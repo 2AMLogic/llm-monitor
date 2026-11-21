@@ -809,17 +809,33 @@ self-contained apart from `libsqlite3-0` (see below).
 
 #### No toolchain on the host? Build in a container
 
-Build the deployable binary inside the `swift:6.1` image and copy the result
-out — no Swift install on either the build host or the target (verified
-2026-09-16, ~47 s):
+Build the deployable binary inside a `swift:6.1`-based image and copy the
+result out — no Swift install on either the build host or the target
+(verified 2026-09-16, ~47 s). `scripts/Dockerfile.swift-linux` is that image:
+`swift:6.1` plus the SQLite dev headers, the same image
+`install-linux.sh --from-source` builds. Installing the headers at
+*image-build* time is what lets the build itself run as your own user:
 
 ```bash
-docker run --rm -v "$PWD/menubar-app/LLMMonitor:/src" -w /src swift:6.1 bash -c \
-  'apt-get update -qq && apt-get install -y -qq libsqlite3-dev && swift build -c release --static-swift-stdlib'
+docker build -t llm-monitor-swift-linux:6.1 -f scripts/Dockerfile.swift-linux scripts
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD/menubar-app/LLMMonitor:/src" -w /src llm-monitor-swift-linux:6.1 \
+  swift build -c release --static-swift-stdlib
 sudo cp menubar-app/LLMMonitor/.build/release/LLMMonitor /usr/local/bin/llm-monitor
 ```
 
 Run it from the repository root (the bind mount is relative to `$PWD`).
+
+`--user "$(id -u):$(id -g)"` is not optional polish: without it the container
+runs as the image's default **root** user, and a bind-mounted checkout ends up
+with a root-owned `.build/` that cannot be deleted without sudo. `-e HOME=/tmp`
+gives the passwd-less uid a writable directory for the SwiftPM cache.
+
+**Build in a disposable checkout.** Never point the bind mount at a live Loom
+worktree (`.loom/worktrees/…`): fleet tooling sweeps those trees as the owning
+user, and stray build output there trips its scheduled cleanup into manual
+mode. Clone or copy the repo somewhere outside `.loom/worktrees/` and build
+from there; delete the whole checkout when done.
 
 #### Runtime requirement
 

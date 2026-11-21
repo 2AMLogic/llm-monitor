@@ -1,0 +1,11 @@
+# Dockerfile.swift-linux — swift:6.1 with the SQLite dev headers preinstalled.
+#
+# Shared by both Linux from-source build paths (README "No toolchain on the
+# host? Build in a container" and `install-linux.sh --from-source`): apt runs
+# here, as root, once at image-build time, so the build container itself can
+# run as the invoking host user (`docker run --user "$(id -u):$(id -g)"`) and
+# a bind-mounted user checkout never accumulates a root-owned `.build/`
+# (issue #343).
+FROM swift:6.1
+RUN apt-get update -qq && apt-get install -y -qq libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
