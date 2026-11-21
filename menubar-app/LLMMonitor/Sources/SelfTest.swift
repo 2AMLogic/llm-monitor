@@ -1931,6 +1931,25 @@ enum SelfTest {
                     "a host with no loom-daemon has no live check — the snapshot path is the fallback"
                 )
 
+                // The daemon shells out to the container runtime by name, so the
+                // child's PATH must reach past launchd's minimal one.
+                let launchd = LoomAccountsCheck.childEnvironment(environment: [
+                    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/Users/alice", "KEEP": "1",
+                ])
+                let launchdPath = (launchd["PATH"] ?? "").split(separator: ":").map(String.init)
+                expectEqual(Array(launchdPath.prefix(4)), ["/usr/bin", "/bin", "/usr/sbin", "/sbin"],
+                            "child PATH: the inherited entries keep their order and precedence")
+                expect(launchdPath.contains("/usr/local/bin") && launchdPath.contains("/Users/alice/.docker/bin"),
+                       "child PATH: a launchd-minimal PATH gains the container runtime's directories")
+                expectEqual(launchd["KEEP"], "1", "child environment: everything else passes through")
+                let rich = LoomAccountsCheck.childEnvironment(environment: [
+                    "PATH": "/usr/local/bin:/usr/bin", "HOME": "/Users/alice",
+                ])
+                expectEqual((rich["PATH"] ?? "").components(separatedBy: "/usr/local/bin").count - 1, 1,
+                            "child PATH: an entry already present is not repeated")
+                expect(!(LoomAccountsCheck.childEnvironment(environment: ["PATH": "/usr/bin"])["PATH"] ?? "")
+                        .contains("~"), "child PATH: with no HOME, tilde entries are dropped, never passed raw")
+
                 expectEqual(LoomAccountsCheck.workspace(environment: ["LOOM_SHARED_ACCOUNTS_ROOT": "/srv/pool"]),
                             "/srv/pool", "the shared accounts root is honoured verbatim")
                 expectEqual(LoomAccountsCheck.workspace(environment: ["LOOM_SHARED_ACCOUNTS_ROOT": " "]), nil,
@@ -1977,6 +1996,21 @@ enum SelfTest {
                             "exit 1 ('no account dispatchable') is still a readable report")
                 expectEqual(report.reading(forProfile: "agent-1")?.rateLimit.weekly?.usedPercent, 43,
                             "…decoded from stdout, with the stderr preamble ignored")
+
+                // The spawn itself, from launchd's PATH: a `docker` that lives
+                // only in a runtime directory must be findable by the child.
+                let probe = try writeStub(in: dir, name: "path-probe", body: """
+                #!/bin/sh
+                case ":$PATH:" in
+                  *:/usr/local/bin:*) echo '\(oneLine)' ;;
+                  *) echo '{"accounts":[]}' ;;
+                esac
+                """)
+                expectEqual(runBlockingReport({
+                    await LoomAccountsCheck.run(
+                        binary: probe, workspace: "/home/ubuntu", timeout: 20,
+                        environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/nowhere"])
+                })?.readings.count, 4, "the child is spawned with the augmented PATH, not launchd's")
 
                 let silent = try writeStub(in: dir, name: "silent", body: "#!/bin/sh\necho oops >&2\nexit 2\n")
                 expect(runBlockingReport({

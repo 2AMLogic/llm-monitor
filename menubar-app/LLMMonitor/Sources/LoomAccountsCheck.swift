@@ -139,6 +139,45 @@ enum LoomAccountsCheck {
         return nil
     }
 
+    /// Directories appended to the child's `PATH` so `loom-daemon` can find the
+    /// **container runtime** it shells out to for a `--live` probe.
+    ///
+    /// Resolving `loom-daemon` by absolute path (above) is only half of the
+    /// launchd problem: the daemon in turn runs `docker exec` into each session
+    /// container, by name. A login-item or Finder launch inherits launchd's
+    /// minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), which holds no `docker`
+    /// on a Mac (Docker Desktop links it into `/usr/local/bin` and
+    /// `~/.docker/bin`), so every row came back `session_probe_error` in
+    /// milliseconds and the app silently fell back to rollout snapshots. That
+    /// is what a reboot did on 2026-11-21: the same build that measured 7/7
+    /// when started from a shell measured 0/7 once launchd restarted it.
+    static let runtimeSearchDirectories = fallbackDirectories + [
+        "~/.docker/bin",
+        "/Applications/Docker.app/Contents/Resources/bin",
+    ]
+
+    /// The environment handed to the child: the app's own, with
+    /// `runtimeSearchDirectories` **appended** to `PATH`. Appended, never
+    /// prepended, so a `PATH` that already resolves `docker` keeps resolving the
+    /// same one; entries already present are not repeated.
+    static func childEnvironment(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
+        let home = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var entries = (environment["PATH"] ?? "").split(separator: ":").map(String.init)
+        for directory in runtimeSearchDirectories {
+            var expanded = directory
+            if expanded.hasPrefix("~/") {
+                guard let home = home, !home.isEmpty else { continue }
+                expanded = (home as NSString).appendingPathComponent(String(expanded.dropFirst(2)))
+            }
+            if !entries.contains(expanded) { entries.append(expanded) }
+        }
+        var child = environment
+        child["PATH"] = entries.joined(separator: ":")
+        return child
+    }
+
     /// The workspace whose account registry this asks about — loom-daemon's
     /// shared machine-level root (see the type doc). An explicitly empty
     /// `LOOM_SHARED_ACCOUNTS_ROOT` disables the shared registry in loom-daemon,
@@ -216,6 +255,7 @@ enum LoomAccountsCheck {
         guard let detail = detail?.trimmingCharacters(in: .whitespaces), !detail.isEmpty else { return nil }
         switch detail {
         case "session_unavailable": return "session container stopped"
+        case "session_probe_error": return "session container probe failed"
         case "not_logged_in": return "profile not logged in"
         case "no_rate_limit_snapshot": return "no Codex activity recorded"
         case "disabled": return "account disabled in Loom"
@@ -325,6 +365,7 @@ enum LoomAccountsCheck {
         binary: String,
         workspace: String,
         timeout: TimeInterval = defaultTimeout,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
         now: Date = Date()
     ) async -> Report? {
         // Nothing is ever written to this child's stdin (it is wired to
@@ -337,6 +378,7 @@ enum LoomAccountsCheck {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binary)
         process.arguments = arguments(workspace: workspace)
+        process.environment = childEnvironment(environment: environment)
 
         let outPipe = Pipe()
         let errPipe = Pipe()

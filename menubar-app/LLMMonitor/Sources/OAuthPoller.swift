@@ -1055,8 +1055,18 @@ class OAuthPoller: ObservableObject {
         }
         loomLiveReadings = report.readings
         let measured = report.readings.values.filter { $0.hasMeasurement }.count
-        flog.info("Loom live Codex check: \(measured)/\(report.readings.count) profile(s) measured",
-                  category: fcat)
+        // Say why, when rows went unmeasured: "0/7 measured" alone hid a
+        // container runtime missing from launchd's PATH for hours.
+        let reasons = Dictionary(grouping: report.readings.values.filter { !$0.hasMeasurement }) {
+            $0.detail ?? "no reason given"
+        }.map { "\($0.key) ×\($0.value.count)" }.sorted().joined(separator: ", ")
+        let summary = "Loom live Codex check: \(measured)/\(report.readings.count) profile(s) measured"
+            + (reasons.isEmpty ? "" : " — unmeasured: \(reasons)")
+        if measured == 0 && !report.readings.isEmpty {
+            flog.warning(summary, category: fcat)
+        } else {
+            flog.info(summary, category: fcat)
+        }
         return measured
     }
 
