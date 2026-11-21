@@ -9,6 +9,11 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 - [2026-07](work_log/WORK_LOG_2026-07.md)
 - [2025-12](work_log/WORK_LOG_2025-12.md)
 
+### 2026-11-21
+
+- **Issue #231** (closed): Live-verify LoomAccountsCheck against a populated 'accounts check --live' report
+- **Issue #341** (closed): ci: settle whether CodeQL swift/cleartext-storage-database is in scope for the by-design cleartext usage.db
+
 ### 2026-11-19
 
 - **Issue #333** (closed): Popover: compareRows re-derives effectiveSortBy/visibleProviders and rateLimit per comparison (residual of #330/#331)
