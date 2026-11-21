@@ -11,6 +11,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-11-21
 
+- **PR #345**: fix: build Linux container binaries as the invoking user
+- **Issue #343** (closed): Linux container build writes root-owned .build into user checkouts (fleet clean residue)
 - **Issue #231** (closed): Live-verify LoomAccountsCheck against a populated 'accounts check --live' report
 - **Issue #341** (closed): ci: settle whether CodeQL swift/cleartext-storage-database is in scope for the by-design cleartext usage.db
 
