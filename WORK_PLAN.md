@@ -3,7 +3,7 @@
 Prioritized roadmap derived from current GitHub label state. Regenerated automatically by the Guide role whenever labels change — see [WORK_LOG.md](WORK_LOG.md) for completed work.
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-20T05:52:54Z (snapshot; compare against live labels)_
+_Generated: 2026-11-21T14:24:46Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
@@ -59,6 +59,7 @@ Issues carrying `loom:curated`.
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings *(curated)*
 - **#323**: Offer an in-app "Update now" when a newer release is available *(curated)*
 - **#338**: Per-account scope (personal | work): push/export skip personal accounts; popover marks them *(curated)*
+- **#343**: Linux container build writes root-owned .build into user checkouts (fleet clean residue) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -79,7 +80,7 @@ _None._
 | In Progress (`loom:building`) | 4 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 6 |
+| Curated | 7 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
