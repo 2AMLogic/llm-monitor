@@ -24,6 +24,9 @@ UNIT_NAME="llm-monitor.service"
 LEGACY_UNIT_NAME="claude-monitor.service"
 LEGACY_BIN_NAME="claude-monitor"
 UNIT_SRC="$SCRIPT_DIR/$UNIT_NAME"
+# swift:6.1 + SQLite dev headers (scripts/Dockerfile.swift-linux), built once
+# and cached by docker; see acquire_from_source.
+SWIFT_IMAGE="llm-monitor-swift-linux:6.1"
 
 MODE=""
 RELEASE_TAG=""
@@ -52,7 +55,8 @@ Binary source (exactly one required):
                           verify its checksum when the release API publishes
                           one. The asset is x86_64-only: other architectures
                           (aarch64/arm64) are refused before any download.
-  --from-source           Build inside the swift:6.1 Docker container with
+  --from-source           Build inside the swift:6.1 Docker image (SQLite
+                          headers preinstalled) as the invoking user, with
                           --static-swift-stdlib (requires docker, no local
                           Swift toolchain needed).
   --binary PATH            Use an already-built binary from the local
@@ -207,9 +211,18 @@ acquire_from_source() {
     command -v docker >/dev/null 2>&1 || fail "--from-source requires docker (not found on PATH)."
     local src_dir="$REPO_ROOT/menubar-app/LLMMonitor"
     [[ -d "$src_dir" ]] || fail "Source directory not found at $src_dir — run this script from within an llm-monitor checkout."
-    log "Building in the swift:6.1 container (~1 minute)..."
-    docker run --rm -v "$src_dir:/src" -w /src swift:6.1 bash -c \
-        'apt-get update -qq && apt-get install -y -qq libsqlite3-dev && swift build -c release --static-swift-stdlib' \
+    local dockerfile="$SCRIPT_DIR/Dockerfile.swift-linux"
+    [[ -f "$dockerfile" ]] || fail "Dockerfile not found at $dockerfile — run this script from within an llm-monitor checkout."
+    log "Preparing $SWIFT_IMAGE (swift:6.1 + SQLite headers; cached after the first run)..."
+    docker build -f "$dockerfile" -t "$SWIFT_IMAGE" "$SCRIPT_DIR" \
+        || fail "Could not build the $SWIFT_IMAGE image."
+    # Run the build as the invoking user so .build/ is user-owned and
+    # user-removable (issue #343): apt already ran at image-build time, and
+    # HOME=/tmp gives the passwd-less uid a writable SwiftPM cache directory.
+    log "Building in the $SWIFT_IMAGE container (~1 minute)..."
+    docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+        -v "$src_dir:/src" -w /src "$SWIFT_IMAGE" \
+        swift build -c release --static-swift-stdlib \
         || fail "Container build failed."
     local built_bin="$src_dir/.build/release/LLMMonitor"
     [[ -f "$built_bin" ]] || fail "Container build did not produce $built_bin."
