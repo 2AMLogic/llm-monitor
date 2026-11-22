@@ -3,7 +3,7 @@
 Prioritized roadmap derived from current GitHub label state. Regenerated automatically by the Guide role whenever labels change — see [WORK_LOG.md](WORK_LOG.md) for completed work.
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-21T21:54:48Z (snapshot; compare against live labels)_
+_Generated: 2026-11-21T23:55:00Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
@@ -36,13 +36,11 @@ Issues currently being built (`loom:building`).
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings
 - **#323**: Offer an in-app "Update now" when a newer release is available
 - **#338**: Per-account scope (personal | work): push/export skip personal accounts; popover marks them
-- **#343**: Linux container build writes root-owned .build into user checkouts (fleet clean residue)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#345**: fix: build Linux container binaries as the invoking user
 - **#346**: Give the Loom live Codex check a PATH that reaches the container runtime
 
 ## Approved (Awaiting Merge)
@@ -60,7 +58,6 @@ Issues carrying `loom:curated`.
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings *(curated)*
 - **#323**: Offer an in-app "Update now" when a newer release is available *(curated)*
 - **#338**: Per-account scope (personal | work): push/export skip personal accounts; popover marks them *(curated)*
-- **#343**: Linux container build writes root-owned .build into user checkouts (fleet clean residue) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -78,10 +75,10 @@ _None._
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`, net of holds/building/merge-pending) | 0 |
-| In Progress (`loom:building`) | 5 |
-| PRs awaiting review | 2 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 6 |
+| Curated | 5 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
