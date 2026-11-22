@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Live Codex quota in the Mac menu bar** (#346). After login or reboot, the
+  app could fall back to older readings because its search path omitted Docker
+  Desktop. The live check now includes Docker Desktop’s command-line directories.
 - **Codex usage archives no longer truncate differently on every poll** (#301,
   #312). Over the 200-field cap, the archived field set depended on dictionary
   order; keys are now walked in sorted order.

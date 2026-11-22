@@ -51,6 +51,14 @@ enum AppPaths {
         return nil
     }
 
+    /// Resolve a subprocess search directory beginning with `~/` against its supplied HOME.
+    static func expandingHome(in path: String, environment: [String: String]) -> String? {
+        guard path.hasPrefix("~/") else { return path }
+        guard let home = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !home.isEmpty else { return nil }
+        return (home as NSString).appendingPathComponent(String(path.dropFirst(2)))
+    }
+
     // MARK: - Migration
 
     enum MigrationOutcome: Equatable {
