@@ -38,7 +38,7 @@ enum ZaiCLI {
 
     private static func runImport(_ args: [String]) -> Never {
         var dbPath: String?
-        var directory = ZaiKeyFile.defaultDirectory
+        var directory: String?
         var i = 0
         while i < args.count {
             switch CLIArgs.matchCommon(args, i) {
@@ -56,28 +56,23 @@ enum ZaiCLI {
             i += 1
         }
 
-        let files = ZaiKeyFile.scan(directory: directory)
-        guard !files.isEmpty else {
-            CLIArgs.fail("No coding-plan-<label>.env files with a ZAI_API_KEY line in \(directory)")
-        }
-
         let storePath = dbPath
         let store = UsageStore(dbPath: storePath)
         store.ensureDatabase()
         let poller = OAuthPoller(dbPath: storePath)
 
         Task {
-            var failed = 0
-            for file in files {
-                let (_, error) = await poller.addZaiAccount(apiKey: file.apiKey, email: file.email, label: file.label)
-                if let error = error {
-                    failed += 1
-                    FileHandle.standardError.write(Data("  \(file.label): \(error)\n".utf8))
+            let results = await poller.syncZaiKeyFiles(discovery: ZaiDiscovery(directory: directory), refresh: true)
+            let failed = results.filter { !$0.success }.count
+            for result in results {
+                if let error = result.error {
+                    FileHandle.standardError.write(Data("  \(result.email): \(error)\n".utf8))
                 } else {
-                    print("  \(file.label)  \(file.email ?? "(no email)")  registered")
+                    print("  \(result.email)  registered")
                 }
             }
-            print("Registered \(files.count - failed)/\(files.count) z.ai account(s).")
+            if results.isEmpty, let directory { CLIArgs.fail("No local Z.ai keys found in \(directory)") }
+            print("Registered \(results.count - failed)/\(results.count) z.ai account(s).")
             exportRanking(storePath)
             printTable(storePath)
             exit(failed == 0 ? 0 : 1)
@@ -191,7 +186,6 @@ enum ZaiCLI {
             print("No z.ai accounts registered. Add them with: llm-monitor zai import")
             return
         }
-        func pct(_ value: Double?) -> String { value.map { String(format: "%.0f%%", $0) } ?? "—" }
         print("")
         print(pad("ACCOUNT", 10) + pad("EMAIL", 26) + pad("PLAN", 6) + pad("5H", 6) + pad("WEEK", 6) + "WEEK RESETS")
         for account in accounts {
@@ -199,8 +193,8 @@ enum ZaiCLI {
             let windows = usage?.rateLimit
             let reset = windows?.weekly?.resetAt.map { formatReset($0) } ?? "—"
             print(pad(account.accountName ?? account.id, 10) + pad(account.email ?? "—", 26)
-                  + pad(account.plan ?? "—", 6) + pad(pct(windows?.session?.usedPercent), 6)
-                  + pad(pct(windows?.weekly?.usedPercent), 6) + reset)
+                  + pad(account.plan ?? "—", 6) + pad(ZaiQuotaResponse.percentText(windows?.session?.usedPercent), 6)
+                  + pad(ZaiQuotaResponse.percentText(windows?.weekly?.usedPercent), 6) + reset)
         }
     }
 
@@ -238,6 +232,8 @@ enum ZaiCLI {
                                         directory (default ~/.zai, or $LLM_MONITOR_ZAI_DIR).
                                         Each file holds one ZAI_API_KEY=… line; an
                                         "(account: <email>)" header comment names the account.
+                                        Without --dir, LLM_MONITOR_ZAI_DIRS selects local directories
+                                        and LLM_MONITOR_ZAI_POOL_SEATS selects exact pool labels.
                                         The app also does this automatically at launch.
               add <label> [--key-file <path>|-] [--email <addr>]
                                         Register one key, read from a file or stdin

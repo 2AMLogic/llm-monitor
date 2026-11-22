@@ -50,6 +50,14 @@ struct ZaiQuotaResponse: Decodable {
     let success: Bool?
     let data: DataBody?
 
+    static func percentText(_ value: Double?) -> String {
+        guard let value, value.isFinite else { return "—" }
+        guard value > 0 else { return "0%" }
+        if value < 0.1 { return "<0.1%" }
+        if value < 10 { return String(format: "%.1f%%", floor(value * 10) / 10) }
+        return String(format: "%.0f%%", floor(value))
+    }
+
     struct DataBody: Decodable {
         let level: String?
         let limits: [Limit]?
@@ -168,7 +176,7 @@ final class ZaiAPIClient: Sendable {
         // The real status lives in the body; HTTP is 200 either way.
         guard decoded.success == true, let body = decoded.data else {
             let code = decoded.code ?? 0
-            flog.warning("z.ai quota rejected: code \(code) (\(decoded.msg ?? "no message"))", category: fcat)
+            flog.warning("z.ai quota rejected: code \(code)", category: fcat)
             if code == 401 || code == 403 || (1000...1099).contains(code) {
                 throw ProviderAPIError.unauthorized
             }
@@ -285,21 +293,13 @@ struct ZaiKeyFile: Equatable {
         return ZaiKeyFile(label: label, email: email, apiKey: apiKey)
     }
 
-    /// Every `coding-plan-<label>.env` in `directory` that carries a key,
-    /// sorted by label. A missing directory is simply empty.
     static func scan(directory: String = defaultDirectory) -> [ZaiKeyFile] {
-        let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: directory) else { return [] }
-        let prefix = "coding-plan-", suffix = ".env"
-        var seenKeys = Set<String>()
-        return names.sorted().compactMap { name -> ZaiKeyFile? in
-            guard name.hasPrefix(prefix), name.hasSuffix(suffix), name.count > prefix.count + suffix.count else { return nil }
-            let label = String(name.dropFirst(prefix.count).dropLast(suffix.count))
-            let path = (directory as NSString).appendingPathComponent(name)
-            guard let content = try? String(contentsOfFile: path, encoding: .utf8),
-                  let file = parse(content, label: label),
-                  seenKeys.insert(file.apiKey).inserted else { return nil }
-            return file
-        }
+        ZaiDiscovery(directory: directory).files().map(\.file)
     }
+}
+
+extension ZaiKeyFile: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    var description: String { "ZaiKeyFile(label: \(label), key: <redacted>)" }
+    var debugDescription: String { description }
+    var customMirror: Mirror { Mirror(self, children: ["label": label]) }
 }

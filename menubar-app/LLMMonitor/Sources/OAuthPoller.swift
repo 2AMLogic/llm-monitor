@@ -1175,60 +1175,94 @@ class OAuthPoller: ObservableObject {
     /// shows up with data rather than as an empty row.
     @discardableResult
     func addZaiAccount(apiKey: String, email: String?, label: String) async -> (accountId: String?, error: String?) {
-        let apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !apiKey.isEmpty else { return (nil, "Empty z.ai API key") }
-        let email = email.flatMap { looksLikeEmailAddress($0) ? $0 : nil }
-        let accountId = ZaiKeyFile.accountId(email: email, label: label)
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return (nil, "Empty z.ai API key") }
+        let file = ZaiKeyFile(label: label, email: email.flatMap { looksLikeEmailAddress($0) ? $0 : nil }, apiKey: key)
+        return await registerZai(.init(file: file, fromPool: false), refresh: true)
+    }
 
-        let snapshot: ProviderUsageSnapshot
+    private func registerZai(_ seat: ZaiDiscovery.Seat, refresh: Bool) async -> (accountId: String?, error: String?) {
+        let file = seat.file
         do {
-            snapshot = try await zaiClient.fetchUsage(apiKey: apiKey, accountKey: accountId)
+            let db = try openDatabase(dbPath)
+            let before = try ZaiRegistration.existing(seat, db: db)
+            if !refresh, let before, before.keyMatches, before.active,
+               (before.email != nil || file.email == nil),
+               (seat.fromPool ? (!ZaiRegistration.isPool(before.source) || before.label == file.label)
+                              : !ZaiRegistration.isPool(before.source)) {
+                return (nil, nil)
+            }
+            let snapshot: ProviderUsageSnapshot?
+            if refresh || before?.keyMatches != true || before?.active != true {
+                snapshot = try await zaiClient.fetchUsage(apiKey: file.apiKey, accountKey: before?.id ?? file.accountId)
+            } else {
+                snapshot = nil
+            }
+            let accountId = try storeZai(seat, snapshot: snapshot, matched: before, db: db)
+            return (accountId, nil)
+        } catch let error as ZaiRegistration.RegistrationError {
+            return (nil, error.localizedDescription)
+        } catch ProviderAPIError.unauthorized {
+            return (nil, "z.ai rejected the key for \(file.label) — expired or incorrect")
         } catch {
-            if case ProviderAPIError.unauthorized = error {
-                return (nil, "z.ai rejected the key for \(label) — expired or incorrect")
-            }
-            return (nil, "Could not read z.ai quota for \(label): \(error.localizedDescription)")
+            return (nil, "Could not register z.ai account \(file.label): \(error.localizedDescription)")
         }
-
-        saveCredentialForAccount(
-            accountId: accountId, email: email, orgName: label,
-            plan: snapshot.plan ?? "coding-plan", accessToken: apiKey,
-            source: "zai-key", provider: .zai
-        )
-        writeSnapshotToDB(accountId: accountId, snapshot: snapshot)
-        flog.info("Registered z.ai account \(label) (\(snapshot.plan ?? "unknown plan"))", category: fcat)
-        return (accountId, nil)
     }
 
-    /// The stored key for an existing z.ai account, if any — lets the
-    /// every-launch key-file sync skip the network for an unchanged key.
-    private func storedZaiKey(accountId: String) -> String? {
-        guard FileManager.default.fileExists(atPath: dbPath),
-              let db = try? openDatabase(dbPath, readonly: true) else { return nil }
-        return (try? db.scalar(
-            "SELECT access_token FROM oauth_credentials WHERE account_id = ? AND is_active = 1 LIMIT 1",
-            accountId
-        )) as? String
-    }
-
-    /// Register every `coding-plan-<label>.env` key in the z.ai key directory
-    /// (`ZaiKeyFile.defaultDirectory`, i.e. the chezmoi-managed `~/.zai`).
-    /// Runs on every launch alongside `syncFromAccountFiles`, so a rotated key
-    /// is picked up without a manual re-import; an unchanged key is a no-op
-    /// with no network call. Add-only: a key file that disappears never
-    /// deletes its account.
-    @discardableResult
-    func syncZaiKeyFiles(directory: String = ZaiKeyFile.defaultDirectory) async -> [EnvImportResult] {
-        var results: [EnvImportResult] = []
-        for file in ZaiKeyFile.scan(directory: directory) {
-            if storedZaiKey(accountId: file.accountId) == file.apiKey { continue }
-            let (_, error) = await addZaiAccount(apiKey: file.apiKey, email: file.email, label: file.label)
-            if let error = error {
-                flog.warning("syncZaiKeyFiles: \(error)", category: fcat)
+    func storeZai(_ seat: ZaiDiscovery.Seat, snapshot: ProviderUsageSnapshot?,
+                  matched before: ZaiRegistration.Existing?, db: Connection) throws -> String {
+        let file = seat.file
+        // Recheck identity under the write lock after the network call.
+        // Publish the source and the credential together so a concurrent
+        // export can never mistake a newly discovered pool key for a local one.
+        try db.execute("BEGIN IMMEDIATE")
+        let accountId: String
+        do {
+            let current = try ZaiRegistration.existing(seat, db: db)
+            guard current?.id == before?.id, current?.source == before?.source,
+                  current?.keyMatches == before?.keyMatches else { throw ZaiRegistration.RegistrationError.conflict }
+            accountId = current?.id ?? file.accountId
+            let poolOnly = seat.fromPool && (current == nil || ZaiRegistration.isPool(current?.source))
+            let source = poolOnly ? ZaiRegistration.poolSource : "zai-key"
+            let gainsEmail = current?.email == nil && file.email != nil
+            if snapshot != nil || current?.source != source || gainsEmail {
+                let plan = try snapshot?.plan ?? (db.scalar("SELECT plan FROM accounts WHERE id = ?", accountId) as? String)
+                guard saveCredentialForAccount(accountId: accountId, email: file.email, orgName: file.label,
+                                               plan: plan ?? "coding-plan", accessToken: file.apiKey, source: source,
+                                               provider: .zai, database: db) else { throw ZaiRegistration.RegistrationError.storage }
             }
-            results.append(EnvImportResult(
-                email: file.email ?? file.label, success: error == nil, error: error, provider: .zai
-            ))
+            if poolOnly {
+                try db.run("UPDATE oauth_credentials SET label = ? WHERE account_id = ? AND source = ? AND label != ?",
+                           file.label, accountId, source, file.label)
+            }
+            try db.execute("COMMIT")
+        } catch {
+            try? db.execute("ROLLBACK")
+            throw error
+        }
+        if let snapshot { writeSnapshotToDB(accountId: accountId, snapshot: snapshot) }
+        return accountId
+    }
+
+    /// Explicit --dir imports affect local registrations only. An ordinary
+    /// launch or import also reconciles the host's selected pool seats.
+    @discardableResult
+    func syncZaiKeyFiles(discovery: ZaiDiscovery = ZaiDiscovery(), refresh: Bool = false) async -> [EnvImportResult] {
+        let seats = discovery.files()
+        var results: [EnvImportResult] = []
+        for seat in seats {
+            let (id, error) = await registerZai(seat, refresh: refresh)
+            guard id != nil || error != nil else { continue }
+            if let error { flog.warning("syncZaiKeyFiles: \(error)", category: fcat) }
+            results.append(EnvImportResult(email: seat.file.email ?? seat.file.label,
+                                           success: error == nil, error: error, provider: .zai))
+        }
+        if !discovery.localOnly {
+            do {
+                try ZaiRegistration.deactivateMissing(seats, db: openDatabase(dbPath))
+            } catch {
+                results.append(EnvImportResult(email: "Z.ai pool", success: false, error: "Could not reconcile the Z.ai pool.", provider: .zai))
+            }
         }
         return results
     }
@@ -1386,6 +1420,7 @@ class OAuthPoller: ObservableObject {
                        a.account_name
                 FROM accounts a
                 LEFT JOIN oauth_credentials c ON c.account_id = a.id AND c.is_active = 1
+                WHERE \(ZaiRegistration.visibleAccounts(in: db, exporting: true, account: "a.id"))
                 ORDER BY a.sort_order, a.id
             """)
 
@@ -1645,15 +1680,16 @@ class OAuthPoller: ObservableObject {
 
     // MARK: - Save Credential for Account
 
+    @discardableResult
     func saveCredentialForAccount(
         accountId: String, email: String?, orgName: String?, plan: String,
         accessToken: String, source: String = "token",
         provider: AccountProvider = .anthropic,
-        refreshToken: String? = nil, tokenExpiresAt: Date? = nil
-    ) {
-        guard FileManager.default.fileExists(atPath: dbPath) else { return }
+        refreshToken: String? = nil, tokenExpiresAt: Date? = nil, database: Connection? = nil
+    ) -> Bool {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return false }
         do {
-            let db = try openDatabase(dbPath)
+            let db = try database ?? openDatabase(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
             let label = orgName ?? email ?? accountId
             let providerValue = provider.rawValue
@@ -1721,8 +1757,10 @@ class OAuthPoller: ObservableObject {
                      accessToken, refreshToken, expiryISO, now, now, now)
                 flog.info("Created new credential for account \(accountId)", category: fcat)
             }
+            return true
         } catch {
             flog.error("Failed to save credential for account: \(error.localizedDescription)", category: fcat)
+            return false
         }
     }
 
