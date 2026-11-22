@@ -44,15 +44,15 @@ _None._
 
 ## Approved (Awaiting Merge)
 
-PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
+PRs that passed review (`loom:pr`). Unheld PRs are queued for Champion auto-merge; held PRs require a human merge decision.
 
-- **#325**: feat: add in-app update check and one-click self-install for macOS
+- **#325**: feat: add in-app update check and one-click self-install for macOS *(held)*
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
-- **#249**: Opt in to selected Z.ai shared-pool seats and show sub-1% quota usage *(curated)*
+- **#249**: Opt in to selected Z.ai shared-pool seats and show sub-1% quota usage *(curated)* *(held)*
 - **#285**: Show each account's available usage-limit resets (weekly and per-model) alongside utilization *(curated)*
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings *(curated)*
 - **#323**: Offer an in-app "Update now" when a newer release is available *(curated)*
