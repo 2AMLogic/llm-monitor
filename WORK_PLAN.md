@@ -3,7 +3,7 @@
 Prioritized roadmap derived from current GitHub label state. Regenerated automatically by the Guide role whenever labels change — see [WORK_LOG.md](WORK_LOG.md) for completed work.
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-21T23:55:00Z (snapshot; compare against live labels)_
+_Generated: 2026-11-22T02:08:57Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
@@ -41,7 +41,7 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#346**: Give the Loom live Codex check a PATH that reaches the container runtime
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -53,7 +53,7 @@ PRs that passed review (`loom:pr`). Held PRs require a human merge decision.
 
 Issues carrying `loom:curated`.
 
-- **#249**: z.ai seats invisible on Loom workers: also discover keys from Loom's shared api-keys pool (~/.loom/api-keys/zai), show sub-1% burn *(curated)* *(held)*
+- **#249**: Opt in to selected Z.ai shared-pool seats and show sub-1% quota usage *(curated)* *(held)*
 - **#285**: Show each account's available usage-limit resets (weekly and per-model) alongside utilization *(curated)*
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings *(curated)*
 - **#323**: Offer an in-app "Update now" when a newer release is available *(curated)*
@@ -76,7 +76,7 @@ _None._
 | Important | 0 |
 | Ready (`loom:issue`, net of holds/building/merge-pending) | 0 |
 | In Progress (`loom:building`) | 4 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
 | Curated | 5 |
 | Architect / Hermit proposals | 0 |
