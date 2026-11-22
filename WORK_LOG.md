@@ -9,6 +9,12 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 - [2026-07](work_log/WORK_LOG_2026-07.md)
 - [2025-12](work_log/WORK_LOG_2025-12.md)
 
+### 2026-11-22
+
+- **Issue #350** (closed): Record the #346 child-PATH invariant (CLAUDE.md + CHANGELOG), and dedup the tilde-expansion block
+- **PR #351**: refactor: share home expansion for Codex and Loom search paths
+- **PR #346**: Give the Loom live Codex check a PATH that reaches the container runtime
+
 ### 2026-11-21
 
 - **PR #345**: fix: build Linux container binaries as the invoking user
