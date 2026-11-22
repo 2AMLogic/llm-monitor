@@ -244,16 +244,11 @@ enum CodexBinary {
             return fileManager.isExecutableFile(atPath: override) ? override : nil
         }
 
-        let home = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         let pathDirs = (environment["PATH"] ?? "").split(separator: ":").map(String.init)
 
         for directory in pathDirs + fallbackDirectories {
-            guard !directory.isEmpty else { continue }
-            var expanded = directory
-            if expanded.hasPrefix("~/") {
-                guard let home = home, !home.isEmpty else { continue }
-                expanded = (home as NSString).appendingPathComponent(String(expanded.dropFirst(2)))
-            }
+            guard !directory.isEmpty,
+                  let expanded = AppPaths.expandingHome(in: directory, environment: environment) else { continue }
             let candidate = (expanded as NSString).appendingPathComponent("codex")
             if fileManager.isExecutableFile(atPath: candidate) { return candidate }
         }
