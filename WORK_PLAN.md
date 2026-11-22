@@ -8,10 +8,7 @@ _Generated: 2026-11-21T23:55:00Z (snapshot; compare against live labels)_
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
-- **#321**: feat: mirror Codex readings from peer hosts over ssh, read-only
 - **#325**: feat: add in-app update check and one-click self-install for macOS
-- **#334**: feat: show Claude limit resets from a pasted cedar_ember reading
-- **#340**: feat: exclude personal accounts from sync and clipboard exports
 
 ## Very Important
 
@@ -74,7 +71,7 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 4 |
+| Operator merge-risk holds | 1 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`, net of holds/building/merge-pending) | 0 |
