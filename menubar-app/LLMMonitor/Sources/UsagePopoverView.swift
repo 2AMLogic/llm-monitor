@@ -659,12 +659,13 @@ struct UsagePopoverView: View {
                 SummaryHeaderRow(sortBy: $sortBy, sortDir: $sortDir, visibleProviders: providers)
                 Divider()
 
+                let rows = tabRows
                 ScrollView {
                     // Resolved once per render, not once per row: it sorts
                     // every account, and each row used to ask several times.
                     let menubarAccountId = store.effectivePrimaryAccountId
                     VStack(spacing: 0) {
-                        ForEach(tabRows, id: \.account.id) { item in
+                        ForEach(rows, id: \.account.id) { item in
                             SummaryRow(
                                 account: item.account,
                                 usage: item.usage,
@@ -679,6 +680,14 @@ struct UsagePopoverView: View {
                                 }
                             )
                         }
+                    }
+                }
+                if case .provider(let provider) = selectedTab {
+                    Divider()
+                    SummaryTotalRow(headroom: ProviderPoolSummary.totalHeadroom(
+                        rows: rows, tokenStatuses: tokenStatusByAccount, pollInterval: oauthPoller.pollInterval
+                    ), provider: provider) {
+                        ChartWindowController.showTotal(for: provider, store: store)
                     }
                 }
             }
@@ -931,6 +940,46 @@ struct UsagePopoverView: View {
             try? await Task.sleep(nanoseconds: 2_500_000_000)
             await MainActor.run { transferStatus = nil }
         }
+    }
+}
+
+private struct SummaryTotalRow: View {
+    let headroom: Int?
+    let provider: AccountProvider
+    let openChart: () -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Color.clear.frame(width: SummaryColumns.radio, height: 1)
+            Text("Total")
+                .frame(width: SummaryColumns.account, alignment: .leading)
+            Text(headroom.map(String.init) ?? "—")
+                .monospacedDigit()
+                .frame(width: SummaryColumns.headroom, alignment: .trailing)
+                .help("Sum of the displayed headroom scores")
+            Spacer(minLength: 0)
+            HistoryButton(label: "Open \(provider.displayName) total usage history", action: openChart)
+        }
+        .font(.caption.bold())
+        .padding(.horizontal, SummaryColumns.horizontalPadding)
+        .padding(.vertical, 6)
+    }
+}
+
+private struct HistoryButton: View {
+    let label: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "chart.line.uptrend.xyaxis")
+                .foregroundColor(.accentColor)
+        }
+        .buttonStyle(.plain)
+        .frame(width: SummaryColumns.chart)
+        .accessibilityLabel(label)
+        .help(label)
+        .pointerCursorOnHover()
     }
 }
 
@@ -1236,7 +1285,8 @@ struct SummaryRow: View {
     /// An absent identity (#135) is included on the same principle: it has no
     /// reading at all, and must never present one.
     private var displayUsage: UsageRecord? {
-        (isDrifted || isStale || isAbsent) ? nil : usage
+        AccountFreshness.displayUsage(for: account, usage: usage, tokenStatus: tokenStatus,
+                                      pollInterval: oauthPoller.pollInterval)
     }
 
     /// Data age in seconds (nil if no usage data)
@@ -1532,14 +1582,7 @@ struct SummaryRow: View {
                 .frame(width: SummaryColumns.dot)
 
             // History column — opens the detailed chart window
-            Button(action: openChart) {
-                Image(systemName: "chart.line.uptrend.xyaxis")
-                    .foregroundColor(.accentColor)
-            }
-            .buttonStyle(.plain)
-            .frame(width: SummaryColumns.chart)
-            .help("Open usage history")
-            .pointerCursorOnHover()
+            HistoryButton(label: "Open usage history", action: openChart)
         }
         .font(.caption)
         .padding(.horizontal, SummaryColumns.horizontalPadding)

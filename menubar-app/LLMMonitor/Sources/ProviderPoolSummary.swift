@@ -96,6 +96,18 @@ struct PoolAccountInput {
 ///
 /// Portable core: no AppKit / SwiftUI / Combine / os.Logger — builds on Linux.
 enum ProviderPoolSummary {
+    static func totalHeadroom(
+        rows: [(account: Account, usage: UsageRecord?)], tokenStatuses: [String: TokenStatus],
+        pollInterval: TimeInterval, now: Date = Date()
+    ) -> Int? {
+        let scores = rows.compactMap { row in
+            let usage = AccountFreshness.displayUsage(for: row.account, usage: row.usage,
+                tokenStatus: tokenStatuses[row.account.id], pollInterval: pollInterval, now: now)
+            return headroomScore(usage).map { Int($0.rounded()) }
+        }
+        return scores.isEmpty ? nil : scores.reduce(0, +)
+    }
+
     /// Counts for one pool slice (all accounts, or one provider's).
     struct Tally: Equatable {
         var usable = 0

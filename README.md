@@ -25,7 +25,13 @@ OAuth tokens you provide, and renders the data locally on your Mac.
   90%, red above 95%.
 - **Summary table popover.** All accounts at a glance: session %, weekly %,
   reset times, data freshness, token health, and a one-click chart launcher
-  per row.
+  per row. Each provider tab has a **Total** row pinned beneath
+  the sortable accounts. Its headroom is the sum of the displayed scores.
+  Its chart shows cumulative weekly quota consumed across those accounts over
+  the last seven days (100 points per full weekly allowance), alongside hourly
+  billable tokens. Resets preserve the running total. Token
+  records use their mapped account’s provider when available, then a
+  recognizable model family.
 - **Headroom score** (0–100). A single number — `100 − max(session %,
   weekly %)` — answering "which account should I be using". Default sort.
 - **Click any column header to sort.** Account, Headroom, percents, reset

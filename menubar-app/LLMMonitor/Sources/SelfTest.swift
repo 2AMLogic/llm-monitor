@@ -99,6 +99,7 @@ enum SelfTest {
         ("HistoryDecimationKeepsFirstLastAndBigJumps", { testHistoryDecimationKeepsFirstLastAndBigJumps() }),
         ("FullHistoryDecimationMatchesLoadHistory", { testFullHistoryDecimationMatchesLoadHistory() }),
         ("FullHistoryDecimationAlwaysKeepsNilWeeklyPercent", { testFullHistoryDecimationAlwaysKeepsNilWeeklyPercent() }),
+        ("ProviderTotals", { testProviderTotals() }),
         ("HistoryCutoffExcludesOlderRows", { testHistoryCutoffExcludesOlderRows() }),
         ("TokenHistoryRoundTripAndCutoff", { testTokenHistoryRoundTripAndCutoff() }),
         ("UnattributedTokenDataFallsBackToHostTotal", { testUnattributedTokenDataFallsBackToHostTotal() }),
@@ -4763,6 +4764,74 @@ enum SelfTest {
         }
     }
 
+    private static func testProviderTotals() {
+        let now = UsageRecord.parseISO("2026-11-21T12:05:00Z")!
+        let accounts = ["a", "b", "stale", "drift"].map { poolAccount($0, .anthropic) }
+        let rows = accounts.map { account in
+            (account: account, usage: poolUsage(account.id, session: nil, weekly: 20.4,
+                age: account.id == "stale" ? 3600 : 0, now: now))
+        }
+        expectEqual(ProviderPoolSummary.totalHeadroom(rows: rows, tokenStatuses: ["drift": .drifted],
+            pollInterval: 600, now: now), 160, "the total sums displayed scores above 100 and omits suppressed readings")
+        expect(ProviderPoolSummary.totalHeadroom(rows: [], tokenStatuses: [:], pollInterval: 600) == nil,
+               "no known headroom displays a dash")
+
+        withSelfTestTempDir("provider-totals") { dir in
+            do {
+                let db = try openDatabase(dir.appendingPathComponent("usage.db").path)
+                try UsageStore.applySchema(db)
+                try db.execute("""
+                    INSERT INTO accounts (id, provider) VALUES ('a','anthropic'), ('b','anthropic'), ('o','openai');
+                    INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, weekly_reset, is_synthetic) VALUES
+                        ('a','2026-11-14T12:55:00Z',40,NULL,0),
+                        ('a','2026-11-14T13:04:00Z',50,NULL,0),
+                        ('a','2026-11-14T13:05:00Z',60,NULL,0),
+                        ('a','2026-11-14T13:05:59Z',60,NULL,1),
+                        ('a','2026-11-14T13:06:00Z',0,NULL,1),
+                        ('a','2026-11-14T13:06:00Z',4,NULL,0),
+                        ('a','2026-11-14T13:07:00Z',6,NULL,0),
+                        ('a','2026-11-21T11:50:00Z',90,'2026-11-21T12:02:00Z',0),
+                        ('b','2026-11-21T11:55:00Z',80,NULL,0),
+                        ('o','2026-11-21T11:59:00Z',50,NULL,0),
+                        ('b','2026-11-21T12:02:00.500Z',3,NULL,0),
+                        ('b','2026-11-21T12:02:00Z',0,NULL,1),
+                        ('b','2026-11-21T12:02:00Z',2,NULL,0),
+                        ('b','2026-11-21T12:03:00Z',1,NULL,0),
+                        ('a','2026-11-21T12:04:00Z',95,'2026-11-28T12:02:00Z',0),
+                        ('a','2026-11-21T12:06:00Z',100,NULL,0);
+                    INSERT INTO token_sessions(session_id,first_message_ts,override_account_id,parent_session_id)
+                        VALUES ('parent','2026-11-21','o',NULL),('child','2026-11-21',NULL,'parent');
+                    INSERT INTO token_usage(session_id,timestamp,model,input_tokens,output_tokens,cache_creation_tokens,cache_read_tokens)
+                        VALUES ('child','2026-11-21T11:50:00Z','claude-test',5,6,2,99),
+                               ('anonymous','2026-11-21T11:55:00Z','claude-test',20,0,0,0),
+                               ('anonymous','2026-11-21T11:55:00Z','glm-test',30,0,0,0),
+                               ('anonymous','2026-11-21T11:55:00Z','unknown',40,0,0,0),
+                               ('anonymous','2026-11-21T12:06:00Z','claude-test',50,0,0,0);
+                    """)
+                func history(_ provider: AccountProvider) throws -> ProviderUsageHistory {
+                    try ProviderUsageHistory.load(db: db, provider: provider, now: now)
+                }
+                let anthropic = try history(.anthropic)
+                let points = anthropic.quota.map(\.points)
+                expectEqual(points.first, 0, "the pre-window reading sets the baseline without adding spend")
+                expectEqual(points.dropFirst().first, 26, "every increase within the hour counts, including spend after a reset")
+                expectEqual(points.dropFirst(2).first, 26, "an account going quiet keeps the points already recorded")
+                expectEqual(points.dropLast().last, 110, "a returning account adds its increase and a new account sets its baseline")
+                expectEqual(points.last, 208, "ordered reset markers and confirmed rollovers count new spend exactly once")
+                expect(zip(points, points.dropFirst()).allSatisfy { $0 <= $1 }, "provider consumption never decreases")
+                expectEqual(anthropic.tokens.map(\.count), [20], "only Anthropic's recorded tokens appear on its tab")
+                let openai = try history(.openai)
+                expectEqual(openai.quota.last?.points, 0, "a first weekly reading does not charge earlier spend to the period")
+                expectEqual(openai.tokens.map(\.count), [13], "a parent account mapping wins over a model label")
+                let zai = try history(.zai)
+                expectEqual(zai.tokens.map(\.count), [30], "unmapped GLM tokens reach the Z.ai chart")
+                expect(zai.quota.isEmpty, "a token-only chart has no fabricated weekly usage")
+            } catch {
+                failures.append("provider totals test threw: \(error)")
+            }
+        }
+    }
+
     /// The shared `cutoffISOString(daysBack:)` helper must exclude a row
     /// older than the window and include one inside it — exercised through
     /// `loadHistory` since the helper itself is private to `UsageStore`.
@@ -4786,6 +4855,15 @@ enum SelfTest {
                 let history = store.loadHistory(for: "acct-cutoff", daysBack: 30)
                 expectEqual(history.count, 1, "a row outside the daysBack window is excluded")
                 expectEqual(history.first?.weeklyPercent, 30.0, "the in-window row is the one returned")
+
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, weekly_all_percent)
+                    VALUES ('session-only', ?, NULL), ('unlisted', ?, 50)
+                """, isoTimestamp(secondsAgo: 30), isoTimestamp(secondsAgo: 15))
+                expectEqual(store.latestComparisonTimestamp(among: ["acct-cutoff", "session-only"]),
+                            history.first?.timestamp, "the comparison range ends at the newest visible weekly reading")
+                expect(store.latestComparisonTimestamp(among: ["session-only"]) == nil,
+                       "an account without weekly data offers no comparison")
             } catch {
                 checks += 1
                 failures.append("loadHistory cutoff test threw: \(error)")
@@ -4816,6 +4894,14 @@ enum SelfTest {
                         (session_id, timestamp, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
                     VALUES ('sess-1', ?, 100, 50, 10, 5)
                 """, isoTimestamp(secondsAgo: 60))
+                try db.run("""
+                    INSERT INTO token_sessions (session_id, first_message_ts, override_account_id, inferred_account_id)
+                    VALUES ('overridden', ?, 'second', 'acct-token'), ('unattributed', ?, NULL, NULL)
+                """, isoTimestamp(secondsAgo: 60), isoTimestamp(secondsAgo: 60))
+                try db.run("""
+                    INSERT INTO token_usage (session_id, timestamp, input_tokens)
+                    VALUES ('overridden', ?, 42), ('unattributed', ?, 99)
+                """, isoTimestamp(secondsAgo: 60), isoTimestamp(secondsAgo: 60))
                 // Well outside the 30-day window below — must not contribute.
                 try db.run("""
                     INSERT INTO token_usage
@@ -4831,6 +4917,11 @@ enum SelfTest {
                 expectEqual(history.first?.cacheCreationTokens, 10, "cache_creation_tokens round-trips")
                 expectEqual(history.first?.cacheReadTokens, 5, "cache_read_tokens round-trips")
                 expectEqual(history.first?.billableTokens, 160, "billableTokens excludes cache reads")
+
+                let comparisons = store.loadTokenHistoryByAccount(daysBack: 30)
+                expectEqual(Set(comparisons.keys), ["acct-token", "second"], "comparison series omit unattributed spend")
+                expectEqual(comparisons["acct-token"]?.first?.billableTokens, 160, "the inferred account keeps its own spend")
+                expectEqual(comparisons["second"]?.first?.billableTokens, 42, "the override takes precedence in comparisons")
             } catch {
                 checks += 1
                 failures.append("loadTokenHistory round-trip test threw: \(error)")
