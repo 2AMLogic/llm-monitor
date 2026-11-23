@@ -1638,9 +1638,10 @@ struct SummaryRow: View {
     @ViewBuilder
     private func percentText(_ value: Double?, resetCount: Int? = nil) -> some View {
         if let pct = value {
+            let text = account.provider == .zai ? ZaiQuotaResponse.percentText(pct) : "\(Int(pct))%"
             if let count = resetCount, count > 0 {
                 HStack(spacing: 2) {
-                    Text("\(Int(pct))%")
+                    Text(text)
                         .foregroundColor(PercentSeverity(percent: pct).color)
                     Text("\(count)↻")
                         .font(.caption2)
@@ -1649,7 +1650,7 @@ struct SummaryRow: View {
                 .lineLimit(1)
                 .help("\(count) unused rate-limit reset\(count == 1 ? "" : "s") available")
             } else {
-                Text("\(Int(pct))%")
+                Text(text)
                     .foregroundColor(PercentSeverity(percent: pct).color)
             }
         } else {

@@ -1232,7 +1232,9 @@ class UsageStore: ObservableObject {
 
             let isoFormatter = ISO8601DateFormatter()
             isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let nowString = isoFormatter.string(from: Date())
+            let now = Date()
+            let nowString = isoFormatter.string(from: now)
+            let wholeSecond = ISO8601DateFormatter().string(from: now)
 
             // Load accounts using raw SQL. `provider` and `codex_home` are
             // selected only when the column exists, so a database that hasn't
@@ -1260,7 +1262,7 @@ class UsageStore: ObservableObject {
                        \(hasProvider ? "provider" : "NULL"),
                        \(hasCodexHome ? "codex_home" : "NULL"),
                        \(storedTokenCount), \(localReading)
-                FROM accounts ORDER BY last_updated DESC
+                FROM accounts WHERE \(ZaiRegistration.visibleAccounts(in: db)) ORDER BY last_updated DESC
             """)
 
             for row in accountStmt {
@@ -1270,6 +1272,9 @@ class UsageStore: ObservableObject {
                 let acctPlan = row[3] as? String
                 let acctLastUpdated = row[4] as? String
                 let acctProvider = AccountProvider(stored: row[5] as? String)
+                // Z.ai writes whole-second timestamps. A same-second reading ending in Z
+                // sorts after a fractional cutoff ending in .123Z.
+                let readingCutoff = acctProvider == .zai ? wholeSecond : nowString
                 let acctCodexHome = (row[6] as? String).flatMap {
                     $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0
                 }
@@ -1285,7 +1290,7 @@ class UsageStore: ObservableObject {
                 let usageStmt = try db.prepare(
                     "SELECT primary_percent FROM usage_history WHERE account_id = ? AND timestamp <= ? ORDER BY timestamp DESC, rowid DESC LIMIT 1"
                 )
-                for usageRow in usageStmt.bind(accountId, nowString) {
+                for usageRow in usageStmt.bind(accountId, readingCutoff) {
                     percent = usageRow[0] as? Double
                 }
 
@@ -1306,7 +1311,7 @@ class UsageStore: ObservableObject {
                 let latestStmt = try db.prepare(
                     "SELECT id, timestamp, primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data FROM usage_history WHERE account_id = ? AND timestamp <= ? ORDER BY timestamp DESC, rowid DESC LIMIT 1"
                 )
-                for usageRow in latestStmt.bind(accountId, nowString) {
+                for usageRow in latestStmt.bind(accountId, readingCutoff) {
                     var record = UsageRecord(
                         id: (usageRow[0] as? Int64) ?? 0,
                         accountId: accountId,

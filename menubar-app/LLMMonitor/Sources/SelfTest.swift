@@ -50,6 +50,8 @@ enum SelfTest {
         ("OpenAITokenExpiryParsing", { testOpenAITokenExpiryParsing() }),
         ("InstanceLock", { testInstanceLock() }),
         ("ZaiQuotaResponseMapping", { testZaiQuotaResponseMapping() }),
+        ("ZaiSelectedFileAccess", { testZaiSelectedFileAccess() }),
+        ("ZaiPoolRegistration", { testZaiPoolRegistration() }),
         ("ZaiKeyFileParsing", { testZaiKeyFileParsing() }),
         ("DataDirectoryMigration", { testDataDirectoryMigration() }),
         ("CodexRolloutSnapshotParsing", { testCodexRolloutSnapshotParsing() }),
@@ -2299,6 +2301,151 @@ enum SelfTest {
                 }
             }
         }
+    }
+
+    private static func testZaiSelectedFileAccess() {
+        do {
+            try withSelfTestTempDir("zai-selection") { dir in
+                let fm = FileManager.default
+                let pool = dir.appendingPathComponent("zai")
+                let local = dir.appendingPathComponent("local")
+                try fm.createDirectory(at: pool, withIntermediateDirectories: true)
+                try fm.createDirectory(at: local, withIntermediateDirectories: true)
+                let secret = "synthetic-selected-key"
+                func key(_ folder: URL, _ name: String, _ value: String) throws {
+                    try Data("ZAI_API_KEY=\(value)".utf8).write(to: folder.appendingPathComponent(name))
+                }
+                try key(pool, "work.env", secret)
+                try key(pool, "unselected.env", "synthetic-unselected")
+                try key(pool, "coding-plan-hidden.env", "synthetic-hidden")
+                try key(pool, String(repeating: "x", count: 65) + ".env", "synthetic-long-slug")
+                try key(pool, "UPPER.env", "synthetic-upper")
+                try key(pool, "malformed.env", "\"unterminated")
+                try key(local, "coding-plan-local.env", "synthetic-local")
+                try fm.createSymbolicLink(at: pool.appendingPathComponent("alias.env"), withDestinationURL: pool.appendingPathComponent("unselected.env"))
+                try fm.createSymbolicLink(at: pool.appendingPathComponent("outside.env"), withDestinationURL: local.appendingPathComponent("coding-plan-local.env"))
+                try fm.createSymbolicLink(at: local.appendingPathComponent("coding-plan-link.env"), withDestinationURL: pool.appendingPathComponent("unselected.env"))
+                let alias = dir.appendingPathComponent("pool-link")
+                try fm.createSymbolicLink(at: alias, withDestinationURL: pool)
+
+                var env = ["LLM_MONITOR_ZAI_DIRS": local.path + ":" + alias.path, "LOOM_SHARED_API_KEYS_DIR": dir.path]
+                var opened = [String]()
+                func files(directory: String? = nil) -> [ZaiDiscovery.Seat] {
+                    opened = []
+                    return ZaiDiscovery(directory: directory, environment: env).files { path in
+                        opened.append(URL(fileURLWithPath: path).lastPathComponent)
+                        return ZaiDiscovery.readRegularFile(path)
+                    }
+                }
+                expectEqual(files().map { $0.file.label }, ["local"], "only local accounts by default")
+                expectEqual(opened, ["coding-plan-local.env"], "default opens zero pool or pool-linked key files")
+                env["LLM_MONITOR_ZAI_POOL_SEATS"] = "work, alias, outside, malformed, *,../unselected,.disabled,work,UPPER," + String(repeating: "x", count: 65)
+                expectEqual(files().map { $0.file.label }, ["local", "work"], "only selected valid regular files")
+                expectEqual(Set(opened), Set(["coding-plan-local.env", "work.env", "malformed.env"]), "unselected files never opened")
+                expect(files(directory: alias.path).isEmpty && opened.isEmpty, "local-only aliased pool directory opens nothing")
+                env["LOOM_SHARED_API_KEYS_DIR"] = pool.path
+                expect(files().contains { $0.file.label == "work" }, "already qualified root gets zai once")
+                env["LOOM_SHARED_API_KEYS_DIR"] = ""
+                expect(!files().contains { $0.fromPool }, "empty root disables pool")
+                env["LOOM_SHARED_API_KEYS_DIR"] = dir.path
+                try Data("# disabled seats\nwork\n".utf8).write(to: pool.appendingPathComponent(".disabled"))
+                expect(!files().contains { $0.fromPool } && !opened.contains("work.env"), "disabled key is never opened")
+                try fm.removeItem(at: pool.appendingPathComponent(".disabled"))
+                try fm.createDirectory(at: pool.appendingPathComponent(".disabled"), withIntermediateDirectories: false)
+                expect(!files().contains { $0.fromPool } && !opened.contains("work.env"), "unreadable disable list withholds pool seats")
+                try fm.removeItem(at: pool.appendingPathComponent(".disabled"))
+                try key(local, "coding-plan-my-copy.env", secret)
+                let sameKey = files().filter { $0.file.apiKey == secret }
+                expectEqual(sameKey.count, 1, "one registration for an identical key in both sources")
+                expect(sameKey.first?.fromPool == false, "the local registration wins")
+                if let file = sameKey.first?.file {
+                    var rendering = ""; dump(file, to: &rendering)
+                    expect(!rendering.contains(secret) && !String(reflecting: file).contains(secret), "diagnostics redact key material")
+                }
+            }
+        } catch { expect(false, "Z.ai file-access fixture: \(error)") }
+    }
+
+    private static func testZaiPoolRegistration() {
+        for (value, text): (Double?, String) in [
+            (nil, "—"), (0, "0%"), (0.001, "<0.1%"), (150 / 140000.0 * 100, "0.1%"),
+            (3, "3.0%"), (9.99, "9.9%"), (10, "10%"), (99.9, "99%"), (100, "100%"),
+        ] {
+            expectEqual(ZaiQuotaResponse.percentText(value), text, "Z.ai quota display")
+        }
+        do {
+            try withSelfTestTempDir("zai-lifecycle") { dir in
+                let file = dir.appendingPathComponent("usage.db").path
+                let ranking = dir.appendingPathComponent("ranking.json")
+                let store = UsageStore(dbPath: file)
+                store.ensureDatabase()
+                let db = try openDatabase(file)
+                let poller = OAuthPoller(dbPath: file)
+                func seat(_ label: String, _ key: String, email: String? = nil, pool: Bool = true) -> ZaiDiscovery.Seat {
+                    ZaiDiscovery.Seat(file: ZaiKeyFile(label: label, email: email, apiKey: key), fromPool: pool)
+                }
+                let first = seat("work", "synthetic-pool-key")
+                let rotated = seat("work", "synthetic-rotated-key")
+                let fixture = zaiQuotaFixture.replacingOccurrences(of: "\"currentValue\":7000", with: "\"currentValue\":0")
+                let snapshot = try ZaiAPIClient.snapshot(from: Data(fixture.utf8), httpStatus: 200, accountKey: first.file.accountId)
+                @discardableResult
+                @MainActor func persist(_ seat: ZaiDiscovery.Seat) throws -> String {
+                    try poller.storeZai(seat, snapshot: snapshot, matched: ZaiRegistration.existing(seat, db: db), db: db)
+                }
+                @MainActor func verifyVisible(_ visible: Bool) throws {
+                    let reopened = UsageStore(dbPath: file)
+                    reopened.loadFromDatabase()
+                    expectEqual(reopened.accounts.contains { $0.id == first.file.accountId }, visible, "CLI and popover visibility after reopening")
+                    expectEqual(poller.loadActiveCredentials().contains { $0.accountId == first.file.accountId }, visible, "polling eligibility")
+                    RankingExporter.exportNow(dbPath: file, outputPath: ranking.path)
+                    let data = try Data(contentsOf: ranking)
+                    let raw = String(decoding: data, as: UTF8.self)
+                    expect(!raw.contains(first.file.apiKey) && !raw.contains(rotated.file.apiKey), "ranking contains no keys")
+                    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    let rows = json?["accounts"] as? [[String: Any]] ?? []
+                    expectEqual(!rows.isEmpty, visible, "ranking visibility")
+                    if visible {
+                        expectEqual(reopened.latestUsage[first.file.accountId]?.rateLimit.weekly?.usedPercent, 100, "immediate CLI/GUI weekly reading")
+                        expectEqual(rows.first?["status"] as? String, "exhausted", "weekly exhaustion with an idle session")
+                        expect((rows.first?["resets"] as? [String: String])?["7d"] != nil, "weekly reset exported")
+                    }
+                }
+                let id = try persist(first)
+                expectEqual(id, "zai:work", "stable pool-only identity")
+                try verifyVisible(true)
+                expect((try String(contentsOf: ranking, encoding: .utf8)).contains("zai:work"), "ranking provides the label-only join key")
+                expect(try AccountSync.exportBundle(dbPath: file).accounts.isEmpty, "selected pool-only seat excluded from export")
+                expect(poller.exportAccountsEnv()?.env.contains(first.file.apiKey) != true, "clipboard excludes the selected key")
+
+                try ZaiRegistration.deactivateMissing([], db: db)
+                try verifyVisible(false)
+                expect(try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = ?", id) == nil,
+                       "withdrawn pool credential cleared")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", id) as? Int64, 1, "historical observations retained")
+                try persist(rotated)
+                try verifyVisible(true)
+                let local = seat("my-own-label", rotated.file.apiKey, email: "seat@example.test", pool: false)
+                expectEqual(try persist(local), id, "local copy supplies an email and keeps history")
+                try ZaiRegistration.deactivateMissing([], db: db)
+                try verifyVisible(true)
+                let bundle = try AccountSync.exportBundle(dbPath: file)
+                expectEqual(bundle.accounts.count, 1, "independent local seat remains exportable")
+                expectEqual(bundle.accounts.first?.email, local.file.email, "email supersedes label for display")
+                let dest = dir.appendingPathComponent("peer.db").path
+                expectEqual(try AccountSync.importBundle(bundle, dbPath: dest).created, 1, "local recipient gains independent registration")
+                var tagged = bundle
+                tagged.accounts[0].credentials[0].source = ZaiRegistration.poolSource
+                expectEqual(try AccountSync.importBundle(tagged, dbPath: dest).excluded, 1, "import rejects a transferred pool registration")
+                let other = seat("other", "synthetic-other", email: "other@example.test", pool: false)
+                try persist(other)
+                do {
+                    _ = try persist(seat("ambiguous", rotated.file.apiKey, email: other.file.email))
+                    expect(false, "conflicting key and email matches must be preserved")
+                } catch ZaiRegistration.RegistrationError.conflict {
+                    expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 2, "distinct identities survive conflict")
+                }
+            }
+        } catch { expect(false, "Z.ai registration fixture: \(error)") }
     }
 
     private static func testZaiKeyFileParsing() {
@@ -8167,6 +8314,13 @@ enum SelfTest {
                             '\(token)', 1, '2026-09-16T00:00:00Z', '2026-09-16T00:00:00Z')
                 """)
 
+                let poolKey = "synthetic-push-exclusion"
+                try db.run("INSERT INTO accounts (id, account_name, provider) VALUES ('zai:private', 'private', 'zai')")
+                try db.run("""
+                    INSERT INTO oauth_credentials (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                    VALUES ('zai:private', 'private', 'zai-pool', 'zai', ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """, poolKey)
+
                 let ssh = try writeStub(in: dir, name: "ssh", body: """
                     #!/bin/sh
                     # Stub ssh: record the argv it was invoked with, then run the
@@ -8182,7 +8336,9 @@ enum SelfTest {
                     \(reentryGuardEnvKey)=1
                     export \(reentryGuardEnvKey)
                     printf '%s\\n' "$*" > \(argvFile)
-                    exec "\(cli)" accounts import - --db "\(destDB)"
+                    bundle=$(cat)
+                    case "$bundle" in *"\(poolKey)"*|*"zai:private"*) exit 63 ;; esac
+                    printf '%s' "$bundle" | "\(cli)" accounts import - --db "\(destDB)"
                     """)
 
                 var info: [String] = []
@@ -8213,6 +8369,8 @@ enum SelfTest {
                 destStore.loadFromDatabase()
                 expectEqual(destStore.accounts.count, 1, "the account crossed the channel")
                 expectEqual(destStore.accounts.first?.email, "agent-17@example.com", "…with its identity intact")
+                let sshArgs = try String(contentsOfFile: argvFile, encoding: .utf8)
+                expect(!sshArgs.contains(poolKey) && !sshArgs.contains(token), "ssh arguments contain neither credential")
                 let destDB2 = try openDatabase(destDB)
                 expectEqual(try destDB2.scalar(
                     "SELECT access_token FROM oauth_credentials WHERE account_id = 'claude-org-uuid'") as? String,

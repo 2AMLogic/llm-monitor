@@ -494,6 +494,28 @@ duplicate. Accounts are keyed `zai:<email>` (else `zai:<label>`), so a
 rotation rolls the credential in place. In `ranking.json` they appear with
 `"provider": "zai"`, and a spent window reports `exhausted`/`rate_limited`.
 
+To read several local directories, set `LLM_MONITOR_ZAI_DIRS` to a
+colon-separated list in precedence order. It replaces the local directory
+setting. An explicit `zai import --dir <path>` reads only that local directory.
+
+Loom pool seats are opt-in on each host. Set `LLM_MONITOR_ZAI_POOL_SEATS` in
+the app or service environment to a comma-separated list such as `work-a,work-b`.
+Each exact label selects one `<label>.env` file. Labels are 1–64 ASCII characters, start with a lowercase letter or digit,
+and may contain lowercase letters, digits, hyphens, and underscores.
+The default pool is `~/.loom/api-keys/zai`. Set `LOOM_SHARED_API_KEYS_DIR`
+to its parent or the `zai` directory itself to relocate it. An explicitly
+empty shared root or seat list disables pool discovery. Local directory
+overrides cannot enable a bulk import from the pool.
+
+After changing the selection, restart the app or run `llm-monitor zai import`
+in the configured environment. Removing a label or listing it in Loom’s
+`.disabled` file hides a pool-only seat and stops polling it. Its history
+survives reselection. Independently registered local copies continue to poll.
+Pool-only keys stay on the selected host and are excluded from account sync
+and clipboard export. Ranking uses the stable `zai:<label>` identifier for a
+seat without an email. Z.ai usage below 10% shows tenths of a percent, with
+`<0.1%` for a positive reading smaller than one tenth.
+
 ### All providers at a glance
 
 For a pool that mixes providers, `accounts list` prints one table per

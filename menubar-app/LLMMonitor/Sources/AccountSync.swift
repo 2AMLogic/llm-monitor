@@ -101,7 +101,7 @@ enum AccountSync {
             let acctStmt = try db.prepare("""
                 SELECT id, account_name, email, plan, last_updated, sort_order,
                        \(hasAcctProvider ? "provider" : "NULL")
-                FROM accounts ORDER BY sort_order, id
+                FROM accounts WHERE \(ZaiRegistration.visibleAccounts(in: db, exporting: true)) ORDER BY sort_order, id
             """)
             for row in acctStmt {
                 guard let id = row[0] as? String else { continue }
@@ -263,7 +263,7 @@ enum AccountSync {
         // it would be pointless (`codex_home` is never exported, so there is
         // nothing on this host for the account to read) and any bearer it
         // carries is a copy of a secret this host must not hold.
-        guard resolvedProvider != .openai else {
+        guard resolvedProvider != .openai, !account.credentials.contains(where: { ZaiRegistration.isPool($0.source) }) else {
             return ImportOutcome(email: account.email, id: account.id, action: .excludedProvider)
         }
         let provider = resolvedProvider.rawValue

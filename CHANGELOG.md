@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Choose which Loom Z.ai seats to monitor on each host with
+  `LLM_MONITOR_ZAI_POOL_SEATS`. Pool-only keys stay on that host. The Z.ai
+  table and CLI now show small positive quota readings below 1% (#249).
 - **Per-provider tabs in the popover, and `llm-monitor accounts list`** (#297,
   #302). The popover gains a tab strip (`All` plus one tab per provider, labelled
   `Name usable/total`) with a summary line such as

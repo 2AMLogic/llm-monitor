@@ -217,7 +217,7 @@ enum RankingExporter {
             let accountStmt = try db.prepare("""
                 SELECT id, email, plan\(hasProvider ? ", provider" : ", NULL"),
                        \(homeRegistered), \(storedTokenCount), \(localReading)
-                FROM accounts ORDER BY sort_order ASC, last_updated DESC
+                FROM accounts WHERE \(ZaiRegistration.visibleAccounts(in: db)) ORDER BY sort_order ASC, last_updated DESC
             """)
 
             var accountRows: [(id: String, email: String?, plan: String?, provider: AccountProvider, isAbsent: Bool)] = []
@@ -261,7 +261,8 @@ enum RankingExporter {
             for row in accountRows {
                 // Acceptance criterion: accounts with a NULL email are excluded
                 // (email is the sole join key — a null key is useless to consumers).
-                guard let email = row.email, !email.isEmpty else { continue }
+                let email = row.email.flatMap { $0.isEmpty ? nil : $0 } ?? (row.provider == .zai ? row.id : nil)
+                guard let email else { continue }
 
                 if let obj = buildAccount(db: db, accountId: row.id, email: email,
                                           plan: row.plan, provider: row.provider,
