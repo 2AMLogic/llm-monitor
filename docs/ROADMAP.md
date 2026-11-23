@@ -32,8 +32,8 @@ Done and on `main`:
 - **Multi-host.** `accounts push` / `pull` over ssh (`AccountSyncRemote.swift`),
   rolled Claude tokens read from Loom's pool (`ClaudeTokenFiles.swift`,
   `claude sync`), Loom Codex profiles read-only (`LoomAccountsCheck.swift`).
-- **Tests and CI.** `llm-monitor selftest` (`SelfTest.swift`, about 9,000
-  lines, 133 test functions, no network) runs on macOS and Linux in
+- **Tests and CI.** `llm-monitor selftest` (`SelfTest.swift`, about 10,000
+  lines, ~146 test functions, no network) runs on macOS and Linux in
   `.github/workflows/build.yml`, which also builds a static-stdlib
   `llm-monitor-linux-x64` binary and attaches it to each published release.
 
@@ -94,7 +94,7 @@ The three items below can start today and have no issue yet; drafts exist.
   and which endpoint carries the data? See below.
 - **A linux-arm64 release asset.** Question first: does any host that runs the
   headless daemon need it, or is `--from-source` enough there?
-- **Splitting `SelfTest.swift` and `OAuthPoller.swift`** (about 9,000 and 3,400
+- **Splitting `SelfTest.swift` and `OAuthPoller.swift`** (about 10,000 and 3,400
   lines). Question first: does `--filter` (Now item 2) remove most of the pain,
   and can the split be done without changing any assertion?
 - **A real `lint` step.** `package.json`'s `lint` script is a placeholder.
