@@ -29,8 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "resets: unknown" in `accounts list`, never 0; the popover row shows only the
   actionable badges, not the unknown case.
 
+### Changed
+
+- **Popover sorting is 10-45× faster and deterministic for equal reset times**
+  (#330, #331, #333).
+
 ### Fixed
 
+- **Linux container builds no longer leave a root-owned `.build/`** (#343).
+  `install-linux.sh --from-source` and the README recipe build as the invoking
+  user from `scripts/Dockerfile.swift-linux`.
 - **Live Codex quota in the Mac menu bar** (#346). After login or reboot, the
   app could fall back to older readings because its search path omitted Docker
   Desktop. The live check now includes Docker Desktop’s command-line directories.
