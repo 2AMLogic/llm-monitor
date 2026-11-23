@@ -158,8 +158,8 @@ token pool out of git.
 - **Sibling copies of the Loom token pool could be committed** (#217).
   `.loom/tokens.*/` and `.loom/tokens-*/` are now ignored in this public repo;
   a sibling copy is how the pool leaked into `rjwalters/loom`.
-- **A Claude account stored under the wrong org id** (agent-18: `7fe8a5ad`,
-  while its token reports `1fdc58c0`) is re-keyed with all its history, and a
+- **A Claude account stored under the wrong org id** (its token
+  reports a different one) is re-keyed with all its history, and a
   ping whose org doesn't match its row is now flagged as drift instead of
   being silently recorded there.
 - **`--db` runs read and rewrote the live `accounts.env`.** The account lists now

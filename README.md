@@ -911,16 +911,16 @@ macOS and Linux:
 
 ```bash
 # From the host that has the account: fan it out to the whole fleet.
-llm-monitor accounts push robb-pro loom-worker-1 loom-worker-2
+llm-monitor accounts push mac-mini worker-1 worker-2
 
 # Check reachability first, without sending anything:
-llm-monitor accounts push robb-pro loom-worker-1 --dry-run
+llm-monitor accounts push mac-mini worker-1 --dry-run
 
 # On a Loom host, chain the step that always follows an import:
-llm-monitor accounts push loom-worker-1 --then-loom
+llm-monitor accounts push worker-1 --then-loom
 
 # Bootstrapping a fresh host instead? Pull from a peer that already has them.
-llm-monitor accounts pull robb-studio
+llm-monitor accounts pull mac-studio
 ```
 
 - **Nothing is written to disk on either side.** `push` serializes the bundle
