@@ -70,8 +70,8 @@ OAuth tokens you provide, and renders the data locally on your Mac.
   point actually costs — in tokens, cost-equivalent tokens, and dollars —
   exportable as JSON or CSV for an external consumer to watch for step changes,
   plotted as its own chart mode on the per-account history window, and backed
-  by a built-in step-change alert (pool-wide tokens/point) that shows a small
-  badge on the menu-bar icon and is logged in headless mode. See
+  by a built-in step-change alert (pool-wide tokens/point) that shows a one-line
+  notice in the popover footer and is logged in headless mode. See
   [Quota Calibration](#quota-calibration-calibrate).
 - **All data stored locally** in SQLite at `~/.llm-monitor/usage.db`.
 
@@ -771,9 +771,11 @@ swift build
 .build/debug/LLMMonitor &
 ```
 
-CI (`.github/workflows/build.yml`) runs on pushes to `main` and on pull requests:
-two jobs build the package — macOS and a `swift:6.1` Linux container — and each
-runs `LLMMonitor selftest`, with the Linux job also smoke-running `--once`.
+CI (`.github/workflows/build.yml`) runs on pushes to `main`, pull requests,
+and merge-queue groups: two jobs build the package — macOS and a `swift:6.1`
+Linux container — and each runs `LLMMonitor selftest`, with the Linux job also
+smoke-running `--once`. A release-only job attaches the static Linux binary to
+a published GitHub Release.
 
 **Manually re-triggering CI.** The `push`/`pull_request` webhook deliveries
 that normally queue a run can silently stop firing for a stretch of time —
@@ -815,14 +817,15 @@ binary. See `CLAUDE.md` for the exact sequence.
 `permissions` block. Per-user permission preferences belong in
 `.claude/settings.local.json`, which stays git-ignored.
 
-- `SessionStart` (`startup` and `resume`) runs
-  `.claude/skills/repo/hooks/session-start-handoff.sh`.
-- `PreToolUse` on `Bash` runs `.loom/hooks/guard-destructive.sh` (Loom's guard).
+It registers the repo-skills session-start handoff hook
+(`.claude/skills/repo/hooks/session-start-handoff.sh`) plus Loom's hook set
+under `.loom/hooks/` (`SessionStart`, `PreToolUse`, `PostToolUse`,
+`UserPromptSubmit`, `Stop`). Read `.claude/settings.json` for the current list.
 
 Things to know before trusting the workspace:
 
 - **Hooks execute tracked code.** Once you trust the project, Claude Code runs
-  those two scripts from this checkout on your machine. Read them first.
+  those scripts from this checkout on your machine. Read them first.
 - **Handoff context.** On startup/resume the session-start hook may place the
   local handoff note into the agent's context.
 - **The Bash guard is not a sandbox.** It is a pattern-based check that fails
@@ -1006,16 +1009,16 @@ macOS and Linux:
 
 ```bash
 # From the host that has the account: fan it out to the whole fleet.
-llm-monitor accounts push robb-pro loom-worker-1 loom-worker-2
+llm-monitor accounts push mac-mini worker-1 worker-2
 
 # Check reachability first, without sending anything:
-llm-monitor accounts push robb-pro loom-worker-1 --dry-run
+llm-monitor accounts push mac-mini worker-1 --dry-run
 
 # On a Loom host, chain the step that always follows an import:
-llm-monitor accounts push loom-worker-1 --then-loom
+llm-monitor accounts push worker-1 --then-loom
 
 # Bootstrapping a fresh host instead? Pull from a peer that already has them.
-llm-monitor accounts pull robb-studio
+llm-monitor accounts pull mac-studio
 ```
 
 - **Nothing is written to disk on either side.** `push` serializes the bundle
@@ -1120,7 +1123,7 @@ atomically, so a reader never sees a partial document.
   "accounts": [
     {
       "email":       "you@example.com",   // the join key
-      "provider":    "anthropic",         // "anthropic" | "openai"
+      "provider":    "anthropic",         // "anthropic" | "openai" | "zai"
       "plan":        "max_20x",
       "status":      "available",         // available | rate_limited | exhausted | blocked
       "utilization": { "5h": 0.12, "7d": 0.44 },   // 0.0–1.0
@@ -1152,7 +1155,7 @@ atomically, so a reader never sees a partial document.
 **Schema change for consumers (added with OpenAI support):**
 
 - **`provider` is new and additive.** It is emitted for *every* account and is
-  `"anthropic"` or `"openai"`; accounts that predate multi-provider support
+  `"anthropic"`, `"openai"`, or `"zai"`; accounts that predate multi-provider support
   report `"anthropic"`. `schema` stays **1** on purpose — the version number
   tracks breaking changes, and adding an optional key breaks nobody. A consumer
   that ignores `provider` behaves exactly as it did before. Treat an unrecognized
@@ -1190,6 +1193,11 @@ atomically, so a reader never sees a partial document.
   and OpenAI accounts can share an address, distinguished by `provider`.
 - No credential material ever appears in this file, and neither does a
   `CODEX_HOME` path.
+- **`reset_advice` is new and additive (#303).**
+  `{ "state": "use_now" | "expiring" | "expires_soon", "reason": "…", "expires_at": "…Z" }`,
+  present only when there is something to advise; `expires_at` only when the
+  reading reports the reset's own expiry. It is read-only advice: the app never
+  spends a reset. `schema` stays **1**.
 
 ## Transcript Token Ingest (`tokens sync`)
 
@@ -1427,7 +1435,7 @@ sqlite3 ~/.llm-monitor/usage.db \
 
 ### Chart mode and the step-change alert
 
-The per-account history window (opened by clicking an account row) gains a
+The per-account history window (opened from the chart icon on an account's row) gains a
 **Tokens/Point** chart mode alongside % of Quota and Tokens — one point per UTC
 day, plotting that account's `raw_tokens_per_point`. Like the Tokens mode, it
 only appears in the mode picker once the account actually has calibration data
@@ -1449,12 +1457,9 @@ tokens/point that partially reverted ten days later):
   ratio stays depressed, and can only fire again after the ratio actually
   recovers back above the threshold and later drops a second time.
 
-On macOS this shows as a small distinct dot next to the menu-bar percentage —
-deliberately a different visual channel from the existing severity coloring
-(red/orange/black-or-white), not a fourth shade competing with it — and is
-suppressed under the same staleness rule that already blanks the percentage
-for a stale or drifted account. In headless mode there is no menu bar to draw
-into, so the alert is logged instead (`debug.log`, and stdout when run with
+On macOS this shows as a one-line notice in the popover footer (the ratio is
+the recent-window average ending on the alert day; visible for 7 days). In
+headless mode there is no popover, so the alert is logged instead (`debug.log`, and stdout when run with
 `--once`/foreground). The alert is re-evaluated on the same 1-hour cadence as
 the calibration recompute above.
 
@@ -1674,12 +1679,19 @@ llm-monitor/
 │       ├── HeadlessMain.swift      # Linux entry (always headless)
 │       ├── HeadlessRunner.swift    # UI-less poll loop (Linux daemon / --headless on macOS)
 │       ├── AccountSync.swift       # accounts export/import: multi-host record + credential sync
-│       ├── AccountSyncCLI.swift    # `llm-monitor accounts export|import` CLI surface
+│       ├── AccountSyncCLI.swift    # `llm-monitor accounts push|pull|export|import|list` CLI surface
+│       ├── AccountSyncRemote.swift # ssh transport for `accounts push|pull`
+│       ├── AppPaths.swift          # Data directory + LLM_MONITOR_* environment lookup
+│       ├── InstanceLock.swift      # Single-instance guard for the long-running modes
+│       ├── SubprocessIO.swift      # Shared SIGPIPE guard + pipe draining for child processes
 │       ├── CLIArgs.swift           # Shared --db/--help parsing for the subcommand CLIs
 │       ├── UsageStore.swift        # SQLite store, settings, primary-account pin
 │       ├── AccountFreshness.swift  # Single staleness rule shared by display/ranking paths
 │       ├── SQLiteDB.swift          # Minimal system-libsqlite3 wrapper (zero deps)
 │       ├── UsagePopoverView.swift  # Summary table, sortable headers, add-account dialog
+│       ├── PopoverSort.swift       # Summary-table sort pipeline (portable, self-tested)
+│       ├── ProviderPoolSummary.swift # Per-provider usable/exhausted tally + interval wording
+│       ├── ResetAdvisor.swift      # Read-only advice on when to spend a stored limit reset
 │       ├── PercentSeverity.swift   # Shared >95 / >=90 severity bands for popover, chart, menubar
 │       ├── UsageChartView.swift    # Per-account chart window
 │       ├── OAuthPoller.swift       # Per-provider polling, token add/import/refresh
@@ -1687,6 +1699,10 @@ llm-monitor/
 │       ├── OpenAIAPI.swift         # OpenAI/Codex client (wham/usage + token refresh)
 │       ├── CodexAppServer.swift    # Codex app-server JSON-RPC client (usage with no stored credential)
 │       ├── CodexCLI.swift          # `llm-monitor codex provision|add|list|import` CLI surface
+│       ├── CodexProfiles.swift     # Read-only view of Loom's pooled Codex profiles (rollout snapshots)
+│       ├── LoomAccountsCheck.swift # Live Codex limits via `loom-daemon accounts check --live`
+│       ├── ClaudeTokenFiles.swift  # Rolled Claude OAuth token files (read, not owned)
+│       ├── ClaudeCLI.swift         # `llm-monitor claude sync` CLI surface
 │       ├── ZaiAPI.swift            # z.ai GLM Coding Plan quota client + ~/.zai key-file scanner
 │       ├── ZaiCLI.swift            # `llm-monitor zai import|add|list` CLI surface
 │       ├── TranscriptImporter.swift # Incremental Claude Code transcript → token_usage/token_sessions ingest
@@ -1704,6 +1720,8 @@ llm-monitor/
 │       └── LinuxCompat.swift       # ObservableObject/@Published stand-ins for Linux
 ├── scripts/
 │   ├── build-macos-app.sh          # macOS release build script
+│   ├── install-linux.sh            # Linux headless install (release asset, source build, or binary)
+│   ├── Dockerfile.swift-linux      # Build image used by `install-linux.sh --from-source`
 │   └── llm-monitor.service      # Sample systemd user unit for Linux headless mode
 ├── docs/ROADMAP.md              # Human-maintained project direction (Now / Next / Later)
 ├── docs/spikes/                 # Investigation write-ups (e.g. the OpenAI usage-endpoint probe)

@@ -8947,7 +8947,7 @@ enum SelfTest {
                     "label":"agent-17@example.com","provider":"anthropic","source":"token"}],\
                     "email":"agent-17@example.com","id":"claude-org-uuid","provider":"anthropic",\
                     "sortOrder":0}],"exportedAt":"2026-09-16T00:00:00Z","formatVersion":1,\
-                    "sourceHost":"robb-studio"}
+                    "sourceHost":"mac-studio"}
                     """
                 let ssh = try writeStub(in: dir, name: "ssh", body: """
                     #!/bin/sh
@@ -8960,7 +8960,7 @@ enum SelfTest {
                 let dbPath = dir.appendingPathComponent("fresh/usage.db").path
                 var info: [String] = []
                 var errors: [String] = []
-                let options = try AccountSyncRemote.parseArgs(["robb-studio", "--db", dbPath], verb: .pull)
+                let options = try AccountSyncRemote.parseArgs(["mac-studio", "--db", dbPath], verb: .pull)
                 let status = AccountSyncRemote.runPull(
                     options,
                     environment: remoteSyncTestEnvironment(ssh: ssh),
