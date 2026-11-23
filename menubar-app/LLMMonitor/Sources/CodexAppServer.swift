@@ -610,14 +610,29 @@ final class CodexAppServerClient: Sendable {
     /// Environment consulted for binary resolution and inherited by the child.
     private let environment: [String: String]
 
+    /// Run `codex` inside a container instead of on the host: `executable` is
+    /// the container runtime and `arguments` everything up to and including
+    /// the image, so the argv becomes `<executable> <arguments…> codex -s
+    /// read-only -a never app-server`. The home is whatever those arguments
+    /// mount — `CODEX_HOME` is **not** exported to the runtime itself — and
+    /// `codexHome` stays the *host* path, used only for the `.homeMissing`
+    /// check and error text. `CodexQuotaContainer` is the one caller.
+    struct ContainerLaunch: Sendable {
+        let executable: String
+        let arguments: [String]
+    }
+    let containerLaunch: ContainerLaunch?
+
     init(
         codexHome: String? = nil,
         timeouts: Timeouts = Timeouts(),
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        containerLaunch: ContainerLaunch? = nil
     ) {
         self.codexHome = codexHome
         self.timeouts = timeouts
         self.environment = environment
+        self.containerLaunch = containerLaunch
     }
 
     /// The `CODEX_HOME` this client will hand the child, for error messages.
@@ -630,7 +645,7 @@ final class CodexAppServerClient: Sendable {
 
     /// Whether a `codex` executable exists at all. Cheap enough to call before
     /// deciding to try this tier.
-    var isAvailable: Bool { CodexBinary.resolve(environment: environment) != nil }
+    var isAvailable: Bool { containerLaunch != nil || CodexBinary.resolve(environment: environment) != nil }
 
     // MARK: Usage
 
@@ -788,17 +803,18 @@ final class CodexAppServerClient: Sendable {
             throw CodexAppServerError.homeMissing(codexHome)
         }
 
-        guard let binary = CodexBinary.resolve(environment: environment) else {
+        guard let binary = containerLaunch?.executable ?? CodexBinary.resolve(environment: environment) else {
             throw CodexAppServerError.binaryNotFound
         }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binary)
         // `-s` / `-a` are top-level flags and must precede the subcommand.
-        process.arguments = ["-s", "read-only", "-a", "never", "app-server"]
+        let codexArguments = ["-s", "read-only", "-a", "never", "app-server"]
+        process.arguments = containerLaunch.map { $0.arguments + ["codex"] + codexArguments } ?? codexArguments
 
         var childEnv = environment
-        if let codexHome = codexHome, !codexHome.isEmpty {
+        if containerLaunch == nil, let codexHome = codexHome, !codexHome.isEmpty {
             childEnv["CODEX_HOME"] = codexHome
         }
         process.environment = childEnv

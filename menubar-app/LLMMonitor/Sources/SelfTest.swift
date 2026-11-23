@@ -58,6 +58,8 @@ enum SelfTest {
         ("LoomDaemonBinaryAndWorkspaceResolution", { testLoomDaemonBinaryAndWorkspaceResolution() }),
         ("LoomLiveCheckSpawnAgainstStub", { testLoomLiveCheckSpawnAgainstStub() }),
         ("LoomLiveReadingPreferredOnlyWhenNewer", { testLoomLiveReadingPreferredOnlyWhenNewer() }),
+        ("CodexQuotaContainerRules", { testCodexQuotaContainerRules() }),
+        ("CodexQuotaContainerProbeAgainstStub", { testCodexQuotaContainerProbeAgainstStub() }),
         ("ClaudeTokenFileScanning", { testClaudeTokenFileScanning() }),
         ("ClaudeTokenTargetAndAccountsEnv", { testClaudeTokenTargetAndAccountsEnv() }),
         ("ClaudeAccountRekey", { testClaudeAccountRekey() }),
@@ -2115,6 +2117,214 @@ enum SelfTest {
             expectEqual(try! openDatabase(dbPath).scalar(
                 "SELECT COUNT(*) FROM oauth_credentials WHERE account_id = 'acct-agent-1' AND last_error IS NOT NULL") as? Int64,
                 0, "the fallback path is a normal successful poll, not an error state")
+
+            // 5. This app's own quota container is a third source under the
+            //    same rule: older never wins, newer does, with its own time.
+            func quota(at observedAt: Date, weekly: Double) -> CodexQuotaContainer.Reading {
+                CodexQuotaContainer.Reading(
+                    observedAt: observedAt,
+                    rateLimit: RateLimitSnapshot(weekly: RateLimitWindow(
+                        kind: .weekly, usedPercent: weekly,
+                        resetAt: Date().addingTimeInterval(3 * 86400), status: "allowed")),
+                    plan: "promax")
+            }
+            let profileHome = credential()?.codexHome ?? home
+            poller.setLoomCodexLiveReadings(["agent-1": reading(at: liveAt, weekly: 61)])
+            poller.setCodexQuotaContainerReadings([profileHome: quota(at: liveAt.addingTimeInterval(-60), weekly: 9)])
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(weeklyRows().last?.1, 61, "an older quota-container reading never displaces a newer one")
+            let quotaAt = liveAt.addingTimeInterval(1800)
+            poller.setCodexQuotaContainerReadings([profileHome: quota(at: quotaAt, weekly: 88)])
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(weeklyRows().last?.1, 88, "the newest of the three sources is the quota container")
+            expectEqual(weeklyRows().last?.0, ISO8601DateFormatter().string(from: quotaAt),
+                        "…and the row carries the container probe's own timestamp")
+            expectEqual(try! openDatabase(dbPath).scalar(
+                "SELECT plan FROM accounts WHERE id = 'acct-agent-1'") as? String,
+                "promax", "the container reading supplies the plan the live check cannot")
+        }
+    }
+
+    // MARK: - Codex quota containers
+
+    /// The pure rules: which profiles are probed, what the container is
+    /// called, and exactly what it is given.
+    private static func testCodexQuotaContainerRules() {
+        expectEqual(CodexQuotaContainer.containerName(profile: "agent-1"), "llm-monitor-codex-quota-agent-1",
+                    "a profile names its own container")
+        expectEqual(CodexQuotaContainer.containerName(profile: "a b/c"), "llm-monitor-codex-quota-a-b-c",
+                    "characters a container name cannot carry are replaced")
+        expectEqual(CodexQuotaContainer.containerName(profile: "…"), nil,
+                    "a profile with nothing nameable is skipped rather than given an invalid name")
+
+        let homes = ["/p/agent-1", "/p/agent-2", "/p/agent-3"]
+        let eligible = CodexQuotaContainer.eligibleHomes(
+            homes, runningContainers: ["loom-codex-session-agent-2", "unrelated"],
+            isLoggedIn: { $0 != "/p/agent-3" })
+        expectEqual(eligible, ["/p/agent-1"],
+                    "a profile with a running Loom session, or with no login, is never probed")
+
+        expectEqual(CodexQuotaContainer.managedHomes(homes, isLoggedIn: { $0 != "/p/agent-3" }),
+                    ["/p/agent-1", "/p/agent-2"],
+                    "every logged-in profile gets a container, Loom session running or not")
+
+        let name = "llm-monitor-codex-quota-agent-1"
+        let args = CodexQuotaContainer.createArguments(
+            name: name, home: "/p/agent-1", image: "img:1", uid: 501, gid: 20)
+        expectEqual(Array(args.suffix(3)), ["img:1", "sleep", "infinity"],
+                    "the persistent container idles on sleep and runs nothing else")
+        expect(args.contains("-d") && !args.contains("--rm")
+               && args.contains("unless-stopped"),
+               "the container is detached, kept, and restarted with the runtime")
+        expect(args.contains("--read-only") && args.contains("no-new-privileges"), "it is locked down")
+        expectEqual(args.filter { $0 == "-v" }.count, 1, "exactly one mount: the profile home")
+        expect(args.contains("/p/agent-1:/codex-home") && args.contains("CODEX_HOME=/codex-home"),
+               "the whole home directory is mounted (never auth.json alone) and named as CODEX_HOME")
+        expect(args.contains("501:20"), "it runs as the invoking user")
+        expectEqual(CodexQuotaContainer.execArguments(name: name), ["exec", "-i", name],
+                    "a reading is an exec in the existing container")
+
+        // Reconcile decisions from one `docker ps -a` read.
+        let listing = [
+            "\(name)\trunning\timg:1\t/p/agent-1",
+            "llm-monitor-codex-quota-agent-2\texited\timg:1\t/p/agent-2",
+            "llm-monitor-codex-quota-gone\trunning\timg:1\t/p/gone",
+            "loom-codex-session-agent-2\trunning\tloom:1\t",
+        ].joined(separator: "\n")
+        let listed = CodexQuotaContainer.parseContainerList(listing)
+        expectEqual(listed.count, 4, "every row of the listing is read")
+        expectEqual(listed["loom-codex-session-agent-2"]?.home, "", "a container that is not ours has no home label")
+        expectEqual(CodexQuotaContainer.action(existing: listed[name], home: "/p/agent-1", image: "img:1"),
+                    .none, "a running container with the right image and mount is left alone")
+        expectEqual(CodexQuotaContainer.action(
+            existing: listed["llm-monitor-codex-quota-agent-2"], home: "/p/agent-2", image: "img:1"),
+            .start, "a stopped one is started, not recreated")
+        expectEqual(CodexQuotaContainer.action(existing: listed[name], home: "/p/agent-1", image: "img:2"),
+                    .replace, "a new image (a Codex version bump) replaces the container")
+        expectEqual(CodexQuotaContainer.action(existing: listed[name], home: "/elsewhere/agent-1", image: "img:1"),
+                    .replace, "a moved profile root replaces the container")
+        expectEqual(CodexQuotaContainer.action(existing: nil, home: "/p/agent-3", image: "img:1"),
+                    .create, "a profile with no container gets one")
+        expectEqual(CodexQuotaContainer.orphans(
+            in: listed, wantedNames: [name, "llm-monitor-codex-quota-agent-2"]),
+            ["llm-monitor-codex-quota-gone"],
+            "only this app's own containers for departed profiles are removed — never a Loom one")
+
+        expectEqual(CodexQuotaContainer.image(environment: [:]).name, CodexQuotaContainer.builtInImage,
+                    "with no override the built-in image is used")
+        expect(CodexQuotaContainer.image(environment: [:]).isBuiltIn, "…and this app builds it")
+        let override = CodexQuotaContainer.image(environment: ["LLM_MONITOR_CODEX_QUOTA_IMAGE": "reg/x@sha256:ab"])
+        expect(override.name == "reg/x@sha256:ab" && !override.isBuiltIn, "an override image is run as given, never built")
+        expect(CodexQuotaContainer.dockerfile.contains("rust-v${CODEX_VERSION}"),
+               "the built-in image pins the Codex release by build argument")
+
+        expect(CodexQuotaContainer.isEnabled(environment: [:]), "the feature is on by default")
+        expect(!CodexQuotaContainer.isEnabled(environment: ["LLM_MONITOR_CODEX_QUOTA_CONTAINER": "0"]),
+               "LLM_MONITOR_CODEX_QUOTA_CONTAINER=0 turns it off")
+        expectEqual(CodexQuotaContainer.resolveDocker(
+            environment: ["LLM_MONITOR_DOCKER_BIN": "/nonexistent/docker", "PATH": "/usr/bin"]), nil,
+            "a broken docker override fails rather than falling back to PATH")
+    }
+
+    private final class QuotaProbeBox<T>: @unchecked Sendable { var value: T? }
+
+    /// Bounded wait on a non-throwing async call (one writer before the
+    /// signal, one reader after the wait — as `AsyncOutcomeBox`).
+    private static func blockOnQuotaProbe<T: Sendable>(_ operation: @escaping @Sendable () async -> T) -> T? {
+        let box = QuotaProbeBox<T>()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.value = await operation()
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + 60) == .success else { return nil }
+        return box.value
+    }
+
+    /// The container path end to end against a stub `docker`: the running
+    /// list is parsed, a probe speaks the app-server handshake through
+    /// `docker run`, and a failed probe removes its container by name.
+    private static func testCodexQuotaContainerProbeAgainstStub() {
+        withSelfTestTempDir("quota-container") { dir in
+            do {
+                let log = dir.appendingPathComponent("docker.log").path
+                let home = dir.appendingPathComponent("agent-1").path
+                try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+                let oneLine: (String) -> String = { $0.replacingOccurrences(of: "\n", with: "") }
+                let stub = try writeStub(in: dir, name: "docker", body: """
+                #!/bin/sh
+                echo "$*" >> '\(log)'
+                case "$1" in
+                  ps) printf 'llm-monitor-codex-quota-old\\texited\\timg:1\\t/p/old\\n'; exit 0 ;;
+                  rm|start) exit 0 ;;
+                  run) echo abc123; exit 0 ;;
+                  exec)
+                    case "$*" in *agent-2*) sleep 30; exit 0 ;; esac
+                    echo '{"id":1,"result":{"userAgent":"stub"}}'
+                    echo '{"id":2,"result":\(oneLine(codexAccountFixture))}'
+                    echo '{"id":3,"result":\(oneLine(codexRateLimitsFixture))}'
+                    cat > /dev/null ;;
+                esac
+                """)
+
+                let listed = blockOnQuotaProbe { await CodexQuotaContainer.listContainers(docker: stub) } ?? nil
+                expectEqual(listed?["llm-monitor-codex-quota-old"]?.state, "exited",
+                            "the container listing is read through the runtime")
+
+                // Reconcile: the wanted profile is created, the departed one removed.
+                let outcome = blockOnQuotaProbe {
+                    await CodexQuotaContainer.reconcile(
+                        docker: stub, image: "img:1", homes: [home], containers: listed ?? [:])
+                }
+                expectEqual(outcome?.ready, [home], "a created container is ready to probe")
+                var logged = (try? String(contentsOfFile: log, encoding: .utf8)) ?? ""
+                expect(logged.contains("run -d --init --restart unless-stopped --name llm-monitor-codex-quota-agent-1")
+                       && logged.contains("-v \(home):/codex-home img:1 sleep infinity"),
+                       "the persistent container is created idle over the mounted home")
+                expect(logged.contains("rm -f llm-monitor-codex-quota-old"),
+                       "a container for a profile that is gone is removed")
+
+                var budget = CodexAppServerClient.Timeouts()
+                budget.initialize = 2
+                budget.method = 2
+                budget.overall = 4
+                let timeouts = budget
+                let good = blockOnQuotaProbe {
+                    await CodexQuotaContainer.probe(docker: stub, home: home, timeouts: timeouts)
+                }
+                if case .reading(let reading)? = good {
+                    expectEqual(reading.rateLimit.weekly?.usedPercent, 37,
+                                "a containerized handshake maps exactly like a host one")
+                } else {
+                    checks += 1
+                    failures.append("stub quota-container probe did not produce a reading: \(String(describing: good))")
+                }
+                logged = (try? String(contentsOfFile: log, encoding: .utf8)) ?? ""
+                expect(logged.contains("exec -i llm-monitor-codex-quota-agent-1 codex -s read-only -a never app-server"),
+                       "a reading is codex app-server exec'd in the profile's own container")
+                expect(!logged.contains("rm -f llm-monitor-codex-quota-agent-1"),
+                       "a successful probe leaves the persistent container in place")
+
+                // A probe that hangs removes the container so the next cycle
+                // starts from a clean one.
+                let wedgedHome = dir.appendingPathComponent("agent-2").path
+                try FileManager.default.createDirectory(atPath: wedgedHome, withIntermediateDirectories: true)
+                let bad = blockOnQuotaProbe {
+                    await CodexQuotaContainer.probe(docker: stub, home: wedgedHome, timeouts: timeouts)
+                }
+                if case .failed(let reason)? = bad {
+                    expect(!reason.contains(dir.path), "a probe failure never carries the home path")
+                } else {
+                    checks += 1
+                    failures.append("a wedged probe must fail, got \(String(describing: bad))")
+                }
+                let after = (try? String(contentsOfFile: log, encoding: .utf8)) ?? ""
+                expect(after.contains("rm -f llm-monitor-codex-quota-agent-2"),
+                       "a timed-out probe removes its container; reconcile recreates it")
+            } catch {
+                checks += 1
+                failures.append("quota-container stub test threw: \(error)")
+            }
         }
     }
 
