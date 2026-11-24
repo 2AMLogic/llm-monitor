@@ -26,7 +26,7 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#338**: Per-account scope (personal | work): push/export skip personal accounts; popover marks them
 
 ## In Progress
 
@@ -35,7 +35,6 @@ Issues currently being built (`loom:building`).
 - **#285**: Show each account's available usage-limit resets (weekly and per-model) alongside utilization
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings
 - **#323**: Offer an in-app "Update now" when a newer release is available
-- **#338**: Per-account scope (personal | work): push/export skip personal accounts; popover marks them
 
 ## PRs Awaiting Review
 
@@ -75,8 +74,8 @@ _None._
 | Operator merge-risk holds | 2 |
 | Very important | 0 |
 | Important | 0 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 4 |
+| Ready (`loom:issue`) | 1 |
+| In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
 | Curated | 5 |
