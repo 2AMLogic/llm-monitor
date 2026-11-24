@@ -11,6 +11,7 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-11-23
 
+- **PR #360**: Dependabot: render dependabot.yml from the org policy
 - **PR #355**: chore: repo hygiene fixes and identifier scrub
 
 ### 2026-11-22
