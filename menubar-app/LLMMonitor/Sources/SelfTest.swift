@@ -2192,11 +2192,11 @@ enum SelfTest {
                     .none, "a running container with the right image and mount is left alone")
         expectEqual(CodexQuotaContainer.action(
             existing: listed["llm-monitor-codex-quota-agent-2"], home: "/p/agent-2", image: "img:1"),
-            .start, "a stopped one is started, not recreated")
+            .start("def456"), "a stopped one is started, not recreated")
         expectEqual(CodexQuotaContainer.action(existing: listed[name], home: "/p/agent-1", image: "img:2"),
-                    .replace, "a new image (a Codex version bump) replaces the container")
+                    .replace("abc123"), "a new image (a Codex version bump) replaces the container")
         expectEqual(CodexQuotaContainer.action(existing: listed[name], home: "/elsewhere/agent-1", image: "img:1"),
-                    .replace, "a moved profile root replaces the container")
+                    .replace("abc123"), "a moved profile root replaces the container")
         expectEqual(CodexQuotaContainer.action(existing: nil, home: "/p/agent-3", image: "img:1"),
                     .create, "a profile with no container gets one")
         var checkedHomes: [String] = []
@@ -2206,7 +2206,7 @@ enum SelfTest {
         }
         expectEqual(checkedHomes.sorted(), ["/p/agent-1", "/p/agent-3"], "a reserved profile needs no login check")
         expectEqual(plan.eligibleHomes, ["/p/agent-1"], "only logged-in profiles without a Loom session qualify")
-        expectEqual(plan.orphans, ["llm-monitor-codex-quota-gone"],
+        expectEqual(plan.orphanIDs, ["bad654"],
                     "only quota containers for departed profiles are removed")
 
         let collisions = CodexQuotaContainer.plan(
@@ -2215,7 +2215,7 @@ enum SelfTest {
         ) { _ in true }
         expectEqual(collisions.eligibleHomes, ["/p/unique"],
                     "homes that sanitize to the same name are skipped and a repeated home is probed once")
-        expect(!collisions.orphans.contains(name), "a shared container name is reserved from cleanup")
+        expect(!collisions.orphanIDs.contains("abc123"), "a shared container name is reserved from cleanup")
 
         expectEqual(CodexQuotaContainer.image(environment: [:]).name, CodexQuotaContainer.builtInImage,
                     "with no override the built-in image is used")
@@ -2272,15 +2272,20 @@ enum SelfTest {
                 let listing = dir.appendingPathComponent("listing")
                 let afterCreate = dir.appendingPathComponent("after-create")
                 let afterExec = dir.appendingPathComponent("after-exec")
+                let stoppedHome = profileRoot.appendingPathComponent("reserved-stopped").path
                 let reserved = [
                     "aaa111\tloom-codex-session-reserved-running\trunning\tloom:1\t",
                     "aaa222\tloom-codex-session-reserved-stopped\texited\tloom:1\t",
-                    "aaa333\tllm-monitor-codex-quota-reserved-stopped\texited\timg:1\t",
+                    "aaa333\tllm-monitor-codex-quota-reserved-stopped\texited\timg:1\t\(stoppedHome)",
                 ]
                 let initial = reserved + ["aaa444\tllm-monitor-codex-quota-old\texited\timg:1\t/p/old"]
                 let provisioned = reserved + ["abc123\tllm-monitor-codex-quota-agent-1\trunning\timg:1\t\(home)"]
                 func writeListing(_ rows: [String], to file: URL) throws {
                     try rows.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+                }
+                func onlyListedContainers() throws -> Bool {
+                    let calls = try String(contentsOfFile: log, encoding: .utf8).split(whereSeparator: \.isNewline)
+                    return calls.count == 1 && calls[0].hasPrefix("ps -a ")
                 }
                 try writeListing(initial, to: listing)
                 try writeListing(provisioned, to: afterCreate)
@@ -2327,13 +2332,13 @@ enum SelfTest {
                 environment["LLM_MONITOR_CODEX_QUOTA_CONTAINER"] = "1"
                 expectEqual(refresh(environment: environment), 1, "opt-in measures the profile without a Loom session")
                 let logged = try String(contentsOfFile: log, encoding: .utf8)
-                expect(!logged.contains("reserved-running") && !logged.contains("reserved-stopped"),
+                expect(!logged.contains("reserved-running") && !logged.contains("reserved-stopped") && !logged.contains("aaa333"),
                        "existing Loom sessions reserve their profiles and their idle quota containers in either state")
                 expect(logged.contains("run -d --init --restart unless-stopped --name llm-monitor-codex-quota-agent-1")
                        && logged.contains("-v \(home):/codex-home img:1 sleep infinity"),
                        "the persistent container is created idle over the mounted home")
-                expect(logged.contains("rm -f llm-monitor-codex-quota-old"),
-                       "a container for a profile that is gone is removed")
+                expect(logged.contains("rm -f aaa444"),
+                       "a labeled orphan is removed by its listed ID")
 
                 expectEqual(poller.codexQuotaContainerReading(home: home)?.rateLimit.weekly?.usedPercent, 37,
                             "a containerized handshake maps exactly like a host one")
@@ -2341,6 +2346,39 @@ enum SelfTest {
                        "a reading is codex app-server exec'd in the profile's own container")
                 expect(!logged.contains("rm -f abc123"),
                        "a successful probe leaves the persistent container in place")
+
+                let foreignOrphan = "ddd111\tllm-monitor-codex-quota-diagnostics\trunning\timg:1\t"
+                let foreignOccupant = "ddd222\tllm-monitor-codex-quota-agent-1\trunning\timg:1\t"
+                try writeListing(reserved + [foreignOrphan, foreignOccupant], to: listing)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 0, "an unlabeled occupant keeps its name")
+                expect(try onlyListedContainers(),
+                       "an unlabeled orphan and occupant cause no removals, starts, creates or execs")
+
+                let outdated = "ddd333\tllm-monitor-codex-quota-agent-1\trunning\timg:old\t\(home)"
+                try writeListing(reserved + [outdated, foreignOrphan], to: listing)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 1, "a labeled, outdated quota container is replaced")
+                let removals = try String(contentsOfFile: log, encoding: .utf8)
+                    .split(whereSeparator: \.isNewline).filter { $0.hasPrefix("rm ") }
+                expectEqual(removals, ["rm -f ddd333"], "only the verified ID is removed during replacement")
+
+                let marker = URL(fileURLWithPath: home).appendingPathComponent(".session-managed.json")
+                try Data("{}".utf8).write(to: marker)
+                try writeListing(reserved, to: listing)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 0, "a marker without an owner skips the profile")
+                expect(try onlyListedContainers(), "unknown ownership prevents mutations")
+                try Data(#"{"schema_version":1,"container_name":"loom-codex-session-work","adopted_at_unix":1}"#.utf8)
+                    .write(to: marker)
+                for state in ["running", "exited"] {
+                    let owner = "bbb111\tloom-codex-session-work\t\(state)\tloom:1\t"
+                    try writeListing(reserved + [owner], to: listing)
+                    try Data().write(to: URL(fileURLWithPath: log))
+                    expectEqual(refresh(environment: environment), 0, "a registry alias reserves its profile when \(state)")
+                    expect(try onlyListedContainers(),
+                           "an aliased owner prevents both quota creation and exec when \(state)")
+                }
 
                 // A stopped Loom session appears during docker run, after the initial plan.
                 try writeListing(initial, to: listing)
@@ -2360,15 +2398,16 @@ enum SelfTest {
                 try writeListing(provisioned, to: listing)
                 try Data().write(to: URL(fileURLWithPath: log))
                 expectEqual(refresh(environment: environment), 0, "neither active home can use the shared container name")
-                let collisionCalls = try String(contentsOfFile: log, encoding: .utf8).split(whereSeparator: \.isNewline)
-                expect(collisionCalls.count == 1 && collisionCalls[0].hasPrefix("ps -a "),
+                expect(try onlyListedContainers(),
                        "ambiguous homes cause no Docker mutations or execs")
 
                 // Reserve the next batch's profile during the first batch's exec.
                 try FileManager.default.createDirectory(atPath: wedgedHome, withIntermediateDirectories: true)
                 let bothReady = provisioned + ["def456\tllm-monitor-codex-quota-agent-2\trunning\timg:1\t\(wedgedHome)"]
                 try writeListing(bothReady, to: listing)
-                try writeListing(bothReady + ["bbb222\tloom-codex-session-agent-2\texited\tloom:1\t"], to: afterExec)
+                let batchMarker = URL(fileURLWithPath: wedgedHome).appendingPathComponent(".session-managed.json")
+                try Data(#"{"container_name":"loom-codex-session-other"}"#.utf8).write(to: batchMarker)
+                try writeListing(bothReady + ["bbb222\tloom-codex-session-other\texited\tloom:1\t"], to: afterExec)
                 let batches = blockOnQuotaProbe {
                     await CodexQuotaContainer.probeAll(docker: stub, homes: [home, wedgedHome], concurrency: 1)
                 }

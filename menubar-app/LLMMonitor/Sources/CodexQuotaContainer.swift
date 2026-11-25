@@ -152,15 +152,24 @@ enum CodexQuotaContainer {
     /// Where the profile is mounted inside the container.
     static let containerHome = "/codex-home"
 
-    /// The name of Loom's own session container for a profile — loom-daemon's
-    /// `loom-codex-session-<name>` convention (what each profile's
-    /// `.session-managed.json` records).
-    static func loomSessionContainerName(profile: String) -> String {
-        "loom-codex-session-\(profile)"
+    /// A registry alias can name the session independently of the profile directory.
+    /// Check both names at planning time and again against each probe's fresh listing.
+    private static func loomSessionIsAbsent(home: String, containers: [String: ContainerInfo]) -> Bool {
+        let directory = URL(fileURLWithPath: home, isDirectory: true)
+        guard containers["loom-codex-session-\(directory.lastPathComponent)"] == nil else { return false }
+        do {
+            let data = try Data(contentsOf: directory.appendingPathComponent(".session-managed.json"))
+            let marker = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            guard let owner = marker?["container_name"] as? String, !owner.isEmpty else { return false }
+            return containers[owner] == nil
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return true // With no marker, only the conventional name applies.
+        } catch {
+            return false // An unreadable marker leaves ownership unknown.
+        }
     }
 
-    /// Every container this app owns starts with this, which is how
-    /// `reconcile` recognises one whose profile is gone.
+    /// This prefix and a nonempty home label identify containers managed by the app.
     static let containerNamePrefix = "llm-monitor-codex-quota-"
 
     /// Label recording which host directory a container mounts, so a profile
@@ -220,6 +229,7 @@ enum CodexQuotaContainer {
         /// The `homeLabel` value; empty on a container that is not ours.
         let home: String
         var isRunning: Bool { state == "running" }
+        var isManagedQuotaContainer: Bool { name.hasPrefix(containerNamePrefix) && !home.isEmpty }
     }
 
     static let listArguments = [
@@ -287,26 +297,29 @@ enum CodexQuotaContainer {
         /// Running, right image, right mount.
         case none
         /// Present and correct but not running.
-        case start
+        case start(String)
+        /// Another container occupies this name.
+        case occupied
         /// Absent.
         case create
         /// Present with the wrong image or mount (a Codex version bump, a
         /// moved profile root) — removed and created again.
-        case replace
+        case replace(String)
     }
 
     /// Pure decision for one profile, for the self-test.
     static func action(existing: ContainerInfo?, home: String, image: String) -> Action {
         guard let existing = existing else { return .create }
-        guard existing.image == image, existing.home.utf8.elementsEqual(home.utf8) else { return .replace }
-        return existing.isRunning ? .none : .start
+        guard existing.isManagedQuotaContainer else { return .occupied }
+        guard existing.image == image, existing.home.utf8.elementsEqual(home.utf8) else { return .replace(existing.id) }
+        return existing.isRunning ? .none : .start(existing.id)
     }
 
     /// A Loom session reserves its profile even while stopped, since Loom can restart it.
     /// Keep any quota container for that profile idle and skip its login check.
     struct ReconciliationPlan {
         let eligibleHomes: [String]
-        let orphans: [String]
+        let orphanIDs: [String]
     }
 
     static func plan(
@@ -322,8 +335,8 @@ enum CodexQuotaContainer {
             guard let name, let home = candidates.first else { continue }
             // Linux paths can be byte-distinct even when Swift strings compare equal.
             let uniqueHome = candidates.dropFirst().allSatisfy { $0.utf8.elementsEqual(home.utf8) }
-            let profile = (home as NSString).lastPathComponent
-            if uniqueHome, containers[loomSessionContainerName(profile: profile)] == nil {
+            if uniqueHome, containers[name]?.isManagedQuotaContainer != false,
+               loomSessionIsAbsent(home: home, containers: containers) {
                 guard isLoggedIn(home) else { continue }
                 eligible.append(home)
             }
@@ -331,9 +344,9 @@ enum CodexQuotaContainer {
             wanted.insert(name)
         }
         // An empty pool of managed profiles can be temporary. Leave containers in place.
-        guard !wanted.isEmpty else { return ReconciliationPlan(eligibleHomes: [], orphans: []) }
-        let orphans = containers.keys.filter { $0.hasPrefix(containerNamePrefix) && !wanted.contains($0) }
-        return ReconciliationPlan(eligibleHomes: eligible.sorted(), orphans: orphans.sorted())
+        guard !wanted.isEmpty else { return ReconciliationPlan(eligibleHomes: [], orphanIDs: []) }
+        let orphans = containers.values.filter { $0.isManagedQuotaContainer && !wanted.contains($0.name) }
+        return ReconciliationPlan(eligibleHomes: eligible.sorted(), orphanIDs: orphans.map(\.id).sorted())
     }
 
     /// Bring one profile's container to the wanted state. Nil on success,
@@ -341,17 +354,18 @@ enum CodexQuotaContainer {
     static func ensureContainer(
         docker: String, name: String, home: String, image: String, existing: ContainerInfo?
     ) async -> String? {
-        var needed = action(existing: existing, home: home, image: image)
-        if needed == .none { return nil }
-        if needed == .start {
+        switch action(existing: existing, home: home, image: image) {
+        case .none: return nil
+        case .occupied: return "quota container name already in use"
+        case .start(let id):
             if let started = await SubprocessIO.runCapturing(
-                executable: docker, arguments: ["start", name], timeout: 30), started.succeeded {
+                executable: docker, arguments: ["start", id], timeout: 30), started.succeeded {
                 return nil
             }
-            needed = .replace  // a container that will not start is replaced
-        }
-        if needed == .replace {
-            _ = await SubprocessIO.runCapturing(executable: docker, arguments: ["rm", "-f", name], timeout: 30)
+            fallthrough // Replace the same container if it could not be started.
+        case .replace(let id):
+            _ = await SubprocessIO.runCapturing(executable: docker, arguments: ["rm", "-f", id], timeout: 30)
+        case .create: break
         }
         guard let created = await SubprocessIO.runCapturing(
             executable: docker,
@@ -379,8 +393,8 @@ enum CodexQuotaContainer {
                 ready.append(home)
             }
         }
-        for orphan in plan.orphans {
-            _ = await SubprocessIO.runCapturing(executable: docker, arguments: ["rm", "-f", orphan], timeout: 30)
+        for id in plan.orphanIDs {
+            _ = await SubprocessIO.runCapturing(executable: docker, arguments: ["rm", "-f", id], timeout: 30)
         }
         return (ready, failures)
     }
@@ -421,8 +435,8 @@ enum CodexQuotaContainer {
         guard let containers = await listContainers(docker: docker) else {
             return .failed("could not verify container ownership")
         }
-        guard containers[loomSessionContainerName(profile: profile)] == nil else {
-            return .failed("profile reserved by a Loom session")
+        guard loomSessionIsAbsent(home: home, containers: containers) else {
+            return .failed("could not rule out a Loom session for this profile")
         }
         guard let quota = containers[name], quota.isRunning, quota.home.utf8.elementsEqual(home.utf8) else {
             return .failed("running quota container for this home could not be verified")

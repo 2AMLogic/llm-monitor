@@ -204,6 +204,7 @@ each logged-in profile whose Loom session container is absent.
 ```bash
 docker run -d --init --restart unless-stopped \
   --name llm-monitor-codex-quota-<profile> \
+  --label "llm-monitor.codex-home=$HOME/.loom/codex-profiles/<profile>" \
   --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
   --read-only --tmpfs /tmp -e HOME=/tmp -e CODEX_HOME=/codex-home \
   -v ~/.loom/codex-profiles/<profile>:/codex-home \
@@ -214,8 +215,9 @@ The container only idles (a few MB of memory) and comes back by itself after
 a reboot. On the 10-minute usage cadence the app runs
 `docker exec -i <id> codex -s read-only -a never app-server` in it, asks for
 the account's rate limits over stdio, and `codex` exits. Each cycle the app
-also starts a stopped container, replaces one whose image or mount is out of
-date, and removes one whose profile is gone. What to know:
+manages containers with its quota name prefix and a nonempty `llm-monitor.codex-home`
+label. It starts stopped containers, replaces ones whose image or mount has changed,
+and removes ones whose profiles are gone. An unlabeled container keeps its name.
 
 - **It needs Docker** (or a compatible CLI named `docker`) reachable by the
   app. `LLM_MONITOR_DOCKER_BIN` names a nonstandard binary. Without one the
@@ -226,11 +228,13 @@ date, and removes one whose profile is gone. What to know:
   `LLM_MONITOR_CODEX_QUOTA_IMAGE` to run an image of your own that has
   `codex` on its `PATH`; that image is never built by the app.
 - **A Loom session reserves its profile even while stopped.** If
-  `loom-codex-session-<profile>` appears in `docker ps -a`, LLM Monitor skips
-  that profile and leaves any existing quota container alone. The app checks
-  again immediately before each probe and skips it if Docker cannot confirm
-  ownership. If two registered homes map to the same quota container name,
-  both use the other quota sources and the shared container is left alone.
+  `docker ps -a` lists either `loom-codex-session-<profile>` or the container
+  named in the profile’s `.session-managed.json`, LLM Monitor leaves that
+  profile and its quota container alone. The app checks both names again
+  immediately before each probe. If the listing fails or an existing marker
+  cannot be read, the probe is skipped. If two registered homes map to the
+  same quota container name, both use the other quota sources and the shared
+  container is left alone.
 - **The whole profile directory is mounted read-write, on purpose.** Codex
   saves a refreshed login by renaming a new `auth.json` into place under a
   lock file in the same directory. Mounting only `auth.json` would make that
@@ -238,8 +242,15 @@ date, and removes one whose profile is gone. What to know:
   itself never reads, copies or stores the credential. Codex also updates its
   own state files in the profile while it runs.
 - To disable the fallback, unset `LLM_MONITOR_CODEX_QUOTA_CONTAINER` and
-  restart LLM Monitor. Existing quota containers stay in place. To remove them, run
-  `docker rm -f $(docker ps -aq --filter name=llm-monitor-codex-quota-)`.
+  restart LLM Monitor. Existing quota containers stay in place. To remove them by ID, run
+
+  ```sh
+  docker ps -a --no-trunc --filter 'name=^/llm-monitor-codex-quota-' \
+    --format '{{if .Label "llm-monitor.codex-home"}}{{.ID}}{{end}}' |
+    while read -r id; do
+      [ -z "$id" ] || docker rm -f "$id"
+    done
+  ```
 
 `debug.log` reports how many profiles were measured, and names (never paths)
 for any profile that could not be.
