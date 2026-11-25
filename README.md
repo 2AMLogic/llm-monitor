@@ -178,10 +178,9 @@ Loom owns these profiles and manages their rotating credentials. LLM Monitor
 reads the rate-limit snapshot Codex records in `sessions/**/rollout-*.jsonl`
 and a live reading from `loom-daemon accounts check --live`. For a
 session-managed profile, Loom takes that live reading inside the account’s
-Docker container. When a profile has **no** running Loom session container,
-LLM Monitor reads its quota in a minimal persistent container of its own
-(see "Quota containers" below). The newest usable observation of the three
-wins.
+Docker container. If you enable quota containers, LLM Monitor can also read
+quota for profiles that have no Loom session container. The newest usable
+observation wins.
 
 Snapshots have trade-offs:
 
@@ -194,13 +193,13 @@ Snapshots have trade-offs:
 
 `llm-monitor codex list` shows each profile's latest snapshot and its age.
 
-#### Quota containers (no Loom session running)
+#### Optional quota containers
 
-A rollout snapshot goes stale when a profile is idle, and Loom's live check
-only measures inside a running session container. On a host that uses Loom in
-operator-directed mode (no daemon), or after a reboot that left the session
-containers down, neither source has anything current. So LLM Monitor keeps
-one small container per logged-in profile:
+Set `LLM_MONITOR_CODEX_QUOTA_CONTAINER=1` in LLM Monitor's environment to
+enable this fallback. It is off by default. On a host that uses Loom without
+session containers, a profile's rollout snapshot can go stale while it is idle.
+With the fallback enabled, LLM Monitor keeps one small quota container for
+each logged-in profile whose Loom session container is absent.
 
 ```bash
 docker run -d --init --restart unless-stopped \
@@ -226,17 +225,18 @@ date, and removes one whose profile is gone. What to know:
   first build downloads the Codex release from GitHub. Set
   `LLM_MONITOR_CODEX_QUOTA_IMAGE` to run an image of your own that has
   `codex` on its `PATH`; that image is never built by the app.
-- **A profile with a running `loom-codex-session-<profile>` container is
-  not probed.** Loom's live check covers it. Its quota container stays up,
-  idle.
+- **A Loom session reserves its profile even while stopped.** If
+  `loom-codex-session-<profile>` appears in `docker ps -a`, LLM Monitor skips
+  that profile and leaves any existing quota container alone. A restarted
+  Loom session can then refresh the profile's login.
 - **The whole profile directory is mounted read-write, on purpose.** Codex
   saves a refreshed login by renaming a new `auth.json` into place under a
   lock file in the same directory. Mounting only `auth.json` would make that
   save fail after the refresh token had already been rotated. LLM Monitor
   itself never reads, copies or stores the credential. Codex also updates its
   own state files in the profile while it runs.
-- **`LLM_MONITOR_CODEX_QUOTA_CONTAINER=0` turns it off.** Existing containers
-  are then left alone; remove them with
+- To disable the fallback, unset `LLM_MONITOR_CODEX_QUOTA_CONTAINER` and
+  restart LLM Monitor. Existing quota containers stay in place. To remove them, run
   `docker rm -f $(docker ps -aq --filter name=llm-monitor-codex-quota-)`.
 
 `debug.log` reports how many profiles were measured, and names (never paths)

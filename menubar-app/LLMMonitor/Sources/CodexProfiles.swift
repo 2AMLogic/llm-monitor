@@ -18,8 +18,8 @@ import Foundation
 ///
 /// The snapshot is one of three sources `pollCodexSnapshot` chooses between
 /// (the newest observation wins): the rollout snapshot, `LoomAccountsCheck`'s
-/// live reading, and `CodexQuotaContainer`, which does run `codex` on a profile
-/// home, but only when no session container is running.
+/// live reading, and the opt-in `CodexQuotaContainer` reading for a profile
+/// whose Loom session container is absent from `docker ps -a`.
 ///
 /// The price is freshness: a reading is only as current as the account's
 /// last Codex turn. The reading is timestamped with **when Codex recorded

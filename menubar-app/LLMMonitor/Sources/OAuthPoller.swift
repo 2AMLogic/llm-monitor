@@ -79,9 +79,8 @@ struct OAuthCredential {
     /// (the ambient `$CODEX_HOME`, else `~/.codex`).
     let codexHome: String?
     /// `accounts.codex_home_mode`. `CodexProfiles.snapshotMode` means this
-    /// home is owned by a Loom session container and must only ever be read
-    /// from its rollout snapshots — never by spawning `codex`, never by
-    /// reading its bearer.
+    /// is a pooled profile. Its quota comes from `pollCodexSnapshot`, which
+    /// compares rollout data with the cached Loom and opt-in container readings.
     let codexHomeMode: String?
 
     init(
@@ -1115,9 +1114,8 @@ class OAuthPoller: ObservableObject {
         if warning { flog.warning(notice, category: fcat) } else { flog.info(notice, category: fcat) }
     }
 
-    /// Keep one persistent minimal container per logged-in snapshot-mode
-    /// profile (`CodexQuotaContainer.reconcile`), and read the quota of every
-    /// such profile that has no running Loom session container.
+    /// When enabled, maintain a quota container and read quota for each logged-in
+    /// snapshot-mode profile without a Loom session container.
     /// Returns how many were measured.
     ///
     /// Called after `refreshLoomCodexLiveReadings` and throttled the same way.
@@ -1126,17 +1124,18 @@ class OAuthPoller: ObservableObject {
     /// it is found missing, so a slow first build never holds up a poll.
     @discardableResult
     func refreshCodexQuotaContainerReadings(
-        for credentials: [OAuthCredential], force: Bool = false
+        for credentials: [OAuthCredential], force: Bool = false,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) async -> Int {
         let homes = credentials.filter { $0.isCodexSnapshotOnly }.compactMap { $0.codexHome }
-        guard !homes.isEmpty, CodexQuotaContainer.isEnabled() else { return 0 }
+        guard !homes.isEmpty, CodexQuotaContainer.isEnabled(environment: environment) else { return 0 }
         let now = Date()
         if !force, let last = lastCodexQuotaContainerRun,
            now.timeIntervalSince(last) < codexQuotaContainerInterval {
             return 0
         }
         lastCodexQuotaContainerRun = now
-        guard let docker = CodexQuotaContainer.resolveDocker() else {
+        guard let docker = CodexQuotaContainer.resolveDocker(environment: environment) else {
             noteCodexQuotaContainer("Codex quota containers unavailable: no docker binary found")
             return 0
         }
@@ -1145,11 +1144,9 @@ class OAuthPoller: ObservableObject {
                                     warning: true)
             return 0
         }
-        let managed = CodexQuotaContainer.managedHomes(homes)
-        guard !managed.isEmpty else { return 0 }
-
-        let image = CodexQuotaContainer.image()
-        if image.isBuiltIn, codexQuotaImageState != .ready {
+        let plan = CodexQuotaContainer.plan(homes: homes, containers: containers)
+        let image = CodexQuotaContainer.image(environment: environment)
+        if !plan.eligibleHomes.isEmpty, image.isBuiltIn, codexQuotaImageState != .ready {
             if await CodexQuotaContainer.imageExists(docker: docker, image: image.name) {
                 codexQuotaImageState = .ready
             } else {
@@ -1175,7 +1172,7 @@ class OAuthPoller: ObservableObject {
         }
 
         let reconciled = await CodexQuotaContainer.reconcile(
-            docker: docker, image: image.name, homes: managed, containers: containers)
+            docker: docker, image: image.name, plan: plan, containers: containers)
         for (home, reason) in reconciled.failures {
             let profile = (home as NSString).lastPathComponent
             let message = "container could not be started: \(reason)"
@@ -1184,12 +1181,10 @@ class OAuthPoller: ObservableObject {
                 flog.warning("Codex quota container for profile \(profile): \(message)", category: fcat)
             }
         }
-        // Only an `exec` uses the home, so a profile whose Loom session is
-        // running keeps its idle container and is simply not probed.
-        let running = Set(containers.values.filter { $0.isRunning }.map { $0.name })
-        let eligible = CodexQuotaContainer.eligibleHomes(reconciled.ready, runningContainers: running)
-        guard !eligible.isEmpty else { return 0 }
-        let results = await CodexQuotaContainer.probeAll(docker: docker, homes: eligible)
+        // Provisioning may take time, so recheck the login before probing.
+        let ready = reconciled.ready.filter { CodexAuth.accountId(inHome: $0) != nil }
+        guard !ready.isEmpty else { return 0 }
+        let results = await CodexQuotaContainer.probeAll(docker: docker, homes: ready)
         var measured = 0
         for (home, result) in results {
             let profile = (home as NSString).lastPathComponent
@@ -1206,8 +1201,8 @@ class OAuthPoller: ObservableObject {
                 }
             }
         }
-        noteCodexQuotaContainer("Codex quota containers: \(measured)/\(eligible.count) profile(s) measured "
-                                + "(persistent containers; no Loom session running for them)")
+        noteCodexQuotaContainer("Codex quota containers: \(measured)/\(ready.count) profile(s) measured "
+                                + "(profiles without a Loom session container)")
         return measured
     }
 

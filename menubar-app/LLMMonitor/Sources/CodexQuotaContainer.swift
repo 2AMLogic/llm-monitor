@@ -1,8 +1,7 @@
 import Foundation
 
-/// Codex quota readings for Loom's pooled profiles when **no Loom session
-/// container is running** for them, taken in a minimal **persistent**
-/// container this app keeps per profile.
+/// Opt-in Codex quota readings for pooled profiles without a Loom session
+/// container, taken in a minimal persistent container this app keeps per profile.
 ///
 /// `CodexProfiles` (rollout snapshots) is only as fresh as a profile's last
 /// Codex turn, and `LoomAccountsCheck` (the live check) measures only inside a
@@ -31,10 +30,9 @@ import Foundation
 /// was the single user of that home's login. This is a second user, bounded
 /// by three rules:
 ///
-/// 1. **Never beside a running Loom session.** A profile whose
-///    `loom-codex-session-<profile>` container is running is not probed;
-///    Loom's live check covers it. Its quota container stays up but idle —
-///    `sleep` opens nothing in the home — so only an `exec` counts as use.
+/// 1. **Loom owns the profile whenever its session container exists.** Even
+///    a stopped session can restart and refresh the login. While its name is
+///    in `docker ps -a`, leave the profile and any existing quota container alone.
 /// 2. **The whole home is mounted, never `auth.json` alone.** Codex replaces
 ///    `auth.json` by rename and serializes writers on `auth.lock` in the same
 ///    directory (codex-rs `login/src/auth/storage.rs`). A single-file bind
@@ -64,12 +62,9 @@ import Foundation
 enum CodexQuotaContainer {
     // MARK: - Configuration
 
-    /// `LLM_MONITOR_CODEX_QUOTA_CONTAINER=0` (or `false`/`off`/`no`) turns the
-    /// whole feature off. Anything else, including unset, leaves it on.
+    /// Creating containers and using a profile's login require an explicit opt-in.
     static func isEnabled(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
-        guard let raw = AppPaths.environment("CODEX_QUOTA_CONTAINER", in: environment)?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return true }
-        return !["0", "false", "off", "no"].contains(raw)
+        environment["LLM_MONITOR_CODEX_QUOTA_CONTAINER"] == "1"
     }
 
     /// The Codex release baked into the built-in image. Bump it here; the tag
@@ -246,7 +241,7 @@ enum CodexQuotaContainer {
 
     /// Every container, running or not, by name — or nil when the runtime did
     /// not answer (not installed, daemon down, timed out), which the caller
-    /// must read as "cannot tell whether a Loom session is running", so
+    /// must read as "cannot tell whether a Loom session exists", so
     /// nothing is created or probed.
     static func listContainers(docker: String, timeout: TimeInterval = 15) async -> [String: ContainerInfo]? {
         guard let result = await SubprocessIO.runCapturing(
@@ -306,9 +301,32 @@ enum CodexQuotaContainer {
         return existing.isRunning ? .none : .start
     }
 
-    /// Containers of ours whose profile is no longer wanted. Pure.
-    static func orphans(in containers: [String: ContainerInfo], wantedNames: Set<String>) -> [String] {
-        containers.keys.filter { $0.hasPrefix(containerNamePrefix) && !wantedNames.contains($0) }.sorted()
+    /// A Loom session reserves its profile even while stopped, since Loom can restart it.
+    /// Keep any quota container for that profile idle and skip its login check.
+    struct ReconciliationPlan {
+        let eligibleHomes: [String]
+        let orphans: [String]
+    }
+
+    static func plan(
+        homes: [String], containers: [String: ContainerInfo],
+        isLoggedIn: (String) -> Bool = { CodexAuth.accountId(inHome: $0) != nil }
+    ) -> ReconciliationPlan {
+        var eligible: [String] = []
+        var wanted = Set<String>()
+        for home in homes {
+            let profile = (home as NSString).lastPathComponent
+            guard let name = containerName(profile: profile) else { continue }
+            if containers[loomSessionContainerName(profile: profile)] == nil {
+                guard isLoggedIn(home) else { continue }
+                eligible.append(home)
+            }
+            wanted.insert(name)
+        }
+        // An empty pool of managed profiles can be temporary. Leave containers in place.
+        guard !wanted.isEmpty else { return ReconciliationPlan(eligibleHomes: [], orphans: []) }
+        let orphans = containers.keys.filter { $0.hasPrefix(containerNamePrefix) && !wanted.contains($0) }
+        return ReconciliationPlan(eligibleHomes: eligible, orphans: orphans.sorted())
     }
 
     /// Bring one profile's container to the wanted state. Nil on success,
@@ -336,19 +354,17 @@ enum CodexQuotaContainer {
         return created.succeeded ? nil : failureText(created)
     }
 
-    /// One `reconcile` pass: every wanted profile has a running container,
+    /// One `reconcile` pass: every eligible profile gets a running quota container,
     /// and containers of ours for profiles that are gone are removed.
     /// Returns the homes whose container is up, and a reason per home that
     /// could not be brought up.
     static func reconcile(
-        docker: String, image: String, homes: [String], containers: [String: ContainerInfo]
+        docker: String, image: String, plan: ReconciliationPlan, containers: [String: ContainerInfo]
     ) async -> (ready: [String], failures: [String: String]) {
         var ready: [String] = []
         var failures: [String: String] = [:]
-        var wanted = Set<String>()
-        for home in homes {
+        for home in plan.eligibleHomes {
             guard let name = containerName(profile: (home as NSString).lastPathComponent) else { continue }
-            wanted.insert(name)
             if let failure = await ensureContainer(
                 docker: docker, name: name, home: home, image: image, existing: containers[name]) {
                 failures[home] = failure
@@ -356,7 +372,7 @@ enum CodexQuotaContainer {
                 ready.append(home)
             }
         }
-        for orphan in orphans(in: containers, wantedNames: wanted) {
+        for orphan in plan.orphans {
             _ = await SubprocessIO.runCapturing(executable: docker, arguments: ["rm", "-f", orphan], timeout: 30)
         }
         return (ready, failures)
@@ -376,28 +392,6 @@ enum CodexQuotaContainer {
         case reading(Reading)
         /// Why nothing was measured; already free of home paths.
         case failed(String)
-    }
-
-    /// Which homes get a container at all: nameable and logged in. Pure.
-    static func managedHomes(
-        _ homes: [String],
-        isLoggedIn: (String) -> Bool = { CodexAuth.accountId(inHome: $0) != nil }
-    ) -> [String] {
-        homes.filter { containerName(profile: ($0 as NSString).lastPathComponent) != nil && isLoggedIn($0) }
-    }
-
-    /// Which homes to probe this cycle: logged in, nameable, and with no Loom
-    /// session container running. Pure, so the self-test pins the skip rules.
-    static func eligibleHomes(
-        _ homes: [String], runningContainers: Set<String>,
-        isLoggedIn: (String) -> Bool = { CodexAuth.accountId(inHome: $0) != nil }
-    ) -> [String] {
-        homes.filter { home in
-            let profile = (home as NSString).lastPathComponent
-            guard containerName(profile: profile) != nil else { return false }
-            guard !runningContainers.contains(loomSessionContainerName(profile: profile)) else { return false }
-            return isLoggedIn(home)
-        }
     }
 
     /// Read one profile's rate limits by `exec` in its persistent container.
