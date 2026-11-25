@@ -204,6 +204,7 @@ each logged-in profile whose Loom session container is absent.
 ```bash
 docker run -d --init --restart unless-stopped \
   --name llm-monitor-codex-quota-<profile> \
+  --label "llm-monitor.quota-owner=$(cat ~/.llm-monitor/codex-quota-owner)" \
   --label "llm-monitor.codex-home=$HOME/.loom/codex-profiles/<profile>" \
   --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
   --read-only --tmpfs /tmp -e HOME=/tmp -e CODEX_HOME=/codex-home \
@@ -215,9 +216,14 @@ The container only idles (a few MB of memory) and comes back by itself after
 a reboot. On the 10-minute usage cadence the app runs
 `docker exec -i <id> codex -s read-only -a never app-server` in it, asks for
 the account's rate limits over stdio, and `codex` exits. Each cycle the app
-manages containers with its quota name prefix and a nonempty `llm-monitor.codex-home`
-label. It starts stopped containers, replaces ones whose image or mount has changed,
-and removes ones whose profiles are gone. An unlabeled container keeps its name.
+manages containers bearing its installation ID, quota name prefix and home label.
+The ID is generated on first use and saved beside `usage.db` in `codex-quota-owner`.
+When copying a data directory for a second installation, omit the ID file so
+the copy gets its own ID. The monitor starts stopped containers, replaces ones
+whose image or mount has changed, and removes ones whose profiles are gone.
+If another installation or an older container without an owner ID holds the
+name, the profile uses the other quota sources. To retire an older container, verify its profile mount and owner
+manually before removing it by ID.
 
 - **It needs Docker** (or a compatible CLI named `docker`) reachable by the
   app. `LLM_MONITOR_DOCKER_BIN` names a nonstandard binary. Without one the
@@ -239,14 +245,19 @@ and removes ones whose profiles are gone. An unlabeled container keeps its name.
   saves a refreshed login by renaming a new `auth.json` into place under a
   lock file in the same directory. Mounting only `auth.json` would make that
   save fail after the refresh token had already been rotated. LLM Monitor
-  itself never reads, copies or stores the credential. Codex also updates its
-  own state files in the profile while it runs.
+  reads the account ID from `auth.json` to identify the login. Only containerized
+  Codex uses the login tokens on this path. The monitor checks the login and
+  reported identity before writing quota or plan, and drops windows whose
+  reset time has passed, including when it reuses a cached observation. Codex
+  also updates its own state files in the profile while it runs.
 - To disable the fallback, unset `LLM_MONITOR_CODEX_QUOTA_CONTAINER` and
   restart LLM Monitor. Existing quota containers stay in place. To remove them by ID, run
 
   ```sh
-  docker ps -a --no-trunc --filter 'name=^/llm-monitor-codex-quota-' \
-    --format '{{if .Label "llm-monitor.codex-home"}}{{.ID}}{{end}}' |
+  owner=$(cat ~/.llm-monitor/codex-quota-owner) && [ -n "$owner" ] &&
+    docker ps -a --no-trunc --filter 'name=^/llm-monitor-codex-quota-' \
+      --filter "label=llm-monitor.quota-owner=$owner" \
+      --format '{{if .Label "llm-monitor.codex-home"}}{{.ID}}{{end}}' |
     while read -r id; do
       [ -z "$id" ] || docker rm -f "$id"
     done

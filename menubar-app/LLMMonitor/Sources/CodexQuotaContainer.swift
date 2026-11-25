@@ -40,9 +40,9 @@ import Foundation
 ///    would rotate the refresh token at OpenAI and then fail to save it.
 ///    Mounting the directory keeps a refresh durable and lock-serialized
 ///    against any other `codex` using that home.
-/// 3. **No credential is read, copied or stored by this app.** Only `codex`
-///    inside the container opens `auth.json`; this app sees rate-limit
-///    numbers and the plan name.
+/// 3. The host reads identity metadata from the profile's auth.json. Only
+///    Codex inside the container uses or refreshes the login tokens. The
+///    monitor checks the returned account identity before attributing usage.
 ///
 /// Codex does write into the mounted home while it runs (its SQLite state and
 /// `models_cache.json`), exactly as a session there would.
@@ -59,7 +59,7 @@ import Foundation
 /// home path.
 ///
 /// Portable core: no AppKit / SwiftUI / Combine / os.Logger — builds on Linux.
-enum CodexQuotaContainer {
+struct CodexQuotaContainer: Sendable {
     // MARK: - Configuration
 
     /// Creating containers and using a profile's login require an explicit opt-in.
@@ -169,7 +169,28 @@ enum CodexQuotaContainer {
         }
     }
 
-    /// This prefix and a nonempty home label identify containers managed by the app.
+    /// An installation owns the containers it stamped with its persistent ID.
+    /// Older containers without an owner label must be treated as occupied.
+    let ownerID: UUID
+    static let ownerLabel = "llm-monitor.quota-owner"
+
+    static func installation(in directory: URL) -> Self? {
+        let file = directory.appendingPathComponent("codex-quota-owner")
+        if !FileManager.default.fileExists(atPath: file.path) {
+            // Exclusive creation lets simultaneous first polls share the winner's ID.
+            let candidate = UUID().uuidString
+            try? Data(candidate.utf8).write(to: file, options: .withoutOverwriting)
+        }
+        guard let text = try? String(contentsOf: file, encoding: .utf8),
+              let id = UUID(uuidString: text), text == id.uuidString else { return nil }
+        return Self(ownerID: id)
+    }
+
+    private func owns(_ container: ContainerInfo) -> Bool {
+        container.owner == ownerID.uuidString && container.name.hasPrefix(Self.containerNamePrefix)
+            && !container.home.isEmpty
+    }
+
     static let containerNamePrefix = "llm-monitor-codex-quota-"
 
     /// Label recording which host directory a container mounts, so a profile
@@ -195,21 +216,22 @@ enum CodexQuotaContainer {
     /// writes into the home stays owned by that user on a Linux host.
     /// `--restart unless-stopped` brings it back after a reboot or a runtime
     /// restart; `--init` makes the idle `sleep` stop promptly.
-    static func createArguments(
+    func createArguments(
         name: String, home: String, image: String, uid: UInt32, gid: UInt32
     ) -> [String] {
         [
             "run", "-d", "--init",
             "--restart", "unless-stopped",
             "--name", name,
-            "--label", "\(homeLabel)=\(home)",
+            "--label", "\(Self.homeLabel)=\(home)",
+            "--label", "\(Self.ownerLabel)=\(ownerID.uuidString)",
             "--user", "\(uid):\(gid)",
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
             "--read-only", "--tmpfs", "/tmp",
             "-e", "HOME=/tmp",
-            "-e", "CODEX_HOME=\(containerHome)",
-            "-v", "\(home):\(containerHome)",
+            "-e", "CODEX_HOME=\(Self.containerHome)",
+            "-v", "\(home):\(Self.containerHome)",
             image, "sleep", "infinity",
         ]
     }
@@ -226,25 +248,25 @@ enum CodexQuotaContainer {
         /// `running`, `exited`, `created`, `paused`, `restarting`, `dead`.
         let state: String
         let image: String
-        /// The `homeLabel` value; empty on a container that is not ours.
         let home: String
+        let owner: String
         var isRunning: Bool { state == "running" }
-        var isManagedQuotaContainer: Bool { name.hasPrefix(containerNamePrefix) && !home.isEmpty }
     }
 
     static let listArguments = [
         "ps", "-a", "--no-trunc", "--format",
-        "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Image}}\t{{.Label \"\(homeLabel)\"}}",
+        "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Image}}\t{{.Label \"\(homeLabel)\"}}\t{{.Label \"\(ownerLabel)\"}}",
     ]
 
     /// Parse `listArguments` output. Pure, for the self-test.
     static func parseContainerList(_ text: String) -> [String: ContainerInfo]? {
         var out: [String: ContainerInfo] = [:]
         for line in text.split(whereSeparator: \.isNewline) {
-            let fields = line.split(separator: "\t", maxSplits: 4, omittingEmptySubsequences: false).map(String.init)
+            let fields = line.split(separator: "\t", maxSplits: 5, omittingEmptySubsequences: false).map(String.init)
             guard fields.count >= 4, !fields[0].isEmpty, !fields[1].isEmpty else { return nil }
             let info = ContainerInfo(id: fields[0], name: fields[1], state: fields[2],
-                                     image: fields[3], home: fields.count == 5 ? fields[4] : "")
+                                     image: fields[3], home: fields.count >= 5 ? fields[4] : "",
+                                     owner: fields.count == 6 ? fields[5] : "")
             out[info.name] = info
         }
         return out
@@ -308,9 +330,9 @@ enum CodexQuotaContainer {
     }
 
     /// Pure decision for one profile, for the self-test.
-    static func action(existing: ContainerInfo?, home: String, image: String) -> Action {
+    func action(existing: ContainerInfo?, home: String, image: String) -> Action {
         guard let existing = existing else { return .create }
-        guard existing.isManagedQuotaContainer else { return .occupied }
+        guard owns(existing) else { return .occupied }
         guard existing.image == image, existing.home.utf8.elementsEqual(home.utf8) else { return .replace(existing.id) }
         return existing.isRunning ? .none : .start(existing.id)
     }
@@ -322,12 +344,12 @@ enum CodexQuotaContainer {
         let orphanIDs: [String]
     }
 
-    static func plan(
+    func plan(
         homes: [String], containers: [String: ContainerInfo],
         isLoggedIn: (String) -> Bool = { CodexAuth.accountId(inHome: $0) != nil }
     ) -> ReconciliationPlan {
         let homesByName = Dictionary(grouping: homes) { home in
-            containerName(profile: (home as NSString).lastPathComponent)
+            Self.containerName(profile: (home as NSString).lastPathComponent)
         }
         var eligible: [String] = []
         var wanted = Set<String>()
@@ -335,8 +357,8 @@ enum CodexQuotaContainer {
             guard let name, let home = candidates.first else { continue }
             // Linux paths can be byte-distinct even when Swift strings compare equal.
             let uniqueHome = candidates.dropFirst().allSatisfy { $0.utf8.elementsEqual(home.utf8) }
-            if uniqueHome, containers[name]?.isManagedQuotaContainer != false,
-               loomSessionIsAbsent(home: home, containers: containers) {
+            if uniqueHome, containers[name].map(owns) != false,
+               Self.loomSessionIsAbsent(home: home, containers: containers) {
                 guard isLoggedIn(home) else { continue }
                 eligible.append(home)
             }
@@ -345,13 +367,13 @@ enum CodexQuotaContainer {
         }
         // An empty pool of managed profiles can be temporary. Leave containers in place.
         guard !wanted.isEmpty else { return ReconciliationPlan(eligibleHomes: [], orphanIDs: []) }
-        let orphans = containers.values.filter { $0.isManagedQuotaContainer && !wanted.contains($0.name) }
+        let orphans = containers.values.filter { owns($0) && !wanted.contains($0.name) }
         return ReconciliationPlan(eligibleHomes: eligible.sorted(), orphanIDs: orphans.map(\.id).sorted())
     }
 
     /// Bring one profile's container to the wanted state. Nil on success,
     /// else a short reason.
-    static func ensureContainer(
+    func ensureContainer(
         docker: String, name: String, home: String, image: String, existing: ContainerInfo?
     ) async -> String? {
         switch action(existing: existing, home: home, image: image) {
@@ -372,20 +394,20 @@ enum CodexQuotaContainer {
             arguments: createArguments(name: name, home: home, image: image, uid: getuid(), gid: getgid()),
             timeout: 120
         ) else { return "could not start the container runtime" }
-        return created.succeeded ? nil : failureText(created)
+        return created.succeeded ? nil : Self.failureText(created)
     }
 
     /// One `reconcile` pass: every eligible profile gets a running quota container,
     /// and containers of ours for profiles that are gone are removed.
     /// Returns the homes whose container is up, and a reason per home that
     /// could not be brought up.
-    static func reconcile(
+    func reconcile(
         docker: String, image: String, plan: ReconciliationPlan, containers: [String: ContainerInfo]
     ) async -> (ready: [String], failures: [String: String]) {
         var ready: [String] = []
         var failures: [String: String] = [:]
         for home in plan.eligibleHomes {
-            guard let name = containerName(profile: (home as NSString).lastPathComponent) else { continue }
+            guard let name = Self.containerName(profile: (home as NSString).lastPathComponent) else { continue }
             if let failure = await ensureContainer(
                 docker: docker, name: name, home: home, image: image, existing: containers[name]) {
                 failures[home] = failure
@@ -405,8 +427,20 @@ enum CodexQuotaContainer {
     struct Reading: Sendable {
         /// When the probe ran — the timestamp any row written from it carries.
         let observedAt: Date
-        let rateLimit: RateLimitSnapshot
+        let accountId: String
+        let email: String?
+        var rateLimit: RateLimitSnapshot
         let plan: String?
+
+        /// A cached observation can outlive one or both primary windows.
+        func current(at now: Date) -> Self? {
+            func active(_ window: RateLimitWindow) -> Bool { window.resetAt.map { $0 > now } ?? true }
+            var reading = self
+            reading.rateLimit.session = rateLimit.session.flatMap { active($0) ? $0 : nil }
+            reading.rateLimit.weekly = rateLimit.weekly.flatMap { active($0) ? $0 : nil }
+            reading.rateLimit.named = rateLimit.named.filter { active($0.value) }
+            return reading.rateLimit.isEmpty ? nil : reading
+        }
     }
 
     enum ProbeResult: Sendable {
@@ -421,34 +455,41 @@ enum CodexQuotaContainer {
     /// runtime's CLI at a deadline does not stop the `codex` it started
     /// inside, and the next `reconcile` creates a clean one. Any other
     /// failure leaves the container alone — recreating it would not help.
-    static func probe(
+    func probe(
         docker: String, home: String,
         timeouts: CodexAppServerClient.Timeouts = CodexAppServerClient.Timeouts()
     ) async -> ProbeResult {
         let profile = (home as NSString).lastPathComponent
-        guard let name = containerName(profile: profile) else {
+        guard let name = Self.containerName(profile: profile) else {
             return .failed("profile name cannot name a container")
         }
         // Provisioning and earlier probe batches may have taken time. Recheck
         // Loom ownership and bind the exec and its timeout cleanup to the
         // exact container that was provisioned for this home.
-        guard let containers = await listContainers(docker: docker) else {
+        guard let containers = await Self.listContainers(docker: docker) else {
             return .failed("could not verify container ownership")
         }
-        guard loomSessionIsAbsent(home: home, containers: containers) else {
+        guard Self.loomSessionIsAbsent(home: home, containers: containers) else {
             return .failed("could not rule out a Loom session for this profile")
         }
-        guard let quota = containers[name], quota.isRunning, quota.home.utf8.elementsEqual(home.utf8) else {
+        guard let quota = containers[name], owns(quota), quota.isRunning, quota.home.utf8.elementsEqual(home.utf8) else {
             return .failed("running quota container for this home could not be verified")
         }
+        guard let accountId = CodexAuth.accountId(inHome: home) else { return .failed("no profile login") }
         let client = CodexAppServerClient(
             codexHome: home, timeouts: timeouts,
-            containerLaunch: .init(executable: docker, arguments: execArguments(containerID: quota.id))
+            containerLaunch: .init(executable: docker, arguments: Self.execArguments(containerID: quota.id))
         )
         do {
             let usage = try await client.fetchUsage()
-            guard !usage.rateLimit.isEmpty else { return .failed("Codex reported no rate-limit window") }
-            return .reading(Reading(observedAt: Date(), rateLimit: usage.rateLimit, plan: usage.plan))
+            guard CodexAuth.accountId(inHome: home) == accountId else {
+                return .failed("profile login changed during probe")
+            }
+            let now = Date()
+            let reading = Reading(observedAt: now, accountId: accountId, email: usage.email,
+                                  rateLimit: usage.rateLimit, plan: usage.plan)
+            guard let current = reading.current(at: now) else { return .failed("no current rate-limit window") }
+            return .reading(current)
         } catch {
             if case CodexAppServerError.timedOut = error {
                 _ = await SubprocessIO.runCapturing(executable: docker, arguments: ["rm", "-f", quota.id], timeout: 30)
@@ -458,7 +499,7 @@ enum CodexQuotaContainer {
     }
 
     /// Probe several homes, at most `concurrency` at a time, keyed by home.
-    static func probeAll(
+    func probeAll(
         docker: String, homes: [String], concurrency: Int = 4
     ) async -> [String: ProbeResult] {
         var results: [String: ProbeResult] = [:]

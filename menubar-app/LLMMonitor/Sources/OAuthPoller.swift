@@ -900,8 +900,8 @@ class OAuthPoller: ObservableObject {
     }
 
     /// Read one Loom profile's current rate limits, from whichever of the
-    /// three sources saw the account most recently. Spawns nothing itself and
-    /// never reads a credential (see `CodexProfiles` / `LoomAccountsCheck` /
+    /// three sources saw the account most recently. The host reads identity
+    /// metadata to check the registration (see `CodexProfiles` / `LoomAccountsCheck` /
     /// `CodexQuotaContainer`); the two probed sources are cached per cycle.
     ///
     /// 1. **Loom's live check** (`LoomAccountsCheck`, #230) — measured inside
@@ -930,11 +930,24 @@ class OAuthPoller: ObservableObject {
         // pre-snapshot "Token refresh failed"), which read as the cause.
         // `persistCredentialError` deliberately leaves `last_poll_at` alone,
         // so the staleness backstop still sees an unpolled row (#148).
+        let loginID = CodexAuth.accountId(inHome: home)
         func reportNoReading(rolledOver: Bool) {
             let message = Self.codexSnapshotDiagnostic(home: home, rolledOver: rolledOver)
-            let loggedOut = CodexAuth.accountId(inHome: home) == nil
-            updateCredentialStatus(credential, status: loggedOut || !rolledOver ? .missing : .valid, error: message)
+            updateCredentialStatus(credential, status: loginID == nil || !rolledOver ? .missing : .valid, error: message)
             if let id = credential.id { persistCredentialError(id: id, error: message) }
+        }
+        let registeredEmail = storedEmail(for: accountId)
+        let nativeKey = accountId.hasPrefix(CodexProfiles.accountIdPrefix) ? nil : loginID
+        let needsEmail = registeredEmail != nil && !Self.accountIdsComparable(stored: accountId, reported: nativeKey)
+        if loginID != nil, case .drifted = Self.codexHomeDrift(
+            registeredAccountId: accountId, registeredEmail: registeredEmail, homeAccountId: nativeKey,
+            homeEmail: needsEmail ? CodexAuth.email(inHome: home) : nil
+        ) {
+            // A rollout or live result for this home could also belong to the new login.
+            let message = "The Loom profile is logged in to a different account than its registration."
+            updateCredentialStatus(credential, status: .drifted, error: message)
+            if let id = credential.id { persistCredentialError(id: id, error: message) }
+            return
         }
         let rollout = CodexProfiles.latestSnapshot(home: home)
         let usableRollout = rollout.flatMap { $0.rateLimit.isEmpty ? nil : $0 }
@@ -954,7 +967,10 @@ class OAuthPoller: ObservableObject {
             best = (live.observedAt, live.rateLimit, nil, "loom-accounts-check-live")
         }
         if let quota = codexQuotaContainerReading(home: home),
-           best.map({ quota.observedAt > $0.observedAt }) ?? true {
+           best.map({ quota.observedAt > $0.observedAt }) ?? true,
+           quota.accountId == loginID,
+           Self.compareProfileIdentity(storedID: accountId, storedEmail: registeredEmail,
+                                       loginID: quota.accountId, email: quota.email) == .match {
             best = (quota.observedAt, quota.rateLimit, quota.plan, "codex-quota-container")
         }
         if let best = best {
@@ -1100,8 +1116,21 @@ class OAuthPoller: ObservableObject {
     private var lastCodexQuotaContainerNotice: String?
     private var lastCodexQuotaProbeFailure: [String: String] = [:]
 
-    func codexQuotaContainerReading(home: String) -> CodexQuotaContainer.Reading? {
-        codexQuotaContainerReadings[Data(home.utf8)]
+    /// Snapshot registrations can use a profile-generated or legacy key. When
+    /// the native IDs cannot be compared, only matching email confirms identity.
+    nonisolated static func compareProfileIdentity(
+        storedID: String, storedEmail: String?, loginID: String, email: String?
+    ) -> CodexIdentityComparison {
+        let emailMatch = compareIdentities(reported: email, stored: storedEmail)
+        if case .conflict = emailMatch { return emailMatch }
+        if !storedID.hasPrefix(CodexProfiles.accountIdPrefix), accountIdsComparable(stored: storedID, reported: loginID) {
+            return compareIdentities(reported: loginID, stored: storedID)
+        }
+        return emailMatch
+    }
+
+    func codexQuotaContainerReading(home: String, now: Date = Date()) -> CodexQuotaContainer.Reading? {
+        codexQuotaContainerReadings[Data(home.utf8)]?.current(at: now)
     }
 
     func setCodexQuotaContainerReading(_ reading: CodexQuotaContainer.Reading, home: String) {
@@ -1144,7 +1173,12 @@ class OAuthPoller: ObservableObject {
                                     warning: true)
             return 0
         }
-        let plan = CodexQuotaContainer.plan(homes: homes, containers: containers)
+        let dataDirectory = URL(fileURLWithPath: dbPath).deletingLastPathComponent()
+        guard let installation = CodexQuotaContainer.installation(in: dataDirectory) else {
+            noteCodexQuotaContainer("Codex quota containers skipped: installation ID unavailable", warning: true)
+            return 0
+        }
+        let plan = installation.plan(homes: homes, containers: containers)
         let image = CodexQuotaContainer.image(environment: environment)
         if !plan.eligibleHomes.isEmpty, image.isBuiltIn, codexQuotaImageState != .ready {
             if await CodexQuotaContainer.imageExists(docker: docker, image: image.name) {
@@ -1171,7 +1205,7 @@ class OAuthPoller: ObservableObject {
             }
         }
 
-        let reconciled = await CodexQuotaContainer.reconcile(
+        let reconciled = await installation.reconcile(
             docker: docker, image: image.name, plan: plan, containers: containers)
         for (home, reason) in reconciled.failures {
             let profile = (home as NSString).lastPathComponent
@@ -1181,10 +1215,9 @@ class OAuthPoller: ObservableObject {
                 flog.warning("Codex quota container for profile \(profile): \(message)", category: fcat)
             }
         }
-        // Provisioning may take time, so recheck the login before probing.
-        let ready = reconciled.ready.filter { CodexAuth.accountId(inHome: $0) != nil }
+        let ready = reconciled.ready
         guard !ready.isEmpty else { return 0 }
-        let results = await CodexQuotaContainer.probeAll(docker: docker, homes: ready)
+        let results = await installation.probeAll(docker: docker, homes: ready)
         var measured = 0
         for (home, result) in results {
             let profile = (home as NSString).lastPathComponent
