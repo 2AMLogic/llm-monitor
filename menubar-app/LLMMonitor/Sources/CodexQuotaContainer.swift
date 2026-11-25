@@ -19,11 +19,11 @@ import Foundation
 ///
 /// which idles (it runs nothing but `sleep`) and survives app restarts and
 /// reboots. Each reading is one
-/// `docker exec -i <name> codex -s read-only -a never app-server`, spoken to
+/// `docker exec -i <id> codex -s read-only -a never app-server`, spoken to
 /// by the existing `CodexAppServerClient` handshake (`ContainerLaunch`), so
-/// the wire handling is the one implementation. `reconcile` is the single
-/// place a container is created, started, replaced or removed: it runs once
-/// per cycle from one `docker ps -a` read.
+/// the wire handling is the one implementation. `reconcile` manages containers
+/// from the initial `docker ps -a` listing. Each probe refreshes that listing
+/// before launch and uses the verified container's ID for timeout cleanup.
 ///
 /// **What this changes about ownership, deliberately.** Until now this app
 /// never ran `codex` against a profile home, because Loom's session container
@@ -168,8 +168,8 @@ enum CodexQuotaContainer {
     static let homeLabel = "llm-monitor.codex-home"
 
     /// This app's container for a profile, or nil for a profile name with no
-    /// characters a container name may carry. Fixed per profile: one account,
-    /// one container.
+    /// characters a container name may carry. `plan` checks for collisions
+    /// across registered homes before using this name.
     static func containerName(profile: String) -> String? {
         let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
         let cleaned = String(profile.map { allowed.contains($0) ? $0 : "-" })
@@ -206,12 +206,13 @@ enum CodexQuotaContainer {
     }
 
     /// Everything between the runtime binary and `codex …` for one reading.
-    static func execArguments(name: String) -> [String] { ["exec", "-i", name] }
+    static func execArguments(containerID: String) -> [String] { ["exec", "-i", containerID] }
 
     // MARK: - Runtime queries
 
     /// One row of `docker ps -a`.
     struct ContainerInfo: Sendable, Equatable {
+        let id: String
         let name: String
         /// `running`, `exited`, `created`, `paused`, `restarting`, `dead`.
         let state: String
@@ -222,19 +223,19 @@ enum CodexQuotaContainer {
     }
 
     static let listArguments = [
-        "ps", "-a", "--format",
-        "{{.Names}}\t{{.State}}\t{{.Image}}\t{{.Label \"\(homeLabel)\"}}",
+        "ps", "-a", "--no-trunc", "--format",
+        "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Image}}\t{{.Label \"\(homeLabel)\"}}",
     ]
 
     /// Parse `listArguments` output. Pure, for the self-test.
-    static func parseContainerList(_ text: String) -> [String: ContainerInfo] {
+    static func parseContainerList(_ text: String) -> [String: ContainerInfo]? {
         var out: [String: ContainerInfo] = [:]
         for line in text.split(whereSeparator: \.isNewline) {
-            let fields = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-            guard fields.count >= 3, !fields[0].isEmpty else { continue }
-            out[fields[0]] = ContainerInfo(
-                name: fields[0], state: fields[1], image: fields[2],
-                home: fields.count > 3 ? fields[3] : "")
+            let fields = line.split(separator: "\t", maxSplits: 4, omittingEmptySubsequences: false).map(String.init)
+            guard fields.count >= 4, !fields[0].isEmpty, !fields[1].isEmpty else { return nil }
+            let info = ContainerInfo(id: fields[0], name: fields[1], state: fields[2],
+                                     image: fields[3], home: fields.count == 5 ? fields[4] : "")
+            out[info.name] = info
         }
         return out
     }
@@ -297,7 +298,7 @@ enum CodexQuotaContainer {
     /// Pure decision for one profile, for the self-test.
     static func action(existing: ContainerInfo?, home: String, image: String) -> Action {
         guard let existing = existing else { return .create }
-        guard existing.image == image, existing.home == home else { return .replace }
+        guard existing.image == image, existing.home.utf8.elementsEqual(home.utf8) else { return .replace }
         return existing.isRunning ? .none : .start
     }
 
@@ -312,21 +313,27 @@ enum CodexQuotaContainer {
         homes: [String], containers: [String: ContainerInfo],
         isLoggedIn: (String) -> Bool = { CodexAuth.accountId(inHome: $0) != nil }
     ) -> ReconciliationPlan {
+        let homesByName = Dictionary(grouping: homes) { home in
+            containerName(profile: (home as NSString).lastPathComponent)
+        }
         var eligible: [String] = []
         var wanted = Set<String>()
-        for home in homes {
+        for (name, candidates) in homesByName {
+            guard let name, let home = candidates.first else { continue }
+            // Linux paths can be byte-distinct even when Swift strings compare equal.
+            let uniqueHome = candidates.dropFirst().allSatisfy { $0.utf8.elementsEqual(home.utf8) }
             let profile = (home as NSString).lastPathComponent
-            guard let name = containerName(profile: profile) else { continue }
-            if containers[loomSessionContainerName(profile: profile)] == nil {
+            if uniqueHome, containers[loomSessionContainerName(profile: profile)] == nil {
                 guard isLoggedIn(home) else { continue }
                 eligible.append(home)
             }
+            // Reserve shared names and Loom-owned profiles from orphan cleanup.
             wanted.insert(name)
         }
         // An empty pool of managed profiles can be temporary. Leave containers in place.
         guard !wanted.isEmpty else { return ReconciliationPlan(eligibleHomes: [], orphans: []) }
         let orphans = containers.keys.filter { $0.hasPrefix(containerNamePrefix) && !wanted.contains($0) }
-        return ReconciliationPlan(eligibleHomes: eligible, orphans: orphans.sorted())
+        return ReconciliationPlan(eligibleHomes: eligible.sorted(), orphans: orphans.sorted())
     }
 
     /// Bring one profile's container to the wanted state. Nil on success,
@@ -408,9 +415,21 @@ enum CodexQuotaContainer {
         guard let name = containerName(profile: profile) else {
             return .failed("profile name cannot name a container")
         }
+        // Provisioning and earlier probe batches may have taken time. Recheck
+        // Loom ownership and bind the exec and its timeout cleanup to the
+        // exact container that was provisioned for this home.
+        guard let containers = await listContainers(docker: docker) else {
+            return .failed("could not verify container ownership")
+        }
+        guard containers[loomSessionContainerName(profile: profile)] == nil else {
+            return .failed("profile reserved by a Loom session")
+        }
+        guard let quota = containers[name], quota.isRunning, quota.home.utf8.elementsEqual(home.utf8) else {
+            return .failed("running quota container for this home could not be verified")
+        }
         let client = CodexAppServerClient(
             codexHome: home, timeouts: timeouts,
-            containerLaunch: .init(executable: docker, arguments: execArguments(name: name))
+            containerLaunch: .init(executable: docker, arguments: execArguments(containerID: quota.id))
         )
         do {
             let usage = try await client.fetchUsage()
@@ -418,7 +437,7 @@ enum CodexQuotaContainer {
             return .reading(Reading(observedAt: Date(), rateLimit: usage.rateLimit, plan: usage.plan))
         } catch {
             if case CodexAppServerError.timedOut = error {
-                _ = await SubprocessIO.runCapturing(executable: docker, arguments: ["rm", "-f", name], timeout: 30)
+                _ = await SubprocessIO.runCapturing(executable: docker, arguments: ["rm", "-f", quota.id], timeout: 30)
             }
             return .failed(redactHomePaths(inText: error.localizedDescription))
         }

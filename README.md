@@ -212,7 +212,7 @@ docker run -d --init --restart unless-stopped \
 
 The container only idles (a few MB of memory) and comes back by itself after
 a reboot. On the 10-minute usage cadence the app runs
-`docker exec -i <name> codex -s read-only -a never app-server` in it, asks for
+`docker exec -i <id> codex -s read-only -a never app-server` in it, asks for
 the account's rate limits over stdio, and `codex` exits. Each cycle the app
 also starts a stopped container, replaces one whose image or mount is out of
 date, and removes one whose profile is gone. What to know:
@@ -227,8 +227,10 @@ date, and removes one whose profile is gone. What to know:
   `codex` on its `PATH`; that image is never built by the app.
 - **A Loom session reserves its profile even while stopped.** If
   `loom-codex-session-<profile>` appears in `docker ps -a`, LLM Monitor skips
-  that profile and leaves any existing quota container alone. A restarted
-  Loom session can then refresh the profile's login.
+  that profile and leaves any existing quota container alone. The app checks
+  again immediately before each probe and skips it if Docker cannot confirm
+  ownership. If two registered homes map to the same quota container name,
+  both use the other quota sources and the shared container is left alone.
 - **The whole profile directory is mounted read-write, on purpose.** Codex
   saves a refreshed login by renaming a new `auth.json` into place under a
   lock file in the same directory. Mounting only `auth.json` would make that

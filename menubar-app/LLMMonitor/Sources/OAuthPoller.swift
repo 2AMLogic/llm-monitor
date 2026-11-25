@@ -1091,7 +1091,8 @@ class OAuthPoller: ObservableObject {
     /// The newest container reading per profile home. Kept across a failed
     /// run like `loomLiveReadings`: it carries its own timestamp, so the
     /// newer-wins rule and the staleness backstop retire it.
-    private var codexQuotaContainerReadings: [String: CodexQuotaContainer.Reading] = [:]
+    /// UTF-8 keys preserve distinct filesystem paths through quota attribution.
+    private var codexQuotaContainerReadings: [Data: CodexQuotaContainer.Reading] = [:]
     private enum CodexQuotaImageState { case unknown, building, ready, failed }
     private var codexQuotaImageState = CodexQuotaImageState.unknown
     /// Last thing said about the feature as a whole and about each profile,
@@ -1100,12 +1101,11 @@ class OAuthPoller: ObservableObject {
     private var lastCodexQuotaProbeFailure: [String: String] = [:]
 
     func codexQuotaContainerReading(home: String) -> CodexQuotaContainer.Reading? {
-        codexQuotaContainerReadings[home]
+        codexQuotaContainerReadings[Data(home.utf8)]
     }
 
-    /// Test seam: inject container readings without a container runtime.
-    func setCodexQuotaContainerReadings(_ readings: [String: CodexQuotaContainer.Reading]) {
-        codexQuotaContainerReadings = readings
+    func setCodexQuotaContainerReading(_ reading: CodexQuotaContainer.Reading, home: String) {
+        codexQuotaContainerReadings[Data(home.utf8)] = reading
     }
 
     private func noteCodexQuotaContainer(_ notice: String, warning: Bool = false) {
@@ -1190,7 +1190,7 @@ class OAuthPoller: ObservableObject {
             let profile = (home as NSString).lastPathComponent
             switch result {
             case .reading(let reading):
-                codexQuotaContainerReadings[home] = reading
+                setCodexQuotaContainerReading(reading, home: home)
                 lastCodexQuotaProbeFailure[profile] = nil
                 measured += 1
             case .failed(let reason):

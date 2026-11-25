@@ -2130,11 +2130,14 @@ enum SelfTest {
             }
             let profileHome = credential()?.codexHome ?? home
             poller.setLoomCodexLiveReadings(["agent-1": reading(at: liveAt, weekly: 61)])
-            poller.setCodexQuotaContainerReadings([profileHome: quota(at: liveAt.addingTimeInterval(-60), weekly: 9)])
+            poller.setCodexQuotaContainerReading(quota(at: liveAt.addingTimeInterval(-60), weekly: 9), home: profileHome)
             if let credential = credential() { poller.pollCodexSnapshot(credential) }
             expectEqual(weeklyRows().last?.1, 61, "an older quota-container reading never displaces a newer one")
             let quotaAt = liveAt.addingTimeInterval(1800)
-            poller.setCodexQuotaContainerReadings([profileHome: quota(at: quotaAt, weekly: 88)])
+            poller.setCodexQuotaContainerReading(quota(at: quotaAt, weekly: 88), home: profileHome)
+            poller.setCodexQuotaContainerReading(quota(at: quotaAt, weekly: 21), home: "/p/\u{e9}")
+            expect(poller.codexQuotaContainerReading(home: "/p/e\u{301}") == nil,
+                   "a byte-distinct home cannot inherit another home's cached reading")
             if let credential = credential() { poller.pollCodexSnapshot(credential) }
             expectEqual(weeklyRows().last?.1, 88, "the newest of the three sources is the quota container")
             expectEqual(weeklyRows().last?.0, ISO8601DateFormatter().string(from: quotaAt),
@@ -2172,17 +2175,17 @@ enum SelfTest {
         expect(args.contains("/p/agent-1:/codex-home") && args.contains("CODEX_HOME=/codex-home"),
                "the whole home directory is mounted (never auth.json alone) and named as CODEX_HOME")
         expect(args.contains("501:20"), "it runs as the invoking user")
-        expectEqual(CodexQuotaContainer.execArguments(name: name), ["exec", "-i", name],
+        expectEqual(CodexQuotaContainer.execArguments(containerID: "abc123"), ["exec", "-i", "abc123"],
                     "a reading is an exec in the existing container")
 
         // Reconcile decisions from one `docker ps -a` read.
         let listing = [
-            "\(name)\trunning\timg:1\t/p/agent-1",
-            "llm-monitor-codex-quota-agent-2\texited\timg:1\t/p/agent-2",
-            "llm-monitor-codex-quota-gone\trunning\timg:1\t/p/gone",
-            "loom-codex-session-agent-2\trunning\tloom:1\t",
+            "abc123\t\(name)\trunning\timg:1\t/p/agent-1",
+            "def456\tllm-monitor-codex-quota-agent-2\texited\timg:1\t/p/agent-2",
+            "bad654\tllm-monitor-codex-quota-gone\trunning\timg:1\t/p/gone",
+            "aaa111\tloom-codex-session-agent-2\trunning\tloom:1\t",
         ].joined(separator: "\n")
-        let listed = CodexQuotaContainer.parseContainerList(listing)
+        let listed = CodexQuotaContainer.parseContainerList(listing) ?? [:]
         expectEqual(listed.count, 4, "every row of the listing is read")
         expectEqual(listed["loom-codex-session-agent-2"]?.home, "", "a container that is not ours has no home label")
         expectEqual(CodexQuotaContainer.action(existing: listed[name], home: "/p/agent-1", image: "img:1"),
@@ -2201,10 +2204,18 @@ enum SelfTest {
             checkedHomes.append(home)
             return home != "/p/agent-3"
         }
-        expectEqual(checkedHomes, ["/p/agent-1", "/p/agent-3"], "a reserved profile needs no login check")
+        expectEqual(checkedHomes.sorted(), ["/p/agent-1", "/p/agent-3"], "a reserved profile needs no login check")
         expectEqual(plan.eligibleHomes, ["/p/agent-1"], "only logged-in profiles without a Loom session qualify")
         expectEqual(plan.orphans, ["llm-monitor-codex-quota-gone"],
                     "only quota containers for departed profiles are removed")
+
+        let collisions = CodexQuotaContainer.plan(
+            homes: ["/p/agent-1", "/p/agent 1", "/p/n-\u{e9}", "/p/n-e\u{301}", "/p/unique", "/p/unique"],
+            containers: listed
+        ) { _ in true }
+        expectEqual(collisions.eligibleHomes, ["/p/unique"],
+                    "homes that sanitize to the same name are skipped and a repeated home is probed once")
+        expect(!collisions.orphans.contains(name), "a shared container name is reserved from cleanup")
 
         expectEqual(CodexQuotaContainer.image(environment: [:]).name, CodexQuotaContainer.builtInImage,
                     "with no override the built-in image is used")
@@ -2248,6 +2259,7 @@ enum SelfTest {
                 let dbPath = dir.appendingPathComponent("usage.db").path
                 let profileRoot = dir.appendingPathComponent("profiles")
                 let home = profileRoot.appendingPathComponent("agent-1").path
+                let wedgedHome = dir.appendingPathComponent("agent-2").path
                 for profile in ["agent-1", "reserved-running", "reserved-stopped"] {
                     let profileDir = profileRoot.appendingPathComponent(profile)
                     try FileManager.default.createDirectory(at: profileDir, withIntermediateDirectories: true)
@@ -2257,7 +2269,21 @@ enum SelfTest {
                 UsageStore(dbPath: dbPath).ensureDatabase()
                 let poller = OAuthPoller(dbPath: dbPath)
                 expectEqual(poller.syncCodexProfiles(root: profileRoot.path), 3, "all three test profiles register")
-                let credentials = poller.loadActiveCredentials()
+                let listing = dir.appendingPathComponent("listing")
+                let afterCreate = dir.appendingPathComponent("after-create")
+                let afterExec = dir.appendingPathComponent("after-exec")
+                let reserved = [
+                    "aaa111\tloom-codex-session-reserved-running\trunning\tloom:1\t",
+                    "aaa222\tloom-codex-session-reserved-stopped\texited\tloom:1\t",
+                    "aaa333\tllm-monitor-codex-quota-reserved-stopped\texited\timg:1\t",
+                ]
+                let initial = reserved + ["aaa444\tllm-monitor-codex-quota-old\texited\timg:1\t/p/old"]
+                let provisioned = reserved + ["abc123\tllm-monitor-codex-quota-agent-1\trunning\timg:1\t\(home)"]
+                func writeListing(_ rows: [String], to file: URL) throws {
+                    try rows.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+                }
+                try writeListing(initial, to: listing)
+                try writeListing(provisioned, to: afterCreate)
                 let oneLine: (String) -> String = { $0.replacingOccurrences(of: "\n", with: "") }
                 let stub = try writeStub(in: dir, name: "docker", body: """
                 #!/bin/sh
@@ -2265,15 +2291,12 @@ enum SelfTest {
                 case "$1" in
                   ps)
                     [ "$2" = "-a" ] || exit 1
-                    printf 'loom-codex-session-reserved-running\\trunning\\tloom:1\\n'
-                    printf 'loom-codex-session-reserved-stopped\\texited\\tloom:1\\n'
-                    printf 'llm-monitor-codex-quota-reserved-stopped\\texited\\timg:1\\n'
-                    printf 'llm-monitor-codex-quota-old\\texited\\timg:1\\t/p/old\\n'
-                    exit 0 ;;
+                    cat '\(listing.path)' ;;
                   rm|start) exit 0 ;;
-                  run) echo abc123; exit 0 ;;
+                  run) cp '\(afterCreate.path)' '\(listing.path)' && echo abc123 ;;
                   exec)
-                    case "$*" in *agent-2*) sleep 30; exit 0 ;; esac
+                    if [ -f '\(afterExec.path)' ]; then cp '\(afterExec.path)' '\(listing.path)'; fi
+                    case "$3" in def456) sleep 30; exit 0 ;; abc123) ;; *) exit 1 ;; esac
                     echo '{"id":1,"result":{"userAgent":"stub"}}'
                     echo '{"id":2,"result":\(oneLine(codexAccountFixture))}'
                     echo '{"id":3,"result":\(oneLine(codexRateLimitsFixture))}'
@@ -2287,7 +2310,7 @@ enum SelfTest {
                     var measured: Int?
                     let task = Task {
                         measured = await poller.refreshCodexQuotaContainerReadings(
-                            for: credentials, force: true, environment: environment)
+                            for: poller.loadActiveCredentials(), force: true, environment: environment)
                     }
                     let deadline = Date().addingTimeInterval(30)
                     while measured == nil && Date() < deadline {
@@ -2314,15 +2337,60 @@ enum SelfTest {
 
                 expectEqual(poller.codexQuotaContainerReading(home: home)?.rateLimit.weekly?.usedPercent, 37,
                             "a containerized handshake maps exactly like a host one")
-                expect(logged.contains("exec -i llm-monitor-codex-quota-agent-1 codex -s read-only -a never app-server"),
+                expect(logged.contains("exec -i abc123 codex -s read-only -a never app-server"),
                        "a reading is codex app-server exec'd in the profile's own container")
-                expect(!logged.contains("rm -f llm-monitor-codex-quota-agent-1"),
+                expect(!logged.contains("rm -f abc123"),
                        "a successful probe leaves the persistent container in place")
+
+                // A stopped Loom session appears during docker run, after the initial plan.
+                try writeListing(initial, to: listing)
+                try writeListing(provisioned + ["bbb111\tloom-codex-session-agent-1\texited\tloom:1\t"], to: afterCreate)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 0, "a Loom reservation during provisioning skips the probe")
+                let raced = try String(contentsOfFile: log, encoding: .utf8)
+                expect(raced.contains("run -d") && !raced.contains("exec -i"),
+                       "the quota container was created but no exec followed the new reservation")
+
+                let secondRoot = dir.appendingPathComponent("other-profiles")
+                let secondHome = secondRoot.appendingPathComponent("agent-1")
+                try FileManager.default.createDirectory(at: secondHome, withIntermediateDirectories: true)
+                try Data(#"{"tokens":{"account_id":"another-account"}}"#.utf8)
+                    .write(to: secondHome.appendingPathComponent("auth.json"))
+                expectEqual(poller.syncCodexProfiles(root: secondRoot.path), 1, "a distinct account registers the same basename")
+                try writeListing(provisioned, to: listing)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 0, "neither active home can use the shared container name")
+                let collisionCalls = try String(contentsOfFile: log, encoding: .utf8).split(whereSeparator: \.isNewline)
+                expect(collisionCalls.count == 1 && collisionCalls[0].hasPrefix("ps -a "),
+                       "ambiguous homes cause no Docker mutations or execs")
+
+                // Reserve the next batch's profile during the first batch's exec.
+                try FileManager.default.createDirectory(atPath: wedgedHome, withIntermediateDirectories: true)
+                let bothReady = provisioned + ["def456\tllm-monitor-codex-quota-agent-2\trunning\timg:1\t\(wedgedHome)"]
+                try writeListing(bothReady, to: listing)
+                try writeListing(bothReady + ["bbb222\tloom-codex-session-agent-2\texited\tloom:1\t"], to: afterExec)
+                let batches = blockOnQuotaProbe {
+                    await CodexQuotaContainer.probeAll(docker: stub, homes: [home, wedgedHome], concurrency: 1)
+                }
+                expectEqual(batches?.count, 2, "both probe batches finish")
+                let batched = try String(contentsOfFile: log, encoding: .utf8)
+                expect(batched.contains("exec -i abc123") && !batched.contains("exec -i def456"),
+                       "the later batch rechecks ownership before exec")
+
+                // A replaced mount and a failed ownership check both prevent exec.
+                try Data().write(to: URL(fileURLWithPath: log))
+                try writeListing(["abc999\tllm-monitor-codex-quota-agent-1\trunning\timg:1\t\(secondHome.path)"], to: listing)
+                _ = blockOnQuotaProbe { await CodexQuotaContainer.probe(docker: stub, home: home) }
+                try FileManager.default.removeItem(at: listing)
+                _ = blockOnQuotaProbe { await CodexQuotaContainer.probe(docker: stub, home: home) }
+                let skipped = try String(contentsOfFile: log, encoding: .utf8).split(whereSeparator: \.isNewline)
+                expect(skipped.count == 2 && skipped.allSatisfy { $0.hasPrefix("ps -a ") },
+                       "a wrong mount or an unavailable listing skips exec")
 
                 // A probe that hangs removes the container so the next cycle
                 // starts from a clean one.
-                let wedgedHome = dir.appendingPathComponent("agent-2").path
-                try FileManager.default.createDirectory(atPath: wedgedHome, withIntermediateDirectories: true)
+                try FileManager.default.removeItem(at: afterExec)
+                try writeListing(bothReady, to: listing)
                 var budget = CodexAppServerClient.Timeouts()
                 budget.initialize = 2
                 budget.method = 2
@@ -2338,7 +2406,7 @@ enum SelfTest {
                     failures.append("a wedged probe must fail, got \(String(describing: bad))")
                 }
                 let after = (try? String(contentsOfFile: log, encoding: .utf8)) ?? ""
-                expect(after.contains("rm -f llm-monitor-codex-quota-agent-2"),
+                expect(after.contains("rm -f def456"),
                        "a timed-out probe removes its container; reconcile recreates it")
             } catch {
                 checks += 1
