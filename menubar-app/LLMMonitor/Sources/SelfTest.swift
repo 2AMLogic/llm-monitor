@@ -54,6 +54,7 @@ enum SelfTest {
         ("DataDirectoryMigration", { testDataDirectoryMigration() }),
         ("CodexRolloutSnapshotParsing", { testCodexRolloutSnapshotParsing() }),
         ("CodexProfileSyncSnapshotMode", { testCodexProfileSyncSnapshotMode() }),
+        ("CodexProfileTickDiscovery", { testCodexProfileTickDiscovery() }),
         ("LoomLiveCheckDecoding", { testLoomLiveCheckDecoding() }),
         ("LoomDaemonBinaryAndWorkspaceResolution", { testLoomDaemonBinaryAndWorkspaceResolution() }),
         ("LoomLiveCheckSpawnAgainstStub", { testLoomLiveCheckSpawnAgainstStub() }),
@@ -1788,6 +1789,148 @@ enum SelfTest {
             expect(!OAuthPoller.isLoomCodexProfile(root + "-other/agent-1", root: root), "a sibling path is not")
             expectEqual(CodexProfiles.root(environment: ["LOOM_CODEX_PROFILE_ROOT": " "]), nil,
                         "an explicitly empty LOOM_CODEX_PROFILE_ROOT disables profiles, as in loom-daemon")
+        }
+    }
+
+    /// Per-tick Loom Codex profile discovery (#368): a profile directory that
+    /// appears under the root while the monitor runs joins the poll set on the
+    /// tick that finds it, an unchanged root costs nothing beyond the
+    /// directory listing, a native account id that already owns a different
+    /// home is never taken over, and a failed registration stays eligible for
+    /// retry. Drives the exact sequence `pollDue` runs — discovery, then the
+    /// credential load, then the snapshot poll — offline, with no network and
+    /// no loom-daemon.
+    private static func testCodexProfileTickDiscovery() {
+        withSelfTestTempDir("codex-profile-tick") { dir in
+            let fm = FileManager.default
+            let root = dir.appendingPathComponent("codex-profiles").path
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            UsageStore(dbPath: dbPath).ensureDatabase()
+
+            func makeProfile(_ name: String, accountId: String?, email: String?) {
+                let home = (root as NSString).appendingPathComponent(name)
+                try? fm.createDirectory(atPath: home + "/sessions/2026/09/23", withIntermediateDirectories: true)
+                if let accountId = accountId {
+                    var tokens: [String: Any] = ["account_id": accountId, "access_token": "SECRET-NEVER-READ"]
+                    if let email = email {
+                        let claims = try! JSONSerialization.data(withJSONObject: ["email": email])
+                        let b64 = claims.base64EncodedString().replacingOccurrences(of: "=", with: "")
+                            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+                        tokens["id_token"] = "e30.\(b64).sig"
+                    }
+                    let auth = try! JSONSerialization.data(withJSONObject: ["tokens": tokens])
+                    fm.createFile(atPath: home + "/auth.json", contents: auth)
+                }
+            }
+            // Assertion helpers open a fresh connection per call, so they
+            // always read what the poller's own short-lived connections wrote.
+            func text(_ sql: String, _ arg: String, at path: String = dbPath) -> String? {
+                guard let conn = try? openDatabase(path),
+                      let value = try? conn.scalar(sql, arg) else { return nil }
+                return value as? String
+            }
+            func count(_ sql: String, _ arg: String, at path: String = dbPath) -> Int {
+                guard let conn = try? openDatabase(path),
+                      let value = try? conn.scalar(sql, arg), let n = value as? Int64 else { return 0 }
+                return Int(n)
+            }
+
+            // "Launch": one profile on disk, plus a home-less OpenAI row whose
+            // identity the next profile will match — the pre-profile history
+            // the linking rule keeps attached.
+            makeProfile("alpha", accountId: "acct-alpha", email: nil)
+            let db = try! openDatabase(dbPath)
+            try! db.run("INSERT INTO accounts (id, account_name, email, provider) VALUES (?, ?, ?, 'openai')",
+                        "user-beta", "beta@example.com", "beta@example.com")
+
+            let poller = OAuthPoller(dbPath: dbPath)
+            expectEqual(poller.syncCodexProfiles(root: root), 1,
+                        "the launch sync registers the profile that existed at launch")
+
+            // A profile logs in under the root while the monitor runs, with a
+            // live rollout reading for the discovering tick to poll.
+            makeProfile("beta", accountId: "acct-beta", email: "beta@example.com")
+            let observed = Date().addingTimeInterval(-7200)
+            let observedISO = ISO8601DateFormatter().string(from: observed)
+            let liveLine = #"{"timestamp":"\#(observedISO)","payload":{"rate_limits":{"primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":\#(Int(Date().timeIntervalSince1970) + 3 * 86400)},"secondary":null,"plan_type":"pro"}}}"#
+            fm.createFile(atPath: root + "/beta/sessions/2026/09/23/rollout-2026-09-23T16-55-50-x.jsonl",
+                          contents: Data((liveLine + "\n").utf8))
+
+            // The due tick: discovery, then the credential load, then the
+            // snapshot poll — the sequence `pollDue` runs, minus the network.
+            expectEqual(poller.discoverCodexProfiles(root: root), 1,
+                        "a profile that appeared after launch is registered on the tick that finds it")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "user-beta"), root + "/beta",
+                        "the home-less row keeps its id and gains the new home")
+            expectEqual(text("SELECT codex_home_mode FROM accounts WHERE id = ?", "user-beta"),
+                        CodexProfiles.snapshotMode, "the linked row is in snapshot mode")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", root + "/beta"), 1,
+                        "exactly one row owns the new home")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = ?", "acct-beta"), 0,
+                        "no second row is keyed on the native id when an existing row links")
+            expectEqual(count("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ? AND is_active = 1 "
+                              + "AND access_token IS NULL AND source = 'loom-codex-profile'", "user-beta"), 1,
+                        "the linked row has exactly one active, token-free profile credential")
+            if let credential = poller.loadActiveCredentials().first(where: { $0.accountId == "user-beta" }) {
+                expect(credential.isCodexSnapshotOnly, "the new row joins the poll set on the discovering tick")
+                poller.pollCodexSnapshot(credential)
+                expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND is_synthetic = 0 "
+                                  + "AND weekly_all_percent = 43", "user-beta"), 1,
+                            "the discovering tick polls it: the rollout reading is archived under its id")
+            } else {
+                expect(false, "user-beta must be in the poll set right after discovery")
+            }
+
+            // An unchanged root: the listing is the whole cost. Deleting the
+            // row makes any per-home registration work visible — the
+            // unconditional full sync would resurrect it — and none may
+            // happen, so the settled set must be consulted before any
+            // per-home identity read or registration SQL.
+            try! db.run("DELETE FROM oauth_credentials WHERE account_id = ?", "user-beta")
+            try! db.run("DELETE FROM accounts WHERE id = ?", "user-beta")
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "an unchanged root registers nothing")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", root + "/beta"), 0,
+                        "a settled home is skipped before any per-home identity read or registration SQL")
+
+            // A second directory whose native id already owns a different
+            // home: neither the original row nor its credential may change.
+            makeProfile("owned", accountId: "acct-owned", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "the owned profile registers normally")
+            makeProfile("zz-incoming", accountId: "acct-owned", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 0,
+                        "a conflicting native id registers nothing")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-owned"), root + "/owned",
+                        "the row that already owns a home keeps it")
+            expectEqual(text("SELECT codex_home_mode FROM accounts WHERE id = ?", "acct-owned"),
+                        CodexProfiles.snapshotMode, "and keeps its snapshot mode")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", root + "/zz-incoming"), 0,
+                        "no row is created for the conflicting profile")
+            expectEqual(count("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ? AND is_active = 1",
+                              "acct-owned"), 1,
+                        "the original account's credential is preserved, not duplicated")
+            expectEqual(poller.discoverCodexProfiles(root: root), 0,
+                        "the conflict is settled, so later ticks do not retry it")
+
+            // A registration that fails mid-way must stay eligible for retry:
+            // the home is not marked settled. A second root and database keep
+            // this decoupled from the fixture above; the failure is the
+            // `accounts` table being missing, so the first statement throws.
+            let retryRoot = dir.appendingPathComponent("codex-profiles-retry").path
+            let retryDb = dir.appendingPathComponent("retry.db").path
+            UsageStore(dbPath: retryDb).ensureDatabase()
+            try! openDatabase(retryDb).run("DROP TABLE accounts")
+            let retryHome = (retryRoot as NSString).appendingPathComponent("gamma")
+            try? fm.createDirectory(atPath: retryHome + "/sessions/2026/09/23", withIntermediateDirectories: true)
+            let retryAuth = try! JSONSerialization.data(withJSONObject: ["tokens": ["account_id": "acct-gamma"]])
+            fm.createFile(atPath: retryHome + "/auth.json", contents: retryAuth)
+            let retryPoller = OAuthPoller(dbPath: retryDb)
+            expectEqual(retryPoller.discoverCodexProfiles(root: retryRoot), 0,
+                        "a registration that cannot write registers nothing")
+            UsageStore(dbPath: retryDb).ensureDatabase()
+            expectEqual(retryPoller.discoverCodexProfiles(root: retryRoot), 1,
+                        "the failed home is retried on the next tick and registers")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-gamma", at: retryDb),
+                        retryRoot + "/gamma", "the retried registration landed")
         }
     }
 

@@ -1093,77 +1093,152 @@ class OAuthPoller: ObservableObject {
     /// `rjwalters`). That keeps a pre-profile account's history attached
     /// instead of leaving a dead row beside a new one. A row that already has
     /// a home is never taken over.
+    ///
+    /// Also seeds the per-tick discovery state, so the first `pollDue` after
+    /// launch costs one directory listing (see `discoverCodexProfiles`).
     @discardableResult
     func syncCodexProfiles(root: String? = CodexProfiles.root()) -> Int {
         let profiles = CodexProfiles.scan(root: root)
         guard !profiles.isEmpty, FileManager.default.fileExists(atPath: dbPath),
               let db = try? openDatabase(dbPath) else { return 0 }
-        func normalized(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
+        return registerCodexProfiles(profiles, db: db)
+    }
+
+    /// Incremental per-tick discovery (#368): a Loom Codex profile directory
+    /// that appears under the root while the monitor is running joins the poll
+    /// set on the tick that finds it — no relaunch, no `codex list`, the same
+    /// treatment `syncClaudeTokenFiles` gives a rolled token. Runs from
+    /// `pollDue` before `loadActiveCredentials`, so the new row is polled on
+    /// that same tick. An unchanged root costs one directory listing: the
+    /// settled set short-circuits before any per-home identity read or
+    /// registration SQL. Add-only and idempotent for the same reason the
+    /// launch sync is.
+    @discardableResult
+    func discoverCodexProfiles(root: String? = CodexProfiles.root()) -> Int {
+        let profiles = CodexProfiles.scan(root: root)
+        guard !profiles.isEmpty else { return 0 }
+        // The listing is the whole cost when nothing changed: settled homes
+        // are skipped before the database is even opened.
+        let pending = profiles.filter { !settledCodexProfileHomes.contains($0.home) }
+        guard !pending.isEmpty, FileManager.default.fileExists(atPath: dbPath),
+              let db = try? openDatabase(dbPath) else { return 0 }
+        return registerCodexProfiles(pending, db: db)
+    }
+
+    /// The outcome of registering one Loom Codex profile, shared by the
+    /// every-launch full sync and per-tick discovery so a new home is
+    /// registered by exactly the same rule either way.
+    private enum CodexProfileRegistration {
+        /// A row was created or linked (counted by the sync's return value).
+        case registered
+        /// This exact home already had a row; its mode was refreshed.
+        case alreadyRegistered
+        /// The resolved account id names a row that already owns a different
+        /// home, so the registration is skipped: neither row may change.
+        case conflictingHome
+        /// SQL failure — the home stays eligible for retry on a later tick.
+        case failed
+    }
+
+    /// Register each profile and mark its home settled. Returns how many rows
+    /// were created or linked. A failed registration deliberately leaves its
+    /// home unsettled, so per-tick discovery retries it.
+    private func registerCodexProfiles(_ profiles: [CodexProfiles.Profile], db: Connection) -> Int {
         var registered = 0
         for profile in profiles {
-            let nativeId = CodexAuth.accountId(inHome: profile.home)
-            let email = CodexAuth.email(inHome: profile.home)
-            do {
-                // Already registered to this exact home: nothing to do.
-                if try db.scalar("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", profile.home) as? Int64 ?? 0 > 0 {
-                    try db.run("UPDATE accounts SET codex_home_mode = ? WHERE codex_home = ?",
-                               CodexProfiles.snapshotMode, profile.home)
-                    continue
-                }
-                var target: String?
-                let candidates = try db.prepare("""
-                    SELECT id, email FROM accounts
-                    WHERE COALESCE(provider, 'anthropic') = 'openai'
-                      AND (codex_home IS NULL OR TRIM(codex_home) = '')
-                    ORDER BY sort_order, id
-                """)
-                for row in candidates {
-                    guard let id = row[0] as? String else { continue }
-                    let rowEmail = (row[1] as? String)?.lowercased()
-                    if id == nativeId || (email != nil && rowEmail == email!.lowercased()) {
-                        target = id; break
-                    }
-                    if email == nil, let local = rowEmail?.split(separator: "@").first,
-                       normalized(String(local)) == normalized(profile.name) {
-                        target = id; break
-                    }
-                }
-                let accountId = target ?? nativeId ?? CodexProfiles.accountIdPrefix + profile.name
-                let now = ISO8601DateFormatter().string(from: Date())
-                try db.run("""
-                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider, codex_home, codex_home_mode)
-                    VALUES (?, ?, ?, NULL, NULL, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0), 'openai', ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        email = COALESCE(accounts.email, excluded.email),
-                        provider = 'openai',
-                        codex_home = excluded.codex_home,
-                        codex_home_mode = excluded.codex_home_mode
-                """, accountId, profile.name, email, profile.home, CodexProfiles.snapshotMode)
-                // A credential row with no token: its presence (active) is what
-                // puts the account in the poll set; it never holds a secret.
-                if let credId = try db.scalar(
-                    "SELECT id FROM oauth_credentials WHERE account_id = ? LIMIT 1", accountId) as? Int64 {
-                    try db.run("""
-                        UPDATE oauth_credentials SET provider = 'openai', source = 'loom-codex-profile',
-                            access_token = NULL, refresh_token = NULL, is_active = 1, updated_at = ?
-                        WHERE id = ?
-                    """, now, credId)
-                } else {
-                    try db.run("""
-                        INSERT INTO oauth_credentials (account_id, label, source, provider, access_token,
-                            refresh_token, token_expires_at, is_active, created_at, updated_at)
-                        VALUES (?, ?, 'loom-codex-profile', 'openai', NULL, NULL, NULL, 1, ?, ?)
-                    """, accountId, profile.name, now, now)
-                }
+            switch registerCodexProfile(profile, db: db) {
+            case .registered:
                 registered += 1
-                flog.info("Registered Loom Codex profile \(profile.name) in snapshot mode"
-                          + (target != nil ? " (linked to existing account \(accountId.prefix(8))…)" : ""),
-                          category: fcat)
-            } catch {
-                flog.error("syncCodexProfiles: \(profile.name): \(error.localizedDescription)", category: fcat)
+                settledCodexProfileHomes.insert(profile.home)
+            case .alreadyRegistered, .conflictingHome:
+                settledCodexProfileHomes.insert(profile.home)
+            case .failed:
+                break
             }
         }
         return registered
+    }
+
+    /// Register one Loom Codex profile. Identity fields are read only for a
+    /// home that actually needs registering — never for one already settled.
+    private func registerCodexProfile(_ profile: CodexProfiles.Profile, db: Connection) -> CodexProfileRegistration {
+        func normalized(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
+        do {
+            // Already registered to this exact home: nothing to do.
+            if try db.scalar("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", profile.home) as? Int64 ?? 0 > 0 {
+                try db.run("UPDATE accounts SET codex_home_mode = ? WHERE codex_home = ?",
+                           CodexProfiles.snapshotMode, profile.home)
+                return .alreadyRegistered
+            }
+            let nativeId = CodexAuth.accountId(inHome: profile.home)
+            let email = CodexAuth.email(inHome: profile.home)
+            var target: String?
+            let candidates = try db.prepare("""
+                SELECT id, email FROM accounts
+                WHERE COALESCE(provider, 'anthropic') = 'openai'
+                  AND (codex_home IS NULL OR TRIM(codex_home) = '')
+                ORDER BY sort_order, id
+            """)
+            for row in candidates {
+                guard let id = row[0] as? String else { continue }
+                let rowEmail = (row[1] as? String)?.lowercased()
+                if id == nativeId || (email != nil && rowEmail == email!.lowercased()) {
+                    target = id; break
+                }
+                if email == nil, let local = rowEmail?.split(separator: "@").first,
+                   normalized(String(local)) == normalized(profile.name) {
+                    target = id; break
+                }
+            }
+            let accountId = target ?? nativeId ?? CodexProfiles.accountIdPrefix + profile.name
+            // Collision guard: the candidate query only filters its own
+            // candidates, so the native-id (or placeholder-id) fallback can
+            // still land the upsert below on a row that already owns a
+            // *different* home — silently moving that row's home and
+            // credential to this profile. A row that owns a home is never
+            // taken over, so skip before changing either the account or its
+            // credential. (Steady state, not an error: the conflict cannot
+            // resolve itself, so the home is marked settled above.)
+            if let existing = try db.scalar("SELECT codex_home FROM accounts WHERE id = ?", accountId) as? String,
+               !existing.trimmingCharacters(in: .whitespaces).isEmpty, existing != profile.home {
+                flog.info("Loom Codex profile \(profile.name) reports an account id whose row already "
+                          + "owns a different home; leaving both alone", category: fcat)
+                return .conflictingHome
+            }
+            let now = ISO8601DateFormatter().string(from: Date())
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider, codex_home, codex_home_mode)
+                VALUES (?, ?, ?, NULL, NULL, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0), 'openai', ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    email = COALESCE(accounts.email, excluded.email),
+                    provider = 'openai',
+                    codex_home = excluded.codex_home,
+                    codex_home_mode = excluded.codex_home_mode
+            """, accountId, profile.name, email, profile.home, CodexProfiles.snapshotMode)
+            // A credential row with no token: its presence (active) is what
+            // puts the account in the poll set; it never holds a secret.
+            if let credId = try db.scalar(
+                "SELECT id FROM oauth_credentials WHERE account_id = ? LIMIT 1", accountId) as? Int64 {
+                try db.run("""
+                    UPDATE oauth_credentials SET provider = 'openai', source = 'loom-codex-profile',
+                        access_token = NULL, refresh_token = NULL, is_active = 1, updated_at = ?
+                    WHERE id = ?
+                """, now, credId)
+            } else {
+                try db.run("""
+                    INSERT INTO oauth_credentials (account_id, label, source, provider, access_token,
+                        refresh_token, token_expires_at, is_active, created_at, updated_at)
+                    VALUES (?, ?, 'loom-codex-profile', 'openai', NULL, NULL, NULL, 1, ?, ?)
+                """, accountId, profile.name, now, now)
+            }
+            flog.info("Registered Loom Codex profile \(profile.name) in snapshot mode"
+                      + (target != nil ? " (linked to existing account \(accountId.prefix(8))…)" : ""),
+                      category: fcat)
+            return .registered
+        } catch {
+            flog.error("Codex profile registration failed for \(profile.name): \(error.localizedDescription)", category: fcat)
+            return .failed
+        }
     }
 
     // MARK: - z.ai (GLM Coding Plan) accounts
@@ -2065,6 +2140,14 @@ class OAuthPoller: ObservableObject {
     /// Last poll time per credential ID
     private var lastPollTimes: [Int64: Date] = [:]
 
+    /// Loom Codex profile homes this poller has already settled (registered,
+    /// found already registered, or deliberately skipped as conflicting).
+    /// Seeded by the every-launch full sync, consulted by per-tick discovery
+    /// (`discoverCodexProfiles`, #368) so an unchanged profile root costs one
+    /// directory listing and no per-home work. A home whose registration
+    /// *failed* is deliberately absent, so the next tick retries it.
+    private var settledCodexProfileHomes: Set<String> = []
+
     /// How often to probe the Fable tier per account (seconds). Independent of the
     /// Haiku poll — a few times an hour is enough to track Fable availability/usage
     /// without spending meaningful Fable quota.
@@ -2103,6 +2186,11 @@ class OAuthPoller: ObservableObject {
         // A token rolled while the app runs is picked up within one tick; an
         // unchanged token file costs a file read and no network call.
         await syncClaudeTokenFiles()
+        // Likewise a Loom Codex profile directory that appeared since the last
+        // tick (#368) — an unchanged root costs one directory listing. Runs
+        // before `loadActiveCredentials` so the new row joins the poll set on
+        // the tick that discovers it.
+        discoverCodexProfiles()
         let credentials = loadActiveCredentials()
         reportStrandedCodexIdentities()
         guard !credentials.isEmpty else { return 0 }
