@@ -38,13 +38,12 @@ Issues currently being built (`loom:building`).
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings
 - **#323**: Offer an in-app "Update now" when a newer release is available
 - **#368**: Register new Loom Codex profiles on a poll tick, not only at launch or by codex list
-- **#380**: check-main-clean.sh exits 3 on a clean main because loom-daemon writes .loom/account-ranking.codex there
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#381**: chore: gitignore loom-daemon's account-ranking cache
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -64,7 +63,6 @@ Issues carrying `loom:curated`.
 - **#323**: Offer an in-app "Update now" when a newer release is available *(curated)*
 - **#338**: Per-account scope (personal | work): push/export skip personal accounts; popover marks them *(curated)*
 - **#368**: Register new Loom Codex profiles on a poll tick, not only at launch or by codex list *(curated)*
-- **#380**: check-main-clean.sh exits 3 on a clean main because loom-daemon writes .loom/account-ranking.codex there *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -82,10 +80,10 @@ _None._
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 6 |
-| PRs awaiting review | 1 |
+| In Progress (`loom:building`) | 5 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 3 |
-| Curated | 7 |
+| Curated | 6 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
