@@ -96,7 +96,8 @@ enum HeadlessRunner {
             if stamp != filesStamp {
                 filesStamp = stamp
                 flog.info("Account list files changed — re-importing", category: "Headless")
-                _ = await poller.syncFromAccountFiles()
+                // pollDue handles new profiles, including logins still in progress.
+                _ = await poller.syncFromAccountFiles(includeCodexProfiles: false)
             }
 
             let polled = await poller.pollDue()

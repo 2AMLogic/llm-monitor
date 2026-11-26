@@ -1098,18 +1098,19 @@ class OAuthPoller: ObservableObject {
     /// launch costs one directory listing (see `discoverCodexProfiles`).
     @discardableResult
     func syncCodexProfiles(root: String? = CodexProfiles.root()) -> Int {
-        registerCodexProfiles(CodexProfiles.scan(root: root))
+        registerCodexProfiles(CodexProfiles.scan(root: root), requireLoginIdentity: false)
     }
 
     /// Run before loading credentials so a new home can be polled on this tick.
-    /// An unchanged listing returns before opening SQLite or reading auth.json.
+    /// When every home is settled, only the root listing touches the filesystem.
     @discardableResult
-    func discoverCodexProfiles(root: String? = CodexProfiles.root()) -> Int {
-        let pending = CodexProfiles.scan(root: root).filter { !settledCodexProfileHomes.contains($0.home) }
-        return registerCodexProfiles(pending)
+    func discoverCodexProfiles(root: String? = CodexProfiles.root(),
+                               isDirectory: (String) -> Bool = CodexProfiles.isDirectory) -> Int {
+        let pending = CodexProfiles.scan(root: root, excluding: settledCodexProfileHomes, isDirectory: isDirectory)
+        return registerCodexProfiles(pending, requireLoginIdentity: true)
     }
 
-    private func registerCodexProfiles(_ profiles: [CodexProfiles.Profile]) -> Int {
+    private func registerCodexProfiles(_ profiles: [CodexProfiles.Profile], requireLoginIdentity: Bool) -> Int {
         guard !profiles.isEmpty, FileManager.default.fileExists(atPath: dbPath),
               let db = try? openDatabase(dbPath) else { return 0 }
         func normalized(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
@@ -1131,6 +1132,12 @@ class OAuthPoller: ObservableObject {
                 // stay in the profile's auth.json.
                 let nativeId = CodexAuth.accountId(inHome: profile.home)
                 let email = CodexAuth.email(inHome: profile.home)
+                if requireLoginIdentity && nativeId == nil && email == nil {
+                    // Login can create the directory a tick before publishing
+                    // auth.json. Leave the home unclaimed and retry next tick.
+                    try db.execute("COMMIT")
+                    continue
+                }
                 var target: String?
                 let candidates = try db.prepare("""
                     SELECT id, email FROM accounts
@@ -1618,7 +1625,7 @@ class OAuthPoller: ObservableObject {
     /// that isn't there, and is a no-op once one exists — including after the
     /// identity has been provisioned for real.
     @discardableResult
-    func syncFromAccountFiles() async -> [EnvImportResult] {
+    func syncFromAccountFiles(includeCodexProfiles: Bool = true) async -> [EnvImportResult] {
         let fm = FileManager.default
         var merged: [ParsedAccountEntry] = []
         var indexByEmail: [String: Int] = [:]
@@ -1644,8 +1651,9 @@ class OAuthPoller: ObservableObject {
         // z.ai keys live in their own chezmoi-managed directory rather than in
         // the account list files; sync them on the same launch cadence.
         let zaiResults = await syncZaiKeyFiles()
-        // Likewise Loom's Codex profiles, which need no network at all.
-        syncCodexProfiles()
+        if includeCodexProfiles {
+            syncCodexProfiles()
+        }
 
         guard !merged.isEmpty else {
             flog.info("syncFromAccountFiles: no account list files found", category: fcat)
@@ -2106,8 +2114,8 @@ class OAuthPoller: ObservableObject {
     /// found already registered, or deliberately skipped as conflicting).
     /// Seeded by the every-launch full sync, consulted by per-tick discovery
     /// (`discoverCodexProfiles`, #368) so an unchanged profile root costs one
-    /// directory listing and no per-home work. A home whose registration
-    /// *failed* is deliberately absent, so the next tick retries it.
+    /// directory listing and no per-home work once all homes are settled.
+    /// Ticks retry homes still logging in and failed registrations.
     private var settledCodexProfileHomes: Set<String> = []
 
     /// How often to probe the Fable tier per account (seconds). Independent of the

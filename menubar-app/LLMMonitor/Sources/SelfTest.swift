@@ -1856,24 +1856,39 @@ enum SelfTest {
                               + "AND access_token IS NULL AND refresh_token IS NULL", "acct-alpha"), 1,
                         "a new snapshot credential stores neither token from auth.json")
 
-            // A profile logs in under the root while the monitor runs, with a
-            // live rollout reading for the discovering tick to poll.
-            makeProfile("beta", accountId: "acct-beta", email: "beta@example.com")
+            // The directory appears a tick before login. Its name cannot identify
+            // the existing account. Only the eventual email claim links the two.
+            let slot = root + "/slot-7"
+            try! fm.createDirectory(atPath: slot, withIntermediateDirectories: false)
+            var directoryProbes: [String] = []
+            func probeDirectory(_ path: String) -> Bool {
+                directoryProbes.append(path)
+                return CodexProfiles.isDirectory(path)
+            }
+            try! db.run("INSERT INTO usage_history (account_id, timestamp, weekly_all_percent) VALUES (?, ?, 17)",
+                        "user-beta", ISO8601DateFormatter().string(from: Date().addingTimeInterval(-10800)))
+            expectEqual(poller.discoverCodexProfiles(root: root, isDirectory: probeDirectory), 0, "an empty home waits for login")
+            expectEqual(directoryProbes, [slot], "only the new entry needs a directory type lookup")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 0,
+                        "the first tick leaves the home available for identity matching")
+
+            makeProfile("slot-7", accountId: "acct-beta", email: "beta@example.com")
             let observed = Date().addingTimeInterval(-7200)
             let observedISO = ISO8601DateFormatter().string(from: observed)
             let liveLine = #"{"timestamp":"\#(observedISO)","payload":{"rate_limits":{"primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":\#(Int(Date().timeIntervalSince1970) + 3 * 86400)},"secondary":null,"plan_type":"pro"}}}"#
-            fm.createFile(atPath: root + "/beta/sessions/2026/09/23/rollout-2026-09-23T16-55-50-x.jsonl",
+            fm.createFile(atPath: slot + "/sessions/2026/09/23/rollout-2026-09-23T16-55-50-x.jsonl",
                           contents: Data((liveLine + "\n").utf8))
 
             // The due tick: discovery, then the credential load, then the
             // snapshot poll — the sequence `pollDue` runs, minus the network.
-            expectEqual(poller.discoverCodexProfiles(root: root), 1,
-                        "a profile that appeared after launch is registered on the tick that finds it")
-            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "user-beta"), root + "/beta",
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "the next tick links the home once login supplies an identity")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "user-beta"), slot,
                         "the home-less row keeps its id and gains the new home")
+            expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND weekly_all_percent = 17",
+                              "user-beta"), 1, "the linked account keeps its earlier history")
             expectEqual(text("SELECT codex_home_mode FROM accounts WHERE id = ?", "user-beta"),
                         CodexProfiles.snapshotMode, "the linked row is in snapshot mode")
-            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", root + "/beta"), 1,
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 1,
                         "exactly one row owns the new home")
             expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = ?", "acct-beta"), 0,
                         "no second row is keyed on the native id when an existing row links")
@@ -1897,8 +1912,10 @@ enum SelfTest {
             // per-home identity read or registration SQL.
             try! db.run("DELETE FROM oauth_credentials WHERE account_id = ?", "user-beta")
             try! db.run("DELETE FROM accounts WHERE id = ?", "user-beta")
-            expectEqual(poller.discoverCodexProfiles(root: root), 0, "an unchanged root registers nothing")
-            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", root + "/beta"), 0,
+            directoryProbes.removeAll()
+            expectEqual(poller.discoverCodexProfiles(root: root, isDirectory: probeDirectory), 0, "an unchanged root registers nothing")
+            expectEqual(directoryProbes, [], "an unchanged tick performs no directory type lookups")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 0,
                         "a settled home is skipped before any per-home identity read or registration SQL")
 
             // A second directory whose native id already owns a different

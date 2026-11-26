@@ -64,18 +64,23 @@ enum CodexProfiles {
         let home: String
     }
 
-    /// Every profile directory under `root`, sorted by name. Hidden entries
-    /// (Loom's own bookkeeping) are skipped.
-    static func scan(root: String?) -> [Profile] {
+    /// List visible profile directories in name order. Skip settled paths
+    /// before asking the filesystem for the type of an entry.
+    static func scan(root: String?, excluding settledHomes: Set<String> = [],
+                     isDirectory: (String) -> Bool = isDirectory) -> [Profile] {
         guard let root = root,
               let names = try? FileManager.default.contentsOfDirectory(atPath: root) else { return [] }
         return names.sorted().compactMap { name in
             guard !name.hasPrefix(".") else { return nil }
             let home = (root as NSString).appendingPathComponent(name)
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: home, isDirectory: &isDir), isDir.boolValue else { return nil }
+            guard !settledHomes.contains(home), isDirectory(home) else { return nil }
             return Profile(name: name, home: home)
         }
+    }
+
+    static func isDirectory(_ path: String) -> Bool {
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
     }
 
     // MARK: - Snapshot
