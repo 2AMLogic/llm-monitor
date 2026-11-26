@@ -2084,28 +2084,29 @@ enum SelfTest {
             ])
 
             // The rightful owners can also arrive a tick later, outside the
-            // current batch. Both pairs have distinct workspace UUIDs.
-            let emailOwner = "aaaaaaaa-0000-4000-8000-000000000001"
-            let nameOwner = "cccccccc-0000-4000-8000-000000000003"
+            // current batch. These fixture workspace IDs identify the two
+            // pre-existing rows across both ticks.
+            let shiftWorkspaceID = "aaaaaaaa-0000-4000-8000-000000000001"
+            let nextShiftWorkspaceID = "cccccccc-0000-4000-8000-000000000003"
             try! db.run("INSERT INTO accounts (id, email, provider) VALUES (?, ?, 'openai'), (?, ?, 'openai')",
-                        emailOwner, "shift@example.com", nameOwner, "next.shift@example.com")
+                        shiftWorkspaceID, "shift@example.com", nextShiftWorkspaceID, "next.shift@example.com")
             checkDiscoveryTick([
                 ("bbbbbbbb-0000-4000-8000-000000000002", "early-email", "shift@example.com", 64),
                 ("dddddddd-0000-4000-8000-000000000004", "nextshift", nil, 71)
             ])
-            for id in [emailOwner, nameOwner] {
+            for id in [shiftWorkspaceID, nextShiftWorkspaceID] {
                 expect(text("SELECT codex_home FROM accounts WHERE id = ?", id) == nil,
                        "the absent workspace keeps its home unassigned")
                 expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", id), 0,
                             "the earlier login writes no usage under the absent workspace")
             }
             checkDiscoveryTick([
-                (emailOwner, "later-email", "shift@example.com", 21),
-                (nameOwner, "later-name", "next.shift@example.com", 33)
+                (shiftWorkspaceID, "later-email", "shift@example.com", 21),
+                (nextShiftWorkspaceID, "later-name", "next.shift@example.com", 33)
             ])
 
             // A UUID with a different spelling still identifies the existing owner.
-            makeProfile("duplicate-uppercase", accountId: emailOwner.uppercased(), email: nil)
+            makeProfile("duplicate-uppercase", accountId: shiftWorkspaceID.uppercased(), email: nil)
             expectEqual(poller.discoverCodexProfiles(root: root), 0, "UUID casing cannot create a second owner")
             try! fm.removeItem(atPath: root + "/duplicate-uppercase")
 
