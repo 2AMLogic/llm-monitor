@@ -39,7 +39,7 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#356**: Read Codex quota through persistent per-profile containers
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -74,7 +74,7 @@ _None._
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
 | In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
 | Curated | 5 |
 | Architect / Hermit proposals | 0 |
