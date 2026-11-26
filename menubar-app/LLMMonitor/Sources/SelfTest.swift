@@ -2140,10 +2140,12 @@ enum SelfTest {
             expectEqual(tick(), 1, "only the former owner's own credential is due; the new login adds none")
             expect(text("SELECT codex_home_mode FROM accounts WHERE id = ?", formerOwnerID) != CodexProfiles.snapshotMode,
                    "a login that is not the owner leaves the owner's mode unchanged")
-            expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", formerOwnerID), 0,
-                        "the new login's reading is never archived under the former owner")
-            expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", reusedLoginID), 0,
-                        "the skipped login writes no reading for another row")
+            let recordedAccountIDs = try! db.prepare("SELECT DISTINCT account_id FROM usage_history")
+                .map { $0[0] as! String }
+            expect(!recordedAccountIDs.contains(formerOwnerID),
+                   "the new login's reading is never archived under the former owner")
+            expect(!recordedAccountIDs.contains(reusedLoginID),
+                   "the skipped login has no usage history")
 
             // An unchanged root: the listing is the whole cost. Deleting the
             // row makes any per-home registration work visible — the
