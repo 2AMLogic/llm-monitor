@@ -1085,15 +1085,11 @@ class OAuthPoller: ObservableObject {
     /// has one (what every other OpenAI row is keyed on), else
     /// `codex-profile:<name>`.
     ///
-    /// **Linking an existing row.** Before creating a new row, an existing
-    /// OpenAI row with no `codex_home` of its own is adopted when it is
-    /// plainly the same identity: its id matches, its email matches the
-    /// profile's `email` claim, or (for a profile that was never logged in and
-    /// so has no claim) its email's local part matches the profile name once
-    /// punctuation is ignored (`robb@…` → `robb`, `r.j.walters@…` →
-    /// `rjwalters`). That keeps a pre-profile account's history attached
-    /// instead of leaving a dead row beside a new one. A row that already has
-    /// a home is never taken over.
+    /// A matching native ID links the profile to its existing OpenAI row.
+    /// If a home-less row has no conflicting native identity, it can also
+    /// match by email or, when the login has no email claim, by the email's
+    /// local part and profile name ignoring punctuation (`r.j.walters@…`
+    /// matches `rjwalters`). Linking preserves the account's history.
     ///
     /// Also seeds the per-tick discovery state, so the first `pollDue` after
     /// launch costs one directory listing (see `discoverCodexProfiles`).
@@ -1139,6 +1135,13 @@ class OAuthPoller: ObservableObject {
         guard !profiles.isEmpty, FileManager.default.fileExists(atPath: dbPath),
               let db = try? openDatabase(dbPath) else { return 0 }
         func normalized(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
+        func identityKey(_ id: String) -> String { UUID(uuidString: id)?.uuidString ?? id }
+        // A home-less row may have a local or imported key. Only a recognized
+        // native key can contradict the login, and only within its own namespace.
+        func allowsLegacyMatch(_ id: String, nativeId: String?) -> Bool {
+            guard UUID(uuidString: id) != nil || Self.isLegacyUserId(id) else { return true }
+            return !Self.accountIdsComparable(stored: id, reported: nativeId)
+        }
         // Reserve native IDs across the batch before a legacy match can claim
         // the row belonging to a profile later in directory order. Only the
         // opaque account ID and email claim are used for registration.
@@ -1146,9 +1149,10 @@ class OAuthPoller: ObservableObject {
             (profile: profile, nativeId: CodexAuth.accountId(inHome: profile.home),
              email: CodexAuth.email(inHome: profile.home))
         }
-        let pendingNativeIDs = Set(logins.compactMap(\.nativeId))
+        let pendingNativeIDs = Set(logins.compactMap { $0.nativeId.map(identityKey) })
         var registered = 0
         for (profile, nativeId, email) in logins {
+            let nativeKey = nativeId.map(identityKey)
             do {
                 try db.execute("BEGIN IMMEDIATE")
                 // Holding the write lock keeps the home lookup, account and token-free
@@ -1177,18 +1181,20 @@ class OAuthPoller: ObservableObject {
                 """)
                 for row in candidates {
                     guard let id = row[0] as? String else { continue }
-                    if id == nativeId {
+                    let key = identityKey(id)
+                    if key == nativeKey {
                         target = id
                         break
                     }
                     if let home = row[2] as? String {
-                        guard let nativeId, CodexAuth.accountId(inHome: home) == nativeId else { continue }
+                        guard let nativeKey, CodexAuth.accountId(inHome: home).map(identityKey) == nativeKey else { continue }
                         target = id
                         break
                     }
                     // Remember the first legacy match, but keep looking for
                     // the native ID in the remaining home-less rows.
-                    guard target == nil, !pendingNativeIDs.contains(id) else { continue }
+                    guard target == nil, !pendingNativeIDs.contains(key),
+                          allowsLegacyMatch(id, nativeId: nativeId) else { continue }
                     let rowEmail = (row[1] as? String)?.lowercased()
                     if let email, rowEmail == email.lowercased() {
                         target = id
@@ -3020,8 +3026,11 @@ class OAuthPoller: ObservableObject {
     nonisolated static func accountIdsComparable(stored: String, reported: String?) -> Bool {
         guard let reported = reported?.trimmingCharacters(in: .whitespacesAndNewlines), !reported.isEmpty,
               !isLocallyMintedAccountId(stored) else { return false }
-        func isLegacyUserId(_ id: String) -> Bool { id.lowercased().hasPrefix("user-") }
         return isLegacyUserId(stored) == isLegacyUserId(reported)
+    }
+
+    nonisolated private static func isLegacyUserId(_ id: String) -> Bool {
+        id.lowercased().hasPrefix("user-")
     }
 
     /// Two identity strings that are both known and disagree. Pure function of

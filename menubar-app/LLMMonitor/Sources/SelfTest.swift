@@ -2083,6 +2083,45 @@ enum SelfTest {
                 ("existing-name", "z-existing", "pool.name@example.com", 33)
             ])
 
+            // The rightful owners can also arrive a tick later, outside the
+            // current batch. Both pairs have distinct workspace UUIDs.
+            let emailOwner = "aaaaaaaa-0000-4000-8000-000000000001"
+            let nameOwner = "cccccccc-0000-4000-8000-000000000003"
+            try! db.run("INSERT INTO accounts (id, email, provider) VALUES (?, ?, 'openai'), (?, ?, 'openai')",
+                        emailOwner, "shift@example.com", nameOwner, "next.shift@example.com")
+            checkDiscoveryTick([
+                ("bbbbbbbb-0000-4000-8000-000000000002", "early-email", "shift@example.com", 64),
+                ("dddddddd-0000-4000-8000-000000000004", "nextshift", nil, 71)
+            ])
+            for id in [emailOwner, nameOwner] {
+                expect(text("SELECT codex_home FROM accounts WHERE id = ?", id) == nil,
+                       "the absent workspace keeps its home unassigned")
+                expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", id), 0,
+                            "the earlier login writes no usage under the absent workspace")
+            }
+            checkDiscoveryTick([
+                (emailOwner, "later-email", "shift@example.com", 21),
+                (nameOwner, "later-name", "next.shift@example.com", 33)
+            ])
+
+            // A UUID with a different spelling still identifies the existing owner.
+            makeProfile("duplicate-uppercase", accountId: emailOwner.uppercased(), email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "UUID casing cannot create a second owner")
+            try! fm.removeItem(atPath: root + "/duplicate-uppercase")
+
+            // A legacy user key and a current workspace UUID describe different
+            // kinds of identity. A login with no email can still use the name.
+            try! db.run("INSERT INTO accounts (id, email, provider) VALUES (?, ?, 'openai')",
+                        "user-oldshift", "old.shift@example.com")
+            checkDiscoveryTick([("user-othershift", "other-user", "old.shift@example.com", 19)])
+            makeProfile("oldshift", accountId: "eeeeeeee-0000-4000-8000-000000000005", email: nil)
+            writeSnapshot("oldshift", weeklyPercent: 18)
+            expectEqual(tick(), 1, "the legacy name match is polled on discovery")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "user-oldshift"), root + "/oldshift",
+                        "the legacy user row gains the workspace home")
+            expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND weekly_all_percent = 18",
+                              "user-oldshift"), 1, "the reading belongs to the legacy account")
+
             // An unchanged root: the listing is the whole cost. Deleting the
             // row makes any per-home registration work visible — the
             // unconditional full sync would resurrect it — and none may
