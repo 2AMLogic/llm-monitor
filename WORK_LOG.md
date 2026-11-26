@@ -11,8 +11,11 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-11-26
 
+- **Issue #375** (closed): CI flake in build-linux when the Ubuntu security index changes during SQLite setup
 - **PR #373**: fix: honor archived provider rejections in the popover pool tally
 - **Issue #372** (closed): Honor stored provider rejections in the popover pool tally
+- **PR #370**: fix: classify stored windows at their cap as spent in the export status path
+- **Issue #367** (closed): accounts list counts Codex seats at 100% weekly as usable while the popover counts them exhausted
 
 ### 2026-11-23
 
