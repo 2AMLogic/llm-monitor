@@ -95,6 +95,7 @@ enum SelfTest {
         ("RankingExportCarriesResetAdvice", { testRankingExportCarriesResetAdvice() }),
         ("RankingExportMarksAbsentIdentity", { testRankingExportMarksAbsentIdentity() }),
         ("RankingExportBlocksRevokedCredential", { testRankingExportBlocksRevokedCredential() }),
+        ("RankingStatusMatchesWindowExhaustion", { testRankingStatusMatchesWindowExhaustion() }),
         ("NamedLimitsRoundTrip", { testNamedLimitsRoundTrip() }),
         ("HistoryDecimationKeepsFirstLastAndBigJumps", { testHistoryDecimationKeepsFirstLastAndBigJumps() }),
         ("FullHistoryDecimationMatchesLoadHistory", { testFullHistoryDecimationMatchesLoadHistory() }),
@@ -10159,6 +10160,143 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("revoked-credential ranking test threw: \(error)")
+            }
+        }
+    }
+
+    /// #367: a stored reading whose windows carry no status strings at all —
+    /// the Codex snapshot writers' row shape, whose `raw_data` holds only
+    /// `source` and `observed_at` — must be classified by its percentages in
+    /// the shared export status path, so `accounts list` and `ranking.json`
+    /// count a 100%-weekly seat exhausted exactly as the popover's provider
+    /// tab does. Before the fix, `statusReading` fed `mapStatus` only the
+    /// parsed status strings, so such a row read `available` and the CLI
+    /// printed the seat usable while the popover counted the same reading
+    /// exhausted.
+    private static func testRankingStatusMatchesWindowExhaustion() {
+        withSelfTestTempDir("ranking-exhaustion") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let outPath = dir.appendingPathComponent("ranking.json").path
+
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let db = try openDatabase(dbPath)
+                // The reading is backdated a minute so `loadFromDatabase`'s
+                // `timestamp <= <fractional now>` string comparison sees it:
+                // a whole-seconds stamp from the *same* second sorts after
+                // the fractional bound, exactly as a same-second poll would.
+                // A minute is still far inside the 1800s freshness threshold.
+                let readAt = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-60))
+                let now = ISO8601DateFormatter().string(from: Date())
+                let resetIn3Days = ISO8601DateFormatter().string(from: Date().addingTimeInterval(3 * 86400))
+
+                // The Codex snapshot writers' raw_data shape (#367): only
+                // `source` and `observed_at`, no status strings.
+                let snapshotRaw = "{\"source\":\"codex-rollout-snapshot\",\"observed_at\":\"\(readAt)\"}"
+                // The same shape plus one explicit provider rejection.
+                let rejectedRaw = "{\"source\":\"codex-rollout-snapshot\",\"observed_at\":\"\(readAt)\",\"weekly_status\":\"rejected\"}"
+
+                func seedSeat(
+                    _ id: String, session: Double?, weekly: Double?,
+                    raw: String, weeklyReset: String?
+                ) throws {
+                    try db.run("""
+                        INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                        VALUES (?, ?, ?, 'pro', ?, 0, 'openai')
+                    """, id, "\(id)@example.com", "\(id)@example.com", now)
+                    try db.run("""
+                        INSERT INTO usage_history
+                            (account_id, timestamp, primary_percent, session_percent,
+                             weekly_all_percent, weekly_sonnet_percent, weekly_reset, raw_data, is_synthetic)
+                        VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0)
+                    """, id, readAt, [session, weekly].compactMap { $0 }.max(), session, weekly, weeklyReset, raw)
+                }
+
+                // The reported row: a fresh, non-synthetic, weekly-only
+                // reading at the cap with no status strings.
+                try seedSeat("oa-capped", session: nil, weekly: 100, raw: snapshotRaw, weeklyReset: resetIn3Days)
+                // A below-cap weekly-only reading stays available.
+                try seedSeat("oa-quiet", session: nil, weekly: 40, raw: snapshotRaw, weeklyReset: resetIn3Days)
+                // A session-only cap is rate_limited, not exhausted.
+                try seedSeat("oa-session", session: 100, weekly: 30, raw: snapshotRaw, weeklyReset: resetIn3Days)
+                // An explicit provider rejection below cap still applies.
+                try seedSeat("oa-rejected", session: nil, weekly: 50, raw: rejectedRaw, weeklyReset: resetIn3Days)
+                // A blocked credential stays blocked at the weekly cap.
+                try seedSeat("oa-blocked", session: nil, weekly: 100, raw: snapshotRaw, weeklyReset: resetIn3Days)
+                try db.run("""
+                    INSERT INTO oauth_credentials (account_id, label, source, is_active, created_at, updated_at)
+                    VALUES ('oa-blocked', 'fixture', 'selftest', 0, ?, ?)
+                """, now, now)
+
+                // The export path's per-account status — the one rule both
+                // `accounts list` and `ranking.json` read.
+                func status(_ id: String) -> String {
+                    RankingExporter.statusReading(db: db, accountId: id).status
+                }
+                expectEqual(status("oa-capped"), "exhausted",
+                            "a weekly-only reading at the cap reads exhausted with no status strings")
+                expectEqual(status("oa-quiet"), "available",
+                            "a below-cap weekly-only reading stays available")
+                expectEqual(status("oa-session"), "rate_limited",
+                            "a session-only cap reads rate_limited")
+                expectEqual(status("oa-rejected"), "exhausted",
+                            "an explicit weekly rejection below cap still applies")
+                expectEqual(status("oa-blocked"), "blocked",
+                            "a blocked credential stays blocked at the weekly cap")
+
+                // The two pool surfaces over the reported row: the CLI's
+                // inputs come from `statusReading` exactly as `accounts list`
+                // builds them, the popover's from stored windows plus the
+                // credential-blocked set. Both tallies must agree on the same
+                // stored reading.
+                let store = UsageStore(dbPath: dbPath)
+                store.loadFromDatabase()
+                let cliInputs = store.accounts.map { account -> PoolAccountInput in
+                    PoolAccountInput(
+                        account: account,
+                        usage: store.latestUsage[account.id],
+                        status: status(account.id)
+                    )
+                }
+                let popoverInputs = ProviderPoolSummary.poolInputs(
+                    accounts: store.accounts,
+                    latestUsage: store.latestUsage,
+                    blockedIds: ["oa-blocked"]
+                )
+                func cappedTally(_ inputs: [PoolAccountInput]) -> ProviderPoolSummary.Tally {
+                    ProviderPoolSummary.tally(inputs.filter { $0.account.id == "oa-capped" })
+                }
+                let cliTally = cappedTally(cliInputs)
+                let popoverTally = cappedTally(popoverInputs)
+                expectEqual(cliTally.usable, 0,
+                            "accounts list no longer counts the capped seat usable")
+                expectEqual(cliTally.exhausted, 1,
+                            "accounts list counts the capped seat exhausted")
+                expectEqual(popoverTally.usable, 0, "the popover tally agrees: not usable")
+                expectEqual(popoverTally.exhausted, 1, "the popover tally agrees: exhausted")
+                expectEqual(cliTally, popoverTally,
+                            "both surfaces report the same tally for the same stored reading")
+
+                // The exported document says the same thing.
+                RankingExporter.exportNow(dbPath: dbPath, outputPath: outPath)
+                guard let data = FileManager.default.contents(atPath: outPath),
+                      let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let accounts = root["accounts"] as? [[String: Any]] else {
+                    checks += 1
+                    failures.append("ranking export produced no readable accounts array")
+                    return
+                }
+                let statusByEmail = Dictionary(uniqueKeysWithValues: accounts.compactMap { obj -> (String, String)? in
+                    guard let email = obj["email"] as? String, let st = obj["status"] as? String else { return nil }
+                    return (email, st)
+                })
+                expectEqual(statusByEmail["oa-capped@example.com"], "exhausted",
+                            "ranking.json exports the capped seat as exactly exhausted")
+                expectEqual(statusByEmail["oa-quiet@example.com"], "available",
+                            "ranking.json still exports a quiet weekly-only seat as available")
+            } catch {
+                checks += 1
+                failures.append("window-exhaustion ranking test threw: \(error)")
             }
         }
     }
