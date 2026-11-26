@@ -127,6 +127,9 @@ done
 PREFIX="${PREFIX/#\~/$HOME}"
 INSTALL_DIR="$PREFIX/bin"
 INSTALL_BIN="$INSTALL_DIR/llm-monitor"
+UNIT_DEST_DIR="$HOME/.config/systemd/user"
+UNIT_DEST="$UNIT_DEST_DIR/$UNIT_NAME"
+RESTART_STAMP="$UNIT_DEST_DIR/.${UNIT_NAME}.restart-pending"
 
 STAGE_DIR="$(mktemp -d)"
 trap 'rm -rf "$STAGE_DIR"' EXIT
@@ -271,6 +274,11 @@ if [[ -x "$INSTALL_BIN" ]]; then
     OLD_VERSION="$("$INSTALL_BIN" --version 2>/dev/null || true)"
 fi
 
+mark_restart_pending() {
+    mkdir -p "$UNIT_DEST_DIR"
+    : > "$RESTART_STAMP"
+}
+
 BINARY_CHANGED=false
 if [[ -x "$INSTALL_BIN" && "$OLD_VERSION" == "$NEW_VERSION" ]] && cmp -s "$STAGE_BIN" "$INSTALL_BIN"; then
     log "llm-monitor is already up to date ($NEW_VERSION at $INSTALL_BIN) — no-op, skipping reinstall."
@@ -281,6 +289,7 @@ else
         replacement=$(maybe_sudo mktemp "$INSTALL_DIR/.llm-monitor.XXXXXXXX")
         trap 'maybe_sudo rm -f "$replacement"' EXIT
         maybe_sudo install -m 755 "$STAGE_BIN" "$replacement"
+        mark_restart_pending
         maybe_sudo mv -fT "$replacement" "$INSTALL_BIN"
         trap - EXIT
     )
@@ -309,8 +318,6 @@ fi
 
 [[ -f "$UNIT_SRC" ]] || fail "Reference unit file not found at $UNIT_SRC."
 
-UNIT_DEST_DIR="$HOME/.config/systemd/user"
-UNIT_DEST="$UNIT_DEST_DIR/$UNIT_NAME"
 mkdir -p "$UNIT_DEST_DIR"
 
 RENDERED_UNIT="$STAGE_DIR/$UNIT_NAME"
@@ -318,6 +325,7 @@ sed "s|^ExecStart=.*|ExecStart=$INSTALL_BIN|" "$UNIT_SRC" > "$RENDERED_UNIT"
 
 UNIT_CHANGED=false
 if [[ ! -f "$UNIT_DEST" ]] || ! cmp -s "$RENDERED_UNIT" "$UNIT_DEST"; then
+    mark_restart_pending
     cp "$RENDERED_UNIT" "$UNIT_DEST"
     UNIT_CHANGED=true
     log "Installed/updated systemd user unit at $UNIT_DEST (ExecStart=$INSTALL_BIN)"
@@ -356,6 +364,7 @@ elif [[ -d "$LEGACY_DATA_DIR" ]]; then
     if [[ -e "$DATA_DIR" ]]; then
         fail "Both $LEGACY_DATA_DIR and $DATA_DIR exist as real directories. Merge or remove one, then re-run."
     fi
+    mark_restart_pending
     mv "$LEGACY_DATA_DIR" "$DATA_DIR"
     log "Moved $LEGACY_DATA_DIR to $DATA_DIR."
 else
@@ -387,6 +396,7 @@ ACCOUNTS_ENV_DEST="$DATA_DIR/accounts.env"
 ACCOUNTS_SEEDED=false
 if [[ -n "$ACCOUNTS_ENV_PATH" ]]; then
     [[ -f "$ACCOUNTS_ENV_PATH" ]] || fail "--accounts-env path does not exist: $ACCOUNTS_ENV_PATH"
+    mark_restart_pending
     cp "$ACCOUNTS_ENV_PATH" "$ACCOUNTS_ENV_DEST"
     chmod 600 "$ACCOUNTS_ENV_DEST"
     ACCOUNTS_SEEDED=true
@@ -403,11 +413,45 @@ else
     log "$ACCOUNTS_ENV_DEST already exists — leaving it untouched."
 fi
 
-# --- Step 6: restart if anything changed since the unit was (re)started ---
+# --- Step 6: restart if anything changed or the running unit is stale ------
 
-if [[ "$BINARY_CHANGED" == true || "$UNIT_CHANGED" == true || "$ACCOUNTS_SEEDED" == true ]]; then
+service_runs_stale_binary() {
+    local main_pid installed_id running_id fd target
+    main_pid="$(systemctl --user show -p MainPID --value "$UNIT_NAME" 2>/dev/null || true)"
+    [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    installed_id="$(stat -Lc '%d:%i' "$INSTALL_BIN" 2>/dev/null || true)"
+    [[ -n "$installed_id" ]] || return 1
+
+    # A `#!` stub in tests executes its interpreter (/bin/sh), so
+    # /proc/<pid>/exe names the shell rather than $INSTALL_BIN. Compare any
+    # open script descriptor for $INSTALL_BIN instead; for real ELF
+    # binaries, compare /proc/<pid>/exe directly.
+    if [[ "$(LC_ALL=C head -c 2 "$INSTALL_BIN" 2>/dev/null || true)" == '#!' ]]; then
+        for fd in "/proc/$main_pid/fd"/*; do
+            [[ -L "$fd" ]] || continue
+            target="$(readlink -- "$fd" 2>/dev/null || true)"
+            if [[ "$target" == "$INSTALL_BIN" || "$target" == "$INSTALL_BIN (deleted)" ]]; then
+                running_id="$(stat -Lc '%d:%i' "$fd" 2>/dev/null || true)"
+                [[ -n "$running_id" && "$running_id" != "$installed_id" ]] && return 0
+                return 1
+            fi
+        done
+        return 1
+    fi
+
+    running_id="$(stat -Lc '%d:%i' "/proc/$main_pid/exe" 2>/dev/null || true)"
+    [[ -n "$running_id" && "$running_id" != "$installed_id" ]]
+}
+
+RESTART_NEEDED=false
+if [[ "$BINARY_CHANGED" == true || "$UNIT_CHANGED" == true || "$ACCOUNTS_SEEDED" == true || -e "$RESTART_STAMP" ]] || service_runs_stale_binary; then
+    RESTART_NEEDED=true
+fi
+
+if [[ "$RESTART_NEEDED" == true ]]; then
     log "Restarting '$UNIT_NAME' to pick up the change..."
     systemctl --user restart "$UNIT_NAME"
+    rm -f "$RESTART_STAMP"
 else
     log "Nothing changed this run — leaving the running unit as-is."
 fi
