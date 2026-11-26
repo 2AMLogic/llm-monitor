@@ -105,6 +105,9 @@ struct UsageRecord: Identifiable {
     /// snapshots) carry no such object.
     var resetCredits: OpenAIUsageResponse.ResetCredits? = nil
 
+    /// Overall and per-window provider verdicts from this reading's raw_data.
+    var storedStatuses: RankingExporter.StoredStatuses = .unreported
+
     /// This stored reading expressed in the shared, provider-agnostic window
     /// model. The `usage_history` columns are already kind-keyed (a session
     /// column and a weekly column), so each window's kind is explicit and its
@@ -1320,7 +1323,9 @@ class UsageStore: ObservableObject {
                     )
                     // Unused Codex limit resets ride the row's `raw_data`
                     // archive (#298); nil for every reading that carries none.
-                    record.resetCredits = OpenAIUsageResponse.parseStoredReading(usageRow[8] as? String).credits
+                    let rawData = usageRow[8] as? String
+                    record.resetCredits = OpenAIUsageResponse.parseStoredReading(rawData).credits
+                    record.storedStatuses = RankingExporter.parseStoredStatuses(rawData)
 
                     // Premium/Fable allocation + overage come from the latest
                     // Fable probe snapshot's raw headers.

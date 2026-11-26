@@ -62,12 +62,8 @@ enum ProviderTab: Equatable, Hashable {
 
 /// One account's inputs to the provider pool tally (#297).
 ///
-/// Both surfaces produce these from their own source: the macOS popover
-/// derives `status` from the stored windows plus the in-memory token state
-/// (`ProviderPoolSummary.windowStatus`), while `llm-monitor accounts list`
-/// reads exactly what `ranking.json` exports
-/// (`RankingExporter.statusReading`). The tally rules themselves are the one
-/// shared implementation below.
+/// The popover uses the archived provider verdicts, window percentages and
+/// current credential state. The CLI uses the status exported to ranking.json.
 struct PoolAccountInput {
     let account: Account
     /// Latest stored reading; nil = this account has never reported usage
@@ -106,21 +102,16 @@ enum ProviderPoolSummary {
         var nextReset: Date? = nil
     }
 
-    /// The popover's status rule: no stored status blob exists on the display
-    /// side, so exhaustion is derived from the window percentages themselves
-    /// (`RateLimitWindow.isExhausted` reads both a `rejected` status and the
-    /// 100% cap) and fed through the same `RankingExporter.mapStatus` decision
-    /// table the export path uses. nil when there is no reading — unknown,
-    /// never "available".
+    /// Apply the popover's percentage-cap check even when the archive omits
+    /// a window verdict. With no reading, the seat's status stays unknown.
     static func windowStatus(for usage: UsageRecord?, credentialBlocked: Bool) -> String? {
         guard let usage = usage else { return nil }
         let windows = usage.rateLimit
-        let session = windows.session.map { $0.isExhausted ? "rejected" : "allowed" }
-        let weekly = windows.weekly.map { $0.isExhausted ? "rejected" : "allowed" }
+        let stored = usage.storedStatuses
         return RankingExporter.mapStatus(
-            overallStatus: nil,
-            sessionStatus: session,
-            weeklyStatus: weekly,
+            overallStatus: stored.overall,
+            sessionStatus: windows.session?.isExhausted == true ? "rejected" : stored.session,
+            weeklyStatus: windows.weekly?.isExhausted == true ? "rejected" : stored.weekly,
             credentialActive: !credentialBlocked,
             credentialRejected: false
         )
