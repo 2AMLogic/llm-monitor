@@ -1811,7 +1811,8 @@ enum SelfTest {
                 let home = (root as NSString).appendingPathComponent(name)
                 try? fm.createDirectory(atPath: home + "/sessions/2026/09/23", withIntermediateDirectories: true)
                 if let accountId = accountId {
-                    var tokens: [String: Any] = ["account_id": accountId, "access_token": "SECRET-NEVER-READ"]
+                    var tokens: [String: Any] = ["account_id": accountId, "access_token": "fixture-access",
+                                                 "refresh_token": "fixture-refresh"]
                     if let email = email {
                         let claims = try! JSONSerialization.data(withJSONObject: ["email": email])
                         let b64 = claims.base64EncodedString().replacingOccurrences(of: "=", with: "")
@@ -1843,9 +1844,17 @@ enum SelfTest {
             try! db.run("INSERT INTO accounts (id, account_name, email, provider) VALUES (?, ?, ?, 'openai')",
                         "user-beta", "beta@example.com", "beta@example.com")
 
+            try! db.run("""
+                INSERT INTO oauth_credentials (account_id, label, provider, access_token, refresh_token, created_at, updated_at)
+                VALUES ('user-beta', 'beta', 'openai', 'old-access', 'old-refresh', 'now', 'now')
+                """)
             let poller = OAuthPoller(dbPath: dbPath)
             expectEqual(poller.syncCodexProfiles(root: root), 1,
                         "the launch sync registers the profile that existed at launch")
+
+            expectEqual(count("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ? "
+                              + "AND access_token IS NULL AND refresh_token IS NULL", "acct-alpha"), 1,
+                        "a new snapshot credential stores neither token from auth.json")
 
             // A profile logs in under the root while the monitor runs, with a
             // live rollout reading for the discovering tick to poll.
@@ -1869,7 +1878,7 @@ enum SelfTest {
             expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = ?", "acct-beta"), 0,
                         "no second row is keyed on the native id when an existing row links")
             expectEqual(count("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ? AND is_active = 1 "
-                              + "AND access_token IS NULL AND source = 'loom-codex-profile'", "user-beta"), 1,
+                              + "AND access_token IS NULL AND refresh_token IS NULL AND source = 'loom-codex-profile'", "user-beta"), 1,
                         "the linked row has exactly one active, token-free profile credential")
             if let credential = poller.loadActiveCredentials().first(where: { $0.accountId == "user-beta" }) {
                 expect(credential.isCodexSnapshotOnly, "the new row joins the poll set on the discovering tick")
@@ -1911,14 +1920,16 @@ enum SelfTest {
             expectEqual(poller.discoverCodexProfiles(root: root), 0,
                         "the conflict is settled, so later ticks do not retry it")
 
-            // A registration that fails mid-way must stay eligible for retry:
-            // the home is not marked settled. A second root and database keep
-            // this decoupled from the fixture above; the failure is the
-            // `accounts` table being missing, so the first statement throws.
+            // Fail the credential insert after the account upsert. A partial
+            // account would make the next tick skip credential registration.
             let retryRoot = dir.appendingPathComponent("codex-profiles-retry").path
             let retryDb = dir.appendingPathComponent("retry.db").path
             UsageStore(dbPath: retryDb).ensureDatabase()
-            try! openDatabase(retryDb).run("DROP TABLE accounts")
+            let retryConnection = try! openDatabase(retryDb)
+            try! retryConnection.execute("""
+                CREATE TRIGGER fail_profile_credential BEFORE INSERT ON oauth_credentials
+                BEGIN SELECT RAISE(ABORT, 'private-fixture-diagnostic'); END
+                """)
             let retryHome = (retryRoot as NSString).appendingPathComponent("gamma")
             try? fm.createDirectory(atPath: retryHome + "/sessions/2026/09/23", withIntermediateDirectories: true)
             let retryAuth = try! JSONSerialization.data(withJSONObject: ["tokens": ["account_id": "acct-gamma"]])
@@ -1926,7 +1937,9 @@ enum SelfTest {
             let retryPoller = OAuthPoller(dbPath: retryDb)
             expectEqual(retryPoller.discoverCodexProfiles(root: retryRoot), 0,
                         "a registration that cannot write registers nothing")
-            UsageStore(dbPath: retryDb).ensureDatabase()
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = ?", "acct-gamma", at: retryDb), 0,
+                        "the credential failure rolls back the account upsert")
+            try! retryConnection.execute("DROP TRIGGER fail_profile_credential")
             expectEqual(retryPoller.discoverCodexProfiles(root: retryRoot), 1,
                         "the failed home is retried on the next tick and registers")
             expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-gamma", at: retryDb),
