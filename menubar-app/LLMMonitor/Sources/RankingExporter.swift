@@ -159,6 +159,11 @@ enum RankingExporter {
     /// on a multi-day cadence); a session-only rejection is `rate_limited` (the 5h
     /// window is temporarily full and resets soon).
     ///
+    /// A window's `rejected` input need not be a provider status string:
+    /// `statusReading` derives it from the stored usage figure too (a window
+    /// at its cap is spent, per `RateLimitWindow.isExhausted`), so a reading
+    /// whose archive carries no status at all still classifies (#367).
+    ///
     /// A 401 is `blocked` rather than `available` because the last reading is
     /// frozen at the moment the token died: exporting it as usable capacity
     /// would route work to a credential the provider has already revoked. The
@@ -468,12 +473,18 @@ enum RankingExporter {
         }
 
         // Parse the per-poll status blob written by OAuthPoller.writePingToDB().
-        let statuses = parseStatuses(rawData)
+        let statuses = parseStoredStatuses(rawData)
         let credential = credentialState(db: db, accountId: accountId)
+        // The stored window percentages join the parsed status strings (#367):
+        // a reading whose `raw_data` carries no status at all — the Codex
+        // snapshot writers archive only `source`/`observed_at` — still says
+        // its weekly window is spent when its usage figure is at the cap.
+        // Each window is classified by the shared exhaustion rule, so this
+        // path and the popover's pool tally agree on the same stored row.
         let status = mapStatus(
             overallStatus: statuses.overall,
-            sessionStatus: statuses.session,
-            weeklyStatus: statuses.weekly,
+            sessionStatus: windowStatus(kind: .session, usedPercent: sessionPercent, parsed: statuses.session),
+            weeklyStatus: windowStatus(kind: .weekly, usedPercent: weeklyPercent, parsed: statuses.weekly),
             credentialActive: credential.active,
             credentialRejected: credential.rejected
         )
@@ -493,6 +504,24 @@ enum RankingExporter {
             updatedAt: updatedAt,
             resetCredits: resetCredits
         )
+    }
+
+    /// One window's combined status signal for `mapStatus` (#367): `rejected`
+    /// when the shared window-exhaustion rule says the window is spent — an
+    /// explicit provider rejection **or** the usage figure at the cap — and
+    /// the parsed signal otherwise. This is what keeps a status-less stored
+    /// row (the Codex snapshot writers archive only `source`/`observed_at`)
+    /// from reading `available` at a 100% window while the popover's pool
+    /// tally counts the same reading exhausted. A window with neither a
+    /// percentage nor a status stays nil — unknown, never guessed.
+    private static func windowStatus(
+        kind: RateLimitWindowKind,
+        usedPercent: Double?,
+        parsed: String?
+    ) -> String? {
+        guard let usedPercent = usedPercent else { return parsed }
+        let window = RateLimitWindow(kind: kind, usedPercent: usedPercent, status: parsed)
+        return window.isExhausted ? "rejected" : parsed
     }
 
     // MARK: - Helpers
@@ -517,22 +546,29 @@ enum RankingExporter {
         return (true, false)
     }
 
-    private struct Statuses { let overall: String?; let session: String?; let weekly: String? }
+    struct StoredStatuses {
+        let overall: String?
+        let session: String?
+        let weekly: String?
 
-    /// Parse the status blob stored in `usage_history.raw_data`. Two shapes exist
-    /// in the wild and both are tolerated:
-    ///   1. The compact form written by this repo's `OAuthPoller.writePingToDB()`:
-    ///      `{"ping_status":200,"session_status":"allowed","weekly_status":"allowed","overall_status":"allowed"}`
-    ///   2. The full response-header form written by the external poller that
-    ///      populates the live DB, keyed by the raw `anthropic-ratelimit-unified-*`
-    ///      header names.
+        static let unreported = Self(overall: nil, session: nil, weekly: nil)
+    }
+
+    /// Parse the status blob stored in `usage_history.raw_data`. Two key
+    /// spellings exist in stored rows and both are read:
+    ///   1. The compact form the live usage pollers archive beside their
+    ///      flattened fields (OpenAI `wham/usage`, `codex app-server`, z.ai):
+    ///      `{"session_status":"allowed","weekly_status":"allowed","overall_status":"allowed"}`
+    ///   2. The full response-header form keyed by the raw
+    ///      `anthropic-ratelimit-unified-*` header names — the Anthropic ping
+    ///      archive, and the external poller that populates the live DB.
     /// Only status *strings* (`allowed` / `allowed_warning` / `rejected`) are read —
     /// never token or identity fields.
-    private static func parseStatuses(_ raw: String?) -> Statuses {
+    static func parseStoredStatuses(_ raw: String?) -> StoredStatuses {
         guard let raw = raw,
               let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return Statuses(overall: nil, session: nil, weekly: nil)
+            return .unreported
         }
         func str(_ keys: String...) -> String? {
             for key in keys {
@@ -540,7 +576,7 @@ enum RankingExporter {
             }
             return nil
         }
-        return Statuses(
+        return StoredStatuses(
             overall: str("overall_status", "anthropic-ratelimit-unified-status"),
             session: str("session_status", "anthropic-ratelimit-unified-5h-status"),
             weekly: str("weekly_status", "anthropic-ratelimit-unified-7d-status")
