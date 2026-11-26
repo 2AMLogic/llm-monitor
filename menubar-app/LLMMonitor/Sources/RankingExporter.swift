@@ -535,8 +535,8 @@ enum RankingExporter {
 
     /// Parse the status blob stored in `usage_history.raw_data`. Two key
     /// spellings exist in stored rows and both are read:
-    ///   1. The compact form every provider snapshot path archives beside its
-    ///      flattened fields:
+    ///   1. The compact form the live usage pollers archive beside their
+    ///      flattened fields (OpenAI `wham/usage`, `codex app-server`, z.ai):
     ///      `{"session_status":"allowed","weekly_status":"allowed","overall_status":"allowed"}`
     ///   2. The full response-header form keyed by the raw
     ///      `anthropic-ratelimit-unified-*` header names — the Anthropic ping
