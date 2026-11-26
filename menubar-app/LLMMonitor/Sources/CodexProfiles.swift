@@ -59,27 +59,36 @@ enum CodexProfiles {
             .appendingPathComponent(".loom/codex-profiles").path
     }
 
-    struct Profile: Equatable {
+    /// Identity and type as reported by a single directory listing.
+    struct RootEntry: Hashable {
+        enum Kind: Hashable { case directory, other, needsLookup }
         let name: String
         let home: String
+        let inode: ino_t
+        let kind: Kind
     }
 
-    /// One visible entry of the profile root, with the type the directory
-    /// listing itself reported.
-    struct RootEntry: Equatable {
-        enum Kind: Equatable { case directory, other, needsLookup }
-        let name: String
-        let home: String
-        let kind: Kind
+    struct RootListing {
+        let entries: [RootEntry]
+        let modificationTime: timespec?
     }
 
     /// The visible entries of `root` in name order, or nil when the root cannot
     /// be listed (disabled, missing, unreadable). The type comes from the
     /// listing (`d_type`), so a regular file costs no metadata lookup; only a
     /// symlink or a filesystem that reports no type needs one.
-    static func listRoot(_ root: String?) -> [RootEntry]? {
+    static func listRoot(_ root: String?) -> RootListing? {
         guard let root = root, let stream = opendir(root) else { return nil }
         defer { closedir(stream) }
+        // Sample the open root before reading entries. A concurrent replacement
+        // during enumeration remains visible as a change on the next tick.
+        var metadata = stat()
+        let hasMetadata = fstat(dirfd(stream), &metadata) == 0
+        #if os(macOS)
+        let modificationTime = hasMetadata ? metadata.st_mtimespec : nil
+        #else
+        let modificationTime = hasMetadata ? metadata.st_mtim : nil
+        #endif
         var entries: [RootEntry] = []
         while let entry = readdir(stream) {
             let name = withUnsafePointer(to: &entry.pointee.d_name) {
@@ -94,31 +103,21 @@ enum CodexProfiles {
             case Int32(DT_UNKNOWN), Int32(DT_LNK): kind = .needsLookup
             default: kind = .other
             }
-            entries.append(RootEntry(name: name, home: (root as NSString).appendingPathComponent(name), kind: kind))
+            entries.append(RootEntry(name: name, home: (root as NSString).appendingPathComponent(name),
+                                     inode: entry.pointee.d_ino, kind: kind))
         }
-        return entries.sorted { $0.name < $1.name }
+        return RootListing(entries: entries.sorted { $0.name < $1.name }, modificationTime: modificationTime)
     }
 
-    /// Profile directories among `entries`, skipping settled paths first.
-    /// `isDirectory` is consulted only for an entry whose listing type was
-    /// ambiguous (a symlink, which may point at a profile).
-    static func profiles(in entries: [RootEntry], excluding settledHomes: Set<String> = [],
-                         isDirectory: (String) -> Bool = isDirectory) -> [Profile] {
-        entries.compactMap { entry in
-            guard !settledHomes.contains(entry.home) else { return nil }
+    /// Only symlinks and entries without a reported type need a lookup.
+    static func scan(_ entries: [RootEntry], isDirectory: (String) -> Bool = isDirectory) -> [RootEntry] {
+        entries.filter { entry in
             switch entry.kind {
-            case .directory: break
-            case .other: return nil
-            case .needsLookup: guard isDirectory(entry.home) else { return nil }
+            case .directory: return true
+            case .other: return false
+            case .needsLookup: return isDirectory(entry.home)
             }
-            return Profile(name: entry.name, home: entry.home)
         }
-    }
-
-    /// List visible profile directories in name order.
-    static func scan(root: String?, excluding settledHomes: Set<String> = [],
-                     isDirectory: (String) -> Bool = isDirectory) -> [Profile] {
-        profiles(in: listRoot(root) ?? [], excluding: settledHomes, isDirectory: isDirectory)
     }
 
     static func isDirectory(_ path: String) -> Bool {

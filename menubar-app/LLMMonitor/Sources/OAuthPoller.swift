@@ -1098,7 +1098,7 @@ class OAuthPoller: ObservableObject {
     /// launch costs one directory listing (see `discoverCodexProfiles`).
     @discardableResult
     func syncCodexProfiles(root: String? = CodexProfiles.root()) -> Int {
-        registerCodexProfiles(CodexProfiles.scan(root: root), requireLoginIdentity: false)
+        syncCodexProfiles(root: root, incremental: false, isDirectory: CodexProfiles.isDirectory)
     }
 
     /// Run before loading credentials so a new home can be polled on this tick.
@@ -1106,17 +1106,29 @@ class OAuthPoller: ObservableObject {
     @discardableResult
     func discoverCodexProfiles(root: String? = CodexProfiles.root(),
                                isDirectory: (String) -> Bool = CodexProfiles.isDirectory) -> Int {
-        // A successful listing is the one authority on what exists. A settled
-        // path that has vanished is forgotten, so a directory recreated under
-        // the same name (a reused slot) is evaluated afresh. Database rows are
-        // never touched here. A failed listing keeps the cache as it was.
-        guard let entries = CodexProfiles.listRoot(root) else { return 0 }
-        settledCodexProfileHomes.formIntersection(entries.map(\.home))
-        let pending = CodexProfiles.profiles(in: entries, excluding: settledCodexProfileHomes, isDirectory: isDirectory)
-        return registerCodexProfiles(pending, requireLoginIdentity: true)
+        syncCodexProfiles(root: root, incremental: true, isDirectory: isDirectory)
     }
 
-    private func registerCodexProfiles(_ profiles: [CodexProfiles.Profile], requireLoginIdentity: Bool) -> Int {
+    private func syncCodexProfiles(root: String?, incremental: Bool, isDirectory: (String) -> Bool) -> Int {
+        guard let listing = CodexProfiles.listRoot(root) else { return 0 }
+        let listed = Set(listing.entries)
+        settledCodexProfiles.formIntersection(listed)
+        // Inodes can be recycled between listings. Recheck unclaimed conflicts
+        // when the root changes, even if a replacement has the same name and inode.
+        if let previous = codexRootModificationTime, let current = listing.modificationTime,
+           previous.tv_sec == current.tv_sec && previous.tv_nsec == current.tv_nsec {
+            conflictingCodexProfiles.formIntersection(listed)
+        } else {
+            conflictingCodexProfiles.removeAll()
+        }
+        codexRootModificationTime = listing.modificationTime
+        let pending = incremental ? listing.entries.filter {
+            !settledCodexProfiles.contains($0) && !conflictingCodexProfiles.contains($0)
+        } : listing.entries
+        return registerCodexProfiles(CodexProfiles.scan(pending, isDirectory: isDirectory), requireLoginIdentity: incremental)
+    }
+
+    private func registerCodexProfiles(_ profiles: [CodexProfiles.RootEntry], requireLoginIdentity: Bool) -> Int {
         guard !profiles.isEmpty, FileManager.default.fileExists(atPath: dbPath),
               let db = try? openDatabase(dbPath) else { return 0 }
         func normalized(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
@@ -1130,7 +1142,7 @@ class OAuthPoller: ObservableObject {
                     try db.run("UPDATE accounts SET codex_home_mode = ? WHERE codex_home = ?",
                                CodexProfiles.snapshotMode, profile.home)
                     try db.execute("COMMIT")
-                    settledCodexProfileHomes.insert(profile.home)
+                    settledCodexProfiles.insert(profile)
                     continue
                 }
                 // Registration uses the opaque accounts.id and the email claim for
@@ -1178,7 +1190,7 @@ class OAuthPoller: ObservableObject {
                 // home. The guarded upsert leaves it and its credential alone.
                 if try db.scalar("SELECT changes()") as? Int64 == 0 {
                     try db.execute("COMMIT")
-                    settledCodexProfileHomes.insert(profile.home)
+                    conflictingCodexProfiles.insert(profile)
                     flog.info("Skipped Loom Codex profile because its account already owns a home", category: fcat)
                     continue
                 }
@@ -1199,7 +1211,7 @@ class OAuthPoller: ObservableObject {
                     """, accountId, profile.name, now, now)
                 }
                 try db.execute("COMMIT")
-                settledCodexProfileHomes.insert(profile.home)
+                settledCodexProfiles.insert(profile)
                 registered += 1
                 flog.info("Registered Loom Codex profile in snapshot mode", category: fcat)
             } catch {
@@ -2116,13 +2128,9 @@ class OAuthPoller: ObservableObject {
     /// Last poll time per credential ID
     private var lastPollTimes: [Int64: Date] = [:]
 
-    /// Loom Codex profile homes this poller has already settled (registered,
-    /// found already registered, or deliberately skipped as conflicting).
-    /// Seeded by the every-launch full sync, consulted by per-tick discovery
-    /// (`discoverCodexProfiles`, #368) so an unchanged profile root costs one
-    /// directory listing and no per-home work once all homes are settled.
-    /// Ticks retry homes still logging in and failed registrations.
-    private var settledCodexProfileHomes: Set<String> = []
+    private var settledCodexProfiles: Set<CodexProfiles.RootEntry> = []
+    private var conflictingCodexProfiles: Set<CodexProfiles.RootEntry> = []
+    private var codexRootModificationTime: timespec?
 
     /// How often to probe the Fable tier per account (seconds). Independent of the
     /// Haiku poll — a few times an hour is enough to track Fable availability/usage

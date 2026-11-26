@@ -1867,8 +1867,7 @@ enum SelfTest {
             }
             try! db.run("INSERT INTO usage_history (account_id, timestamp, weekly_all_percent) VALUES (?, ?, 17)",
                         "user-beta", ISO8601DateFormatter().string(from: Date().addingTimeInterval(-10800)))
-            expectEqual(poller.discoverCodexProfiles(root: root, isDirectory: probeDirectory), 0, "an empty home waits for login")
-            expectEqual(directoryProbes, [], "the listing types the new directory, so no per-entry lookup runs")
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "an empty home waits for login")
             expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 0,
                         "the first tick leaves the home available for identity matching")
 
@@ -1912,12 +1911,25 @@ enum SelfTest {
             // per-home identity read or registration SQL.
             try! db.run("DELETE FROM oauth_credentials WHERE account_id = ?", "user-beta")
             try! db.run("DELETE FROM accounts WHERE id = ?", "user-beta")
-            // A visible regular file shares the root: the listing already says
-            // it is not a directory, so it costs no type lookup either.
-            fm.createFile(atPath: root + "/pool-readme.txt", contents: Data("notes".utf8))
+            // Exercise both legal listing formats regardless of the host filesystem.
+            let readme = root + "/pool-readme.txt"
+            try! Data("notes".utf8).write(to: URL(fileURLWithPath: readme))
+            typealias Entry = CodexProfiles.RootEntry
+            let typed = [Entry(name: "slot-7", home: slot, inode: 1, kind: .directory),
+                         Entry(name: "pool-readme.txt", home: readme, inode: 2, kind: .other)]
+            expectEqual(CodexProfiles.scan(typed, isDirectory: probeDirectory), [typed[0]],
+                        "a typed listing selects only the directory")
+            expectEqual(directoryProbes, [], "known directory and file types require no lookup")
+            let untyped = typed.map { Entry(name: $0.name, home: $0.home, inode: $0.inode, kind: .needsLookup) }
+            expectEqual(CodexProfiles.scan(untyped, isDirectory: probeDirectory), [untyped[0]],
+                        "the fallback identifies the directory and skips the regular file")
+            expectEqual(directoryProbes, [slot, readme], "each untyped candidate is probed once")
+
             directoryProbes.removeAll()
+            let readmeKind = CodexProfiles.listRoot(root)?.entries.first { $0.home == readme }?.kind
             expectEqual(poller.discoverCodexProfiles(root: root, isDirectory: probeDirectory), 0, "an unchanged root registers nothing")
-            expectEqual(directoryProbes, [], "an unchanged tick performs no directory type lookups, even with a visible file")
+            expectEqual(directoryProbes, readmeKind == .needsLookup ? [readme] : [],
+                        "settled directories cost no probes and only an untyped regular file needs a lookup")
             expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 0,
                         "a settled home is skipped before any per-home identity read or registration SQL")
 
@@ -1939,6 +1951,35 @@ enum SelfTest {
                         "the original account's credential is preserved, not duplicated")
             expectEqual(poller.discoverCodexProfiles(root: root), 0,
                         "the conflict is settled, so later ticks do not retry it")
+
+            // Replacing a conflicting directory between listings must register
+            // the new login immediately, even on filesystems that recycle inodes.
+            let swap = root + "/swap"
+            makeProfile("swap", accountId: "acct-owned", email: nil)
+            // Model separate poll ticks even on a filesystem with a coarse clock.
+            try! fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: root)
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "the first login at swap conflicts")
+            try! fm.removeItem(atPath: swap)
+            makeProfile("swap", accountId: "acct-swap", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "a replacement between ticks registers immediately")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-swap"), swap,
+                        "the replacement login owns its new home")
+
+            // Show the poller a regular file, then return the very same directory
+            // with a new login. The file tick alone must have cleared the conflict.
+            let viaFile = root + "/via-file"
+            let parked = dir.appendingPathComponent("parked").path
+            makeProfile("via-file", accountId: "acct-owned", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "the first login at via-file conflicts")
+            try! fm.moveItem(atPath: viaFile, toPath: parked)
+            try! Data().write(to: URL(fileURLWithPath: viaFile))
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "the intervening regular file registers nothing")
+            try! fm.removeItem(atPath: viaFile)
+            try! fm.moveItem(atPath: parked, toPath: viaFile)
+            makeProfile("via-file", accountId: "acct-via-file", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "a directory returning after a file registers immediately")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-via-file"), viaFile,
+                        "the login after the file owns the reused path")
 
             // A file later replaced by a profile directory is a new entry.
             try! fm.removeItem(atPath: root + "/pool-readme.txt")
