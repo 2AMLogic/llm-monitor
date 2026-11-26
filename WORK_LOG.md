@@ -11,6 +11,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-11-26
 
+- **PR #381**: chore: gitignore loom-daemon's account-ranking cache
+- **Issue #380** (closed): check-main-clean.sh exits 3 on a clean main because loom-daemon writes .loom/account-ranking.codex there
 - **Issue #377** (closed): Describe Codex profile discovery in CLAUDE.md without naming the scan helper
 - **PR #378**: docs: drop CodexProfiles.scan() reference from CLAUDE.md
 - **Issue #375** (closed): CI flake in build-linux when the Ubuntu security index changes during SQLite setup
