@@ -38,6 +38,7 @@ enum SelfTest {
         ("PoolSummaryTally", { testPoolSummaryTally() }),
         ("PoolSummaryTabFallback", { testPoolSummaryTabFallback() }),
         ("PoolInputAssembly", { testPoolInputAssembly() }),
+        ("PoolTallyHonorsStoredRejection", { testPoolTallyHonorsStoredRejection() }),
         ("ResetAdvisor", { testResetAdvisor() }),
         ("WindowKindDerivation", { testWindowKindDerivation() }),
         ("SnapshotFromPositionalWindows", { testSnapshotFromPositionalWindows() }),
@@ -1357,6 +1358,281 @@ enum SelfTest {
             ),
             "resets: unknown",
             "a reading with no reset-credit archive says unknown, never 0")
+    }
+
+    /// #372: a rejection the provider reported — archived beside the
+    /// percentages on the same `usage_history` row — must reach the popover's
+    /// pool tally the way it already reaches `ranking.json` and `accounts
+    /// list`. The popover read only the percentages, so a seat the provider
+    /// had cut off at 14% of its window counted as usable there while the CLI
+    /// and the export classified it exhausted.
+    ///
+    /// Each shape gets its own scratch database — one present account with an
+    /// email and one fresh, non-synthetic reading — read back through the
+    /// popover's own load (`UsageStore.loadFromDatabase` →
+    /// `ProviderPoolSummary.poolInputs`) and compared with both export-side
+    /// readings of that row: `RankingExporter.statusReading`, which is the
+    /// `accounts list` status, and the `ranking.json` `status` key.
+    ///
+    /// Offline fixtures, none a live provider capture: the rejected-14%
+    /// archive is what this app's own decoder writes for the `wham/usage`
+    /// fixture, and every other shape is a stored-row form built here.
+    private static func testPoolTallyHonorsStoredRejection() {
+        withSelfTestTempDir("pool-stored-rejection") { dir in
+            do {
+                let now = Date()
+                let accountId = "acct-fixture"
+                let email = "fixture@example.com"
+
+                typealias Surfaces = (
+                    popover: String?, popoverTally: ProviderPoolSummary.Tally,
+                    cli: String?, cliTally: ProviderPoolSummary.Tally,
+                    exported: String?, record: UsageRecord?, isAbsent: Bool?
+                )
+
+                // One scratch database per shape: exactly one present account
+                // with an email, plus the reading `writeUsageToDB` stores for
+                // it (skipped for the missing-reading shape). A snapshot's
+                // row is stored with `writeSnapshotToDB`'s own argument
+                // mapping — that function is private — unless `archive`
+                // replaces the snapshot's. `storedRawData` overwrites the
+                // stored blob afterwards, for malformed shapes the real writer
+                // cannot produce. No credential row: both surfaces read that
+                // as an active credential.
+                @MainActor
+                func surfaces(
+                    _ name: String,
+                    provider: AccountProvider = .openai,
+                    snapshot: ProviderUsageSnapshot? = nil,
+                    session: Double? = nil,
+                    weekly: Double? = nil,
+                    archive: [String: String]? = nil,
+                    hasReading: Bool = true,
+                    storedRawData: String? = nil,
+                    blockedIds: Set<String> = []
+                ) throws -> Surfaces {
+                    let scratch = dir.appendingPathComponent(name, isDirectory: true)
+                    try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+                    let dbPath = scratch.appendingPathComponent("usage.db").path
+                    let outPath = scratch.appendingPathComponent("ranking.json").path
+                    UsageStore(dbPath: dbPath).ensureDatabase()
+                    let db = try openDatabase(dbPath)
+                    try db.run("""
+                        INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                        VALUES (?, ?, ?, 'pro', ?, 0, ?)
+                    """, accountId, email, email, ISO8601DateFormatter().string(from: now), provider.rawValue)
+
+                    if hasReading {
+                        let windows = snapshot?.rateLimit
+                        OAuthPoller(dbPath: dbPath).writeUsageToDB(
+                            accountId: accountId,
+                            sessionPercent: session ?? windows?.session?.usedPercent,
+                            weeklyPercent: weekly ?? windows?.weekly?.usedPercent,
+                            sessionReset: windows?.session?.resetAtISO,
+                            weeklyReset: windows?.weekly?.resetAtISO,
+                            rawFields: archive ?? snapshot?.rawFields ?? [:],
+                            probeModel: "\(provider.rawValue)-usage",
+                            httpStatus: snapshot?.httpStatus ?? 200,
+                            namedLimits: windows?.named ?? [:],
+                            // Two seconds old, still fresh: `loadFromDatabase`
+                            // bounds rows by comparing ISO text, and a row
+                            // stamped in the load's own whole second sorts
+                            // after its fractional-second bound.
+                            observedAt: now.addingTimeInterval(-2)
+                        )
+                    }
+                    if let storedRawData = storedRawData {
+                        try db.run(
+                            "UPDATE usage_history SET raw_data = ? WHERE account_id = ?", storedRawData, accountId
+                        )
+                    }
+
+                    let store = UsageStore(dbPath: dbPath)
+                    store.loadFromDatabase()
+                    expectEqual(store.accounts.count, 1, "\(name): fixture precondition — exactly one account loads")
+
+                    // The popover's input assembly.
+                    let popoverInputs = ProviderPoolSummary.poolInputs(
+                        accounts: store.accounts, latestUsage: store.latestUsage, blockedIds: blockedIds
+                    )
+                    // `accounts list`'s own input assembly (`AccountSyncCLI.runList`).
+                    let cliInputs = store.accounts.map { account in
+                        PoolAccountInput(
+                            account: account,
+                            usage: store.latestUsage[account.id],
+                            status: RankingExporter.statusReading(db: db, accountId: account.id).status
+                        )
+                    }
+                    RankingExporter.exportNow(dbPath: dbPath, outputPath: outPath)
+                    var exported: String? = nil
+                    if let data = FileManager.default.contents(atPath: outPath),
+                       let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let accounts = root["accounts"] as? [[String: Any]] {
+                        exported = accounts.first?["status"] as? String
+                    }
+                    return Surfaces(
+                        popover: popoverInputs.first?.status,
+                        popoverTally: ProviderPoolSummary.tally(popoverInputs, pollInterval: 600, now: now),
+                        cli: cliInputs.first?.status,
+                        cliTally: ProviderPoolSummary.tally(cliInputs, pollInterval: 600, now: now),
+                        exported: exported,
+                        record: store.latestUsage[accountId],
+                        isAbsent: store.accounts.first?.isAbsent
+                    )
+                }
+
+                // The popover's pool input carries `status` and tallies
+                // `usable`/`exhausted`. Unless told otherwise, both export-side
+                // surfaces say exactly the same about the row.
+                @MainActor
+                func agree(
+                    _ label: String, _ s: Surfaces, _ status: String,
+                    usable: Int, exhausted: Int, exportDiffers: Bool = false
+                ) {
+                    expectEqual(s.popover, status, "\(label): popover pool-input status")
+                    expectEqual(s.popoverTally.usable, usable, "\(label): popover usable")
+                    expectEqual(s.popoverTally.exhausted, exhausted, "\(label): popover exhausted")
+                    expectEqual(s.popoverTally.total, 1, "\(label): one configured account")
+                    if exportDiffers { return }
+                    expectEqual(s.cli, status, "\(label): accounts list status (statusReading)")
+                    expectEqual(s.popoverTally, s.cliTally, "\(label): the popover tallies the same counts as the CLI")
+                    expectEqual(s.exported, status, "\(label): ranking.json status")
+                }
+
+                // The fixture with `limit_reached` set, decoded by the real
+                // snapshot path. `RateLimit.windows` copies the verdict onto
+                // every reported window, so this archive is rejected overall
+                // *and* weekly at 14% used — and weekly wins in `mapStatus`.
+                let capped = openAIUsageFixture
+                    .replacingOccurrences(of: "\"limit_reached\": false", with: "\"limit_reached\": true")
+                    .replacingOccurrences(of: "\"allowed\": true", with: "\"allowed\": false")
+                let rejected = try OpenAIAPIClient.snapshot(from: Data(capped.utf8), httpStatus: 200)
+                expectEqual(rejected.rawFields["overall_status"], "rejected",
+                             "fixture precondition: the archive rejects overall")
+                expectEqual(rejected.rawFields["weekly_status"], "rejected",
+                             "fixture precondition: the archive rejects weekly")
+                expectEqual(rejected.rateLimit.weekly?.usedPercent, 14,
+                             "fixture precondition: the rejected window is below its cap")
+
+                // Overall + weekly rejected, 14% used: exhausted everywhere,
+                // 0 usable / 1 exhausted. (Popover read `available` before #372.)
+                let rejectedRow = try surfaces("rejected-weekly", snapshot: rejected)
+                agree("overall + weekly rejected at 14%", rejectedRow, "exhausted", usable: 0, exhausted: 1)
+                expectEqual(rejectedRow.record?.storedStatuses,
+                            RankingExporter.StoredStatuses(overall: "rejected", weekly: "rejected"),
+                            "overall + weekly rejected at 14%: the store retains the row's archived verdicts")
+
+                // Overall-only rejection, both windows allowed and below
+                // their caps: rate_limited, 0 usable / 0 exhausted. The
+                // `wham/usage` decoder cannot emit this shape (it copies the
+                // verdict onto every window); three independent Anthropic
+                // headers can, so it is built here from the paired fixture's
+                // real archive with one key changed.
+                let paired = try OpenAIAPIClient.snapshot(from: Data(openAIUsageFixture.replacingOccurrences(
+                    of: "\"secondary_window\": null",
+                    with: "\"secondary_window\": {\"used_percent\": 30, \"limit_window_seconds\": 18000, \"reset_at\": 1785900000}"
+                ).utf8), httpStatus: 200)
+                var overallOnly = paired.rawFields
+                overallOnly["overall_status"] = "rejected"
+                agree("overall-only rejection below the caps",
+                      try surfaces("rejected-overall-only", snapshot: paired, archive: overallOnly),
+                      "rate_limited", usable: 0, exhausted: 0)
+
+                // Weekly-only rejection beside reset credits — the stored
+                // blob shape every reset-credit check pins: still exhausted,
+                // and the same row's credits still parse.
+                var weeklyOnly = rejected.rawFields
+                weeklyOnly["overall_status"] = "allowed"
+                weeklyOnly["rate_limit_reset_credits.available_count"] = "1"
+                weeklyOnly["rate_limit_reset_credits.applicable_available_count"] = "0"
+                let credited = try surfaces("rejected-weekly-credited", snapshot: rejected, archive: weeklyOnly)
+                agree("weekly-only rejected at 14%", credited, "exhausted", usable: 0, exhausted: 1)
+                expectEqual(credited.record?.resetCredits?.availableCount, 1,
+                            "weekly-only rejected at 14%: the same row's reset credits still parse")
+
+                // The Anthropic ping archive: keyed by the raw header names,
+                // overall rejected while both windows say allowed.
+                let legacy = try surfaces("legacy-header-rejected", provider: .anthropic, session: 10, weekly: 20,
+                                          archive: ["anthropic-ratelimit-unified-status": "rejected",
+                                                    "anthropic-ratelimit-unified-5h-status": "allowed",
+                                                    "anthropic-ratelimit-unified-7d-status": "allowed"])
+                agree("legacy overall header rejected", legacy, "rate_limited", usable: 0, exhausted: 0)
+                expectEqual(legacy.record?.storedStatuses,
+                            RankingExporter.StoredStatuses(overall: "rejected", session: "allowed", weekly: "allowed"),
+                            "legacy overall header rejected: the header-named keys decode through the same rule")
+
+                // A blocked credential wins over the stored rejection. The
+                // popover's blocked set is its own in-memory input, so the
+                // export-side surfaces (no credential row here) are not
+                // party to this one.
+                let blocked = try surfaces("blocked-over-rejected", snapshot: rejected, blockedIds: [accountId])
+                agree("blocked credential over a rejected weekly window", blocked, "blocked", usable: 0, exhausted: 0,
+                      exportDiffers: true)
+
+                // No status keys at all: the percentage rule stands on its
+                // own — available below the caps, exhausted at the weekly
+                // cap. The export reads a cap without a rejection as
+                // `available`; closing that is #367 / #370, not this change.
+                agree("no status keys, below the caps",
+                      try surfaces("no-status-quiet", session: 10, weekly: 20),
+                      "available", usable: 1, exhausted: 0)
+                agree("no status keys, weekly at its cap",
+                      try surfaces("no-status-capped", session: 10, weekly: 100),
+                      "exhausted", usable: 0, exhausted: 1, exportDiffers: true)
+
+                // Malformed status data: a non-JSON blob and wrongly typed
+                // values both decode to "not reported", so the percentage
+                // rule decides.
+                let notJSON = try surfaces("malformed-not-json", session: 10, weekly: 100, storedRawData: "not json")
+                agree("non-JSON archive, weekly at its cap", notJSON, "exhausted", usable: 0, exhausted: 1, exportDiffers: true)
+                expectEqual(notJSON.record?.storedStatuses, RankingExporter.StoredStatuses(),
+                            "non-JSON archive: nothing is reported")
+                let wrongType = try surfaces("malformed-wrong-type", session: 10, weekly: 20,
+                                             storedRawData: "{\"overall_status\": 1, \"weekly_status\": true}")
+                agree("wrongly typed statuses, below the caps", wrongType, "available", usable: 1, exhausted: 0)
+                expectEqual(wrongType.record?.storedStatuses, RankingExporter.StoredStatuses(),
+                            "wrongly typed statuses: nothing is reported")
+
+                // No reading at all: unknown — neither bucket — never
+                // capacity.
+                let silent = try surfaces("no-reading", hasReading: false)
+                expectEqual(silent.isAbsent as Bool?, true, "no reading: an OpenAI identity with nothing local is absent")
+                expect(silent.record == nil, "no reading: the store carries no record")
+                expectEqual(silent.popover as String?, nil, "no reading: the pool input has no status")
+                expectEqual(silent.popoverTally, ProviderPoolSummary.Tally(usable: 0, exhausted: 0, total: 1, nextReset: nil),
+                            "no reading: counted in the total, in neither bucket")
+
+                // How the two signals combine on one record: only the exact
+                // word `rejected` rejects, a window at its cap stays rejected
+                // beside a stored `allowed`, the weekly verdict still outranks
+                // the session one, and a blocked credential outranks both.
+                @MainActor
+                func stamped(_ session: Double, _ weekly: Double,
+                             _ statuses: RankingExporter.StoredStatuses) -> UsageRecord {
+                    var usage = poolUsage("a", session: session, weekly: weekly, now: now)!
+                    usage.storedStatuses = statuses
+                    return usage
+                }
+                expectEqual(ProviderPoolSummary.windowStatus(
+                    for: stamped(10, 20, .init(overall: "allowed_warning", session: "allowed_warning", weekly: "allowed_warning")),
+                    credentialBlocked: false), "available", "`allowed_warning` is not a rejection")
+                expectEqual(ProviderPoolSummary.windowStatus(
+                    for: stamped(10, 100, .init(overall: "allowed", session: "allowed", weekly: "allowed")),
+                    credentialBlocked: false), "exhausted", "a weekly window at its cap stays rejected beside a stored `allowed`")
+                expectEqual(ProviderPoolSummary.windowStatus(
+                    for: stamped(100, 20, .init(overall: "allowed", session: "allowed", weekly: "allowed")),
+                    credentialBlocked: false), "rate_limited", "a session window at its cap stays rate_limited beside a stored `allowed`")
+                expectEqual(ProviderPoolSummary.windowStatus(
+                    for: stamped(10, 20, .init(session: "rejected", weekly: "rejected")),
+                    credentialBlocked: false), "exhausted", "a weekly rejection outranks a session rejection below the caps")
+                expectEqual(ProviderPoolSummary.windowStatus(
+                    for: stamped(10, 20, .init(overall: "rejected", weekly: "rejected")),
+                    credentialBlocked: true), "blocked", "a blocked credential outranks every stored verdict")
+            } catch {
+                checks += 1
+                failures.append("pool tally stored-rejection test threw: \(error)")
+            }
+        }
     }
 
     // MARK: - Window model
