@@ -109,20 +109,19 @@ enum CodexProfiles {
         return RootListing(entries: entries.sorted { $0.name < $1.name }, modificationTime: modificationTime)
     }
 
-    /// Only symlinks and entries without a reported type need a lookup.
-    static func scan(_ entries: [RootEntry], isDirectory: (String) -> Bool = isDirectory) -> [RootEntry] {
-        entries.filter { entry in
-            switch entry.kind {
-            case .directory: return true
-            case .other: return false
-            case .needsLookup: return isDirectory(entry.home)
-            }
+    /// Resolve an untyped entry without caching a symlink's mutable target
+    /// or a transient lookup failure as a regular file.
+    static func lookupKind(_ path: String) -> RootEntry.Kind {
+        var metadata = stat()
+        guard lstat(path, &metadata) == 0 else { return .needsLookup }
+        switch metadata.st_mode & mode_t(S_IFMT) {
+        case mode_t(S_IFDIR): return .directory
+        case mode_t(S_IFLNK):
+            guard stat(path, &metadata) == 0, metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
+            else { return .needsLookup }
+            return .directory
+        default: return .other
         }
-    }
-
-    static func isDirectory(_ path: String) -> Bool {
-        var isDir: ObjCBool = false
-        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
     }
 
     // MARK: - Snapshot

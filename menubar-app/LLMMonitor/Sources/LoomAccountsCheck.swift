@@ -52,7 +52,7 @@ import Darwin
 /// This deliberately creates no registry and writes no file: when the shared
 /// registry does not exist, loom-daemon's `codex_inventory` falls back to
 /// *discovering every profile directory in the pool*, keyed by directory name —
-/// exactly the set `CodexProfiles.scan()` enumerates. A host that does have a
+/// the same profiles the monitor discovers in the root directory. A host that does have a
 /// shared registry gets that registry's entries instead, which is the operator's
 /// stated intent. Either way this app is a reader: `--ranking` is never passed,
 /// so the command is a pure read that persists nothing on the Loom side.

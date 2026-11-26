@@ -1029,7 +1029,8 @@ class OAuthPoller: ObservableObject {
     /// none of them is an error worth marking an account unhealthy for.
     @discardableResult
     func refreshLoomCodexLiveReadings(
-        for credentials: [OAuthCredential], force: Bool = false
+        for credentials: [OAuthCredential], force: Bool = false,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) async -> Int {
         guard credentials.contains(where: { $0.isCodexSnapshotOnly }) else { return 0 }
         let now = Date()
@@ -1039,8 +1040,8 @@ class OAuthPoller: ObservableObject {
         // Stamped before the run, not after: a slow or failing probe must not
         // become a hot loop (the same rule the transcript ingest follows).
         lastLoomLiveCheck = now
-        guard let binary = LoomAccountsCheck.resolveBinary(),
-              let workspace = LoomAccountsCheck.workspace() else {
+        guard let workspace = LoomAccountsCheck.workspace(environment: environment),
+              let binary = LoomAccountsCheck.resolveBinary(environment: environment) else {
             if !reportedLoomDaemonUnavailable {
                 reportedLoomDaemonUnavailable = true
                 flog.info("Loom live Codex check unavailable (no loom-daemon binary, or the shared "
@@ -1048,7 +1049,7 @@ class OAuthPoller: ObservableObject {
             }
             return 0
         }
-        guard let report = await LoomAccountsCheck.run(binary: binary, workspace: workspace) else {
+        guard let report = await LoomAccountsCheck.run(binary: binary, workspace: workspace, environment: environment) else {
             flog.warning("Loom live Codex check produced no readable report — keeping rollout snapshots",
                          category: fcat)
             return 0
@@ -1098,34 +1099,40 @@ class OAuthPoller: ObservableObject {
     /// launch costs one directory listing (see `discoverCodexProfiles`).
     @discardableResult
     func syncCodexProfiles(root: String? = CodexProfiles.root()) -> Int {
-        syncCodexProfiles(root: root, incremental: false, isDirectory: CodexProfiles.isDirectory)
+        syncCodexProfiles(CodexProfiles.listRoot(root), incremental: false)
     }
 
     /// Run before loading credentials so a new home can be polled on this tick.
     /// When every home is settled, only the root listing touches the filesystem.
     @discardableResult
-    func discoverCodexProfiles(root: String? = CodexProfiles.root(),
-                               isDirectory: (String) -> Bool = CodexProfiles.isDirectory) -> Int {
-        syncCodexProfiles(root: root, incremental: true, isDirectory: isDirectory)
+    func discoverCodexProfiles(root: String? = CodexProfiles.root()) -> Int {
+        syncCodexProfiles(CodexProfiles.listRoot(root), incremental: true)
     }
 
-    private func syncCodexProfiles(root: String?, incremental: Bool, isDirectory: (String) -> Bool) -> Int {
-        guard let listing = CodexProfiles.listRoot(root) else { return 0 }
+    func syncCodexProfiles(_ listing: CodexProfiles.RootListing?, incremental: Bool,
+                           lookupKind: (String) -> CodexProfiles.RootEntry.Kind = CodexProfiles.lookupKind) -> Int {
+        guard let listing else { return 0 }
         let listed = Set(listing.entries)
         settledCodexProfiles.formIntersection(listed)
-        // Inodes can be recycled between listings. Recheck unclaimed conflicts
-        // when the root changes, even if a replacement has the same name and inode.
+        // A regular file or conflicting home can be replaced between listings
+        // with the same name and inode. Recheck both when the root changes.
         if let previous = codexRootModificationTime, let current = listing.modificationTime,
            previous.tv_sec == current.tv_sec && previous.tv_nsec == current.tv_nsec {
-            conflictingCodexProfiles.formIntersection(listed)
+            skippedCodexEntries.formIntersection(listed)
         } else {
-            conflictingCodexProfiles.removeAll()
+            skippedCodexEntries.removeAll()
         }
         codexRootModificationTime = listing.modificationTime
         let pending = incremental ? listing.entries.filter {
-            !settledCodexProfiles.contains($0) && !conflictingCodexProfiles.contains($0)
+            !settledCodexProfiles.contains($0) && !skippedCodexEntries.contains($0)
         } : listing.entries
-        return registerCodexProfiles(CodexProfiles.scan(pending, isDirectory: isDirectory), requireLoginIdentity: incremental)
+        let profiles = pending.filter { entry in
+            guard entry.kind == .needsLookup else { return entry.kind == .directory }
+            let kind = lookupKind(entry.home)
+            if kind == .other { skippedCodexEntries.insert(entry) }
+            return kind == .directory
+        }
+        return registerCodexProfiles(profiles, requireLoginIdentity: incremental)
     }
 
     private func registerCodexProfiles(_ profiles: [CodexProfiles.RootEntry], requireLoginIdentity: Bool) -> Int {
@@ -1197,7 +1204,7 @@ class OAuthPoller: ObservableObject {
                 // original account and its credential untouched.
                 if try db.scalar("SELECT changes()") as? Int64 == 0 {
                     try db.execute("COMMIT")
-                    conflictingCodexProfiles.insert(profile)
+                    skippedCodexEntries.insert(profile)
                     flog.info("Skipped Loom Codex profile because its account already owns a home", category: fcat)
                     continue
                 }
@@ -2132,11 +2139,12 @@ class OAuthPoller: ObservableObject {
     /// override this via --interval; the app keeps the default.
     var pollInterval: TimeInterval = 600  // 10 minutes
 
-    /// Last poll time per credential ID
-    private var lastPollTimes: [Int64: Date] = [:]
+    /// A credential can keep its ID when registration switches its source to
+    /// profile snapshots. Only a poll in the same mode counts toward its interval.
+    private var lastPolls: [Int64: (time: Date, snapshotOnly: Bool)] = [:]
 
     private var settledCodexProfiles: Set<CodexProfiles.RootEntry> = []
-    private var conflictingCodexProfiles: Set<CodexProfiles.RootEntry> = []
+    private var skippedCodexEntries: Set<CodexProfiles.RootEntry> = []
     private var codexRootModificationTime: timespec?
 
     /// How often to probe the Fable tier per account (seconds). Independent of the
@@ -2167,39 +2175,38 @@ class OAuthPoller: ObservableObject {
         for credential in credentials {
             await pollWithRetry(credential)
             if let credId = credential.id {
-                lastPollTimes[credId] = Date()
+                lastPolls[credId] = (Date(), credential.isCodexSnapshotOnly)
             }
         }
     }
 
     /// Poll any accounts whose poll interval has elapsed. Returns count of accounts polled.
-    func pollDue() async -> Int {
+    func pollDue(environment: [String: String] = ProcessInfo.processInfo.environment) async -> Int {
         // A token rolled while the app runs is picked up within one tick; an
         // unchanged token file costs a file read and no network call.
-        await syncClaudeTokenFiles()
+        await syncClaudeTokenFiles(directories: ClaudeTokenFiles.directories(environment: environment))
         // Likewise a Loom Codex profile directory that appeared since the last
         // tick (#368) — an unchanged root costs one directory listing. Runs
         // before `loadActiveCredentials` so the new row joins the poll set on
         // the tick that discovers it.
-        discoverCodexProfiles()
+        discoverCodexProfiles(root: CodexProfiles.root(environment: environment))
         let credentials = loadActiveCredentials()
         reportStrandedCodexIdentities()
         guard !credentials.isEmpty else { return 0 }
         // Self-throttling on its own cadence, so calling it every tick is cheap
         // when it is not due (#230).
-        await refreshLoomCodexLiveReadings(for: credentials)
+        await refreshLoomCodexLiveReadings(for: credentials, environment: environment)
 
         let now = Date()
         var polled = 0
 
         for credential in credentials {
             guard let credId = credential.id else { continue }
-            let lastPoll = lastPollTimes[credId]
-            if lastPoll == nil || now.timeIntervalSince(lastPoll!) >= pollInterval {
-                await pollWithRetry(credential)
-                lastPollTimes[credId] = Date()
-                polled += 1
-            }
+            if let last = lastPolls[credId], last.snapshotOnly == credential.isCodexSnapshotOnly,
+               now.timeIntervalSince(last.time) < pollInterval { continue }
+            await pollWithRetry(credential)
+            lastPolls[credId] = (Date(), credential.isCodexSnapshotOnly)
+            polled += 1
         }
 
         return polled

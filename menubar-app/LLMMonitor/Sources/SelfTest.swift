@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 /// `llm-monitor selftest` — assertions over the portable core, runnable on
@@ -1902,9 +1903,8 @@ enum SelfTest {
     /// tick that finds it, an unchanged root costs nothing beyond the
     /// directory listing, a native account id that already owns a different
     /// home is never taken over, and a failed registration stays eligible for
-    /// retry. Drives the exact sequence `pollDue` runs — discovery, then the
-    /// credential load, then the snapshot poll — offline, with no network and
-    /// no loom-daemon.
+    /// retry. Real due ticks run against fixture directories and a disabled
+    /// shared registry, so every reading comes from the local rollouts.
     private static func testCodexProfileTickDiscovery() {
         withSelfTestTempDir("codex-profile-tick") { dir in
             let fm = FileManager.default
@@ -1961,6 +1961,7 @@ enum SelfTest {
                 INSERT INTO oauth_credentials (account_id, label, provider, access_token, refresh_token, created_at, updated_at)
                 VALUES ('user-beta', 'beta', 'openai', 'old-access', 'old-refresh', 'now', 'now')
                 """)
+            let betaCredentialID = try! db.scalar("SELECT id FROM oauth_credentials WHERE account_id = 'user-beta'") as! Int64
             let poller = OAuthPoller(dbPath: dbPath)
             expectEqual(poller.syncCodexProfiles(root: root), 1,
                         "the launch sync registers the profile that existed at launch")
@@ -1974,22 +1975,42 @@ enum SelfTest {
             let slot = root + "/slot-7"
             try! fm.createDirectory(atPath: slot, withIntermediateDirectories: false)
             var directoryProbes: [String] = []
-            func probeDirectory(_ path: String) -> Bool {
+            func probeKind(_ path: String) -> CodexProfiles.RootEntry.Kind {
                 directoryProbes.append(path)
-                return CodexProfiles.isDirectory(path)
+                return CodexProfiles.lookupKind(path)
             }
             try! db.run("INSERT INTO usage_history (account_id, timestamp, weekly_all_percent) VALUES (?, ?, 17)",
                         "user-beta", ISO8601DateFormatter().string(from: Date().addingTimeInterval(-10800)))
-            expectEqual(poller.discoverCodexProfiles(root: root), 0, "an empty home waits for login")
+            let environment = [
+                "LOOM_CODEX_PROFILE_ROOT": root,
+                "LLM_MONITOR_CLAUDE_TOKEN_DIRS": dir.appendingPathComponent("empty-tokens").path,
+                "LOOM_SHARED_ACCOUNTS_ROOT": ""
+            ]
+            // The synchronous selftest owns the main thread. Pump its run loop
+            // while the real main-actor poll completes, without waiting a poll interval.
+            @MainActor func tick() -> Int {
+                let loop = CFRunLoopGetCurrent()
+                var polled: Int?
+                Task {
+                    polled = await poller.pollDue(environment: environment)
+                    CFRunLoopStop(loop)
+                }
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 10, false)
+                return polled ?? -1
+            }
+            expectEqual(tick(), 2,
+                        "the first tick polls alpha and the still home-less beta credential")
+            expectEqual(text("SELECT last_error FROM oauth_credentials WHERE account_id = ?", "user-beta"),
+                        OAuthPoller.exhaustedTiersMessage(home: .ambiguous),
+                        "the first poll records why the home-less credential cannot supply a reading")
             expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 0,
                         "the first tick leaves the home available for identity matching")
 
             makeProfile("slot-7", accountId: "acct-beta", email: "beta@example.com")
             writeSnapshot("slot-7", weeklyPercent: 43)
 
-            // The due tick: discovery, then the credential load, then the
-            // snapshot poll — the sequence `pollDue` runs, minus the network.
-            expectEqual(poller.discoverCodexProfiles(root: root), 1, "the next tick links the home once login supplies an identity")
+            expectEqual(tick(), 1,
+                        "only the newly converted beta credential is due on the discovering tick")
             expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "user-beta"), slot,
                         "the home-less row keeps its id and gains the new home")
             expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND weekly_all_percent = 17",
@@ -2003,15 +2024,14 @@ enum SelfTest {
             expectEqual(count("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ? AND is_active = 1 "
                               + "AND access_token IS NULL AND refresh_token IS NULL AND source = 'loom-codex-profile'", "user-beta"), 1,
                         "the linked row has exactly one active, token-free profile credential")
-            if let credential = poller.loadActiveCredentials().first(where: { $0.accountId == "user-beta" }) {
-                expect(credential.isCodexSnapshotOnly, "the new row joins the poll set on the discovering tick")
-                poller.pollCodexSnapshot(credential)
-                expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND is_synthetic = 0 "
-                                  + "AND weekly_all_percent = 43", "user-beta"), 1,
-                            "the discovering tick polls it: the rollout reading is archived under its id")
-            } else {
-                expect(false, "user-beta must be in the poll set right after discovery")
-            }
+            expectEqual(try! db.scalar("SELECT id FROM oauth_credentials WHERE account_id = 'user-beta'") as? Int64,
+                        betaCredentialID, "conversion reuses the recently polled credential id")
+            expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND is_synthetic = 0 "
+                              + "AND weekly_all_percent = 43", "user-beta"), 1,
+                        "the discovering tick archives the profile snapshot under the existing id")
+            expect(text("SELECT last_error FROM oauth_credentials WHERE account_id = ?", "user-beta") == nil,
+                   "the same tick clears the old credential error")
+            expectEqual(tick(), 0, "the next tick respects the poll interval")
 
             // An unchanged root: the listing is the whole cost. Deleting the
             // row makes any per-home registration work visible — the
@@ -2024,23 +2044,50 @@ enum SelfTest {
             let readme = root + "/pool-readme.txt"
             try! Data("notes".utf8).write(to: URL(fileURLWithPath: readme))
             typealias Entry = CodexProfiles.RootEntry
-            let typed = [Entry(name: "slot-7", home: slot, inode: 1, kind: .directory),
-                         Entry(name: "pool-readme.txt", home: readme, inode: 2, kind: .other)]
-            expectEqual(CodexProfiles.scan(typed, isDirectory: probeDirectory), [typed[0]],
-                        "a typed listing selects only the directory")
-            expectEqual(directoryProbes, [], "known directory and file types require no lookup")
-            let untyped = typed.map { Entry(name: $0.name, home: $0.home, inode: $0.inode, kind: .needsLookup) }
-            expectEqual(CodexProfiles.scan(untyped, isDirectory: probeDirectory), [untyped[0]],
-                        "the fallback identifies the directory and skips the regular file")
-            expectEqual(directoryProbes, [slot, readme], "each untyped candidate is probed once")
-
+            let listing = CodexProfiles.listRoot(root)!
+            let rest = listing.entries.filter { $0.home != readme }
+            @MainActor func discover(_ listing: CodexProfiles.RootListing) -> Int {
+                poller.syncCodexProfiles(listing, incremental: true, lookupKind: probeKind)
+            }
+            func fileListing(_ kind: Entry.Kind, modified: Int) -> CodexProfiles.RootListing {
+                // Keep the inode fixed even after replacement to exercise inode reuse.
+                let file = Entry(name: "pool-readme.txt", home: readme, inode: 2, kind: kind)
+                return CodexProfiles.RootListing(entries: rest + [file], modificationTime: timespec(tv_sec: modified, tv_nsec: 0))
+            }
+            expectEqual(discover(fileListing(.other, modified: 1)), 0, "a known regular file registers nothing")
+            expectEqual(directoryProbes, [], "known files and settled directories cost no probes")
+            let unchanged = fileListing(.needsLookup, modified: 1)
+            expectEqual(discover(unchanged), 0, "the new regular file registers nothing")
+            expectEqual(directoryProbes, [readme], "the new untyped file is probed once")
             directoryProbes.removeAll()
-            let readmeKind = CodexProfiles.listRoot(root)?.entries.first { $0.home == readme }?.kind
-            expectEqual(poller.discoverCodexProfiles(root: root, isDirectory: probeDirectory), 0, "an unchanged root registers nothing")
-            expectEqual(directoryProbes, readmeKind == .needsLookup ? [readme] : [],
-                        "settled directories cost no probes and only an untyped regular file needs a lookup")
+            for _ in 0..<2 {
+                expectEqual(discover(unchanged), 0, "an unchanged root registers nothing")
+                expectEqual(directoryProbes, [], "an unchanged untyped file costs no further lookups")
+            }
             expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 0,
                         "a settled home is skipped before any per-home identity read or registration SQL")
+
+            try! fm.removeItem(atPath: readme)
+            makeProfile("pool-readme.txt", accountId: "acct-was-file", email: nil)
+            expectEqual(discover(fileListing(.needsLookup, modified: 2)), 1,
+                        "a directory replacing a cached file registers immediately")
+            expectEqual(directoryProbes, [readme], "the changed root triggers one fresh lookup")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-was-file"), readme,
+                        "the replacement owns the former file path")
+
+            // A symlink target can become a directory without changing the root.
+            let link = root + "/linked-home"
+            let target = dir.appendingPathComponent("link-target").path
+            try! fm.createSymbolicLink(atPath: link, withDestinationPath: target)
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "a dangling link registers nothing")
+            try! Data().write(to: URL(fileURLWithPath: target))
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "a link to a regular file registers nothing")
+            try! fm.removeItem(atPath: target)
+            try! fm.createDirectory(atPath: target, withIntermediateDirectories: false)
+            makeProfile("linked-home", accountId: "acct-symlink", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "a link whose target becomes a profile stays eligible")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-symlink"), link,
+                        "the newly available directory is registered through its link")
 
             // A second directory whose native id already owns a different
             // home: neither the original row nor its credential may change.
@@ -2089,12 +2136,6 @@ enum SelfTest {
             expectEqual(poller.discoverCodexProfiles(root: root), 1, "a directory returning after a file registers immediately")
             expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-via-file"), viaFile,
                         "the login after the file owns the reused path")
-
-            // A file later replaced by a profile directory is a new entry.
-            try! fm.removeItem(atPath: root + "/pool-readme.txt")
-            makeProfile("pool-readme.txt", accountId: "acct-was-file", email: nil)
-            expectEqual(poller.discoverCodexProfiles(root: root), 1,
-                        "a file replaced by a profile directory registers on the next tick")
 
             // A conflicting name that disappears for a tick is forgotten. A
             // different login that later reuses the name registers, and the
