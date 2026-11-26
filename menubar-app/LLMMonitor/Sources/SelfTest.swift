@@ -1369,15 +1369,10 @@ enum SelfTest {
                 store.ensureDatabase()
                 let db = try openDatabase(dbPath)
                 let accountId = "acct-fixture"
-                try db.run("""
-                    INSERT INTO accounts (id, account_name, email, provider)
-                    VALUES (?, 'fixture', 'fixture@example.com', 'openai')
-                """, accountId)
-                try db.run("""
-                    INSERT INTO oauth_credentials
-                        (account_id, label, provider, access_token, is_active, created_at, updated_at)
-                    VALUES (?, 'fixture', 'openai', 'fixture', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """, accountId)
+                let poller = OAuthPoller(dbPath: dbPath)
+                poller.saveCodexHomeAccount(
+                    accountId: accountId, email: "fixture@example.com", plan: nil, codexHome: dir.path
+                )
 
                 @MainActor
                 func checkPopover(_ status: String?, usable: Int, exhausted: Int, blocked: Bool = false) {
@@ -1422,7 +1417,7 @@ enum SelfTest {
 
                 let rejected = try OpenAIAPIClient.snapshot(from: Data(rejectedOpenAIUsageFixture.utf8), httpStatus: 200)
                 expectEqual(rejected.rateLimit.weekly?.usedPercent, 14, "fixture rejects below the weekly cap")
-                OAuthPoller(dbPath: dbPath).writeUsageToDB(
+                poller.writeUsageToDB(
                     accountId: accountId, sessionPercent: rejected.rateLimit.session?.usedPercent,
                     weeklyPercent: rejected.rateLimit.weekly?.usedPercent, sessionReset: nil, weeklyReset: nil,
                     rawFields: rejected.rawFields, probeModel: "openai-usage", httpStatus: rejected.httpStatus,
@@ -1432,9 +1427,11 @@ enum SelfTest {
                 try checkOtherSurfaces("exhausted", summary: "0 usable · 1 exhausted")
                 checkPopover("blocked", usable: 0, exhausted: 0, blocked: true)
 
-                // Vary just the archive on the same below-cap row.
+                // The scratch database contains exactly one reading. Vary its archive in place.
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM usage_history") as? Int64, 1,
+                            "one stored fixture reading")
                 func setArchive(_ raw: String?) throws {
-                    try db.run("UPDATE usage_history SET raw_data = ? WHERE account_id = ?", raw, accountId)
+                    try db.run("UPDATE usage_history SET raw_data = ?", raw)
                 }
                 try setArchive(#"{"overall_status":"rejected","weekly_status":"allowed"}"#)
                 checkPopover("rate_limited", usable: 0, exhausted: 0)
@@ -1451,7 +1448,7 @@ enum SelfTest {
                     try setArchive(raw)
                     checkPopover("available", usable: 1, exhausted: 0)
                 }
-                try db.run("UPDATE usage_history SET weekly_all_percent = 100 WHERE account_id = ?", accountId)
+                try db.run("UPDATE usage_history SET weekly_all_percent = 100")
                 for raw in [nil, "not JSON", #"{"weekly_status":"allowed","session_status":"rejected"}"#] {
                     try setArchive(raw)
                     checkPopover("exhausted", usable: 0, exhausted: 1)
