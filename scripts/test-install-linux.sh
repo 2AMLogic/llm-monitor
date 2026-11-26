@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Exercise upgrades without touching the user's home or systemd session.
 set -euo pipefail
+trap 'echo "Installer test failed on line $LINENO: $BASH_COMMAND" >&2' ERR
 installer="$(dirname "$0")/install-linux.sh"
 fixture=$(mktemp -d)
 test_home="$fixture/home"
@@ -117,7 +118,8 @@ build_candidate() {
 #!/bin/sh
 # build: $tag
 if [ "\$#" -eq 0 ]; then
-    exec sleep 300
+    # Keep the running script's inode visible in /proc even after a replacement.
+    exec sleep 300 < "\$0"
 fi
 case "\$1" in
     --version) echo 'llm-monitor 2.2.0' ;;
