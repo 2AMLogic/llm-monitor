@@ -1158,6 +1158,25 @@ class OAuthPoller: ObservableObject {
                 // Holding the write lock keeps the home lookup, account and token-free
                 // credential consistent across concurrent startup, CLI and tick syncs.
                 if try db.scalar("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", profile.home) as? Int64 ?? 0 > 0 {
+                    // The directory's former owner may not be the login now in it
+                    // (a slot reused by another workspace). Converting that row to
+                    // snapshot mode would archive the new login's readings under the
+                    // old account, so a contradicting native ID leaves it untouched.
+                    var occupiedByOther = false
+                    if let nativeId {
+                        for owner in try db.prepare("SELECT id FROM accounts WHERE codex_home = ?").bind(profile.home) {
+                            guard let ownerId = owner[0] as? String,
+                                  Self.accountIdsComparable(stored: ownerId, reported: nativeId),
+                                  identityKey(ownerId) != nativeKey else { continue }
+                            occupiedByOther = true
+                        }
+                    }
+                    if occupiedByOther {
+                        try db.execute("COMMIT")
+                        skippedCodexEntries.insert(profile)
+                        flog.info("Skipped Loom Codex profile because its directory belongs to a different account", category: fcat)
+                        continue
+                    }
                     try db.run("UPDATE accounts SET codex_home_mode = ? WHERE codex_home = ?",
                                CodexProfiles.snapshotMode, profile.home)
                     try db.execute("COMMIT")

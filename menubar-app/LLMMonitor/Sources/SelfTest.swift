@@ -2123,6 +2123,28 @@ enum SelfTest {
             expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND weekly_all_percent = 18",
                               "user-oldshift"), 1, "the reading belongs to the legacy account")
 
+            // A registered home whose directory was absent can be reused by a
+            // different workspace's login. The row's own native ID contradicts
+            // the login, so it must neither change mode nor receive the reading.
+            let formerOwnerID = "f0f0f0f0-0000-4000-8000-000000000006"
+            let reusedLoginID = "a1a1a1a1-0000-4000-8000-000000000007"
+            let reusedHome = root + "/reused-slot"
+            try! db.run("INSERT INTO accounts (id, email, provider, codex_home) VALUES (?, ?, 'openai', ?)",
+                        formerOwnerID, "former@example.com", reusedHome)
+            try! db.run("""
+                INSERT INTO oauth_credentials (account_id, label, provider, source, is_active, last_poll_at, created_at, updated_at)
+                VALUES (?, 'former', 'openai', 'codex-home', 1, ?, 'now', 'now')
+                """, formerOwnerID, ISO8601DateFormatter().string(from: Date()))
+            makeProfile("reused-slot", accountId: reusedLoginID, email: nil)
+            writeSnapshot("reused-slot", weeklyPercent: 73)
+            expectEqual(tick(), 1, "only the former owner's own credential is due; the new login adds none")
+            expect(text("SELECT codex_home_mode FROM accounts WHERE id = ?", formerOwnerID) != CodexProfiles.snapshotMode,
+                   "a login that is not the owner leaves the owner's mode unchanged")
+            expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", formerOwnerID), 0,
+                        "the new login's reading is never archived under the former owner")
+            expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", reusedLoginID), 0,
+                        "the skipped login writes no reading for another row")
+
             // An unchanged root: the listing is the whole cost. Deleting the
             // row makes any per-home registration work visible — the
             // unconditional full sync would resurrect it — and none may
