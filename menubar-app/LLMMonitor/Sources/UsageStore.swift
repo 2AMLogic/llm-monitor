@@ -105,14 +105,8 @@ struct UsageRecord: Identifiable {
     /// snapshots) carry no such object.
     var resetCredits: OpenAIUsageResponse.ResetCredits? = nil
 
-    /// The provider's own verdicts for this reading, decoded from the row's
-    /// `raw_data` archive by the exporter's one decoder (#372) — the same
-    /// inputs `ranking.json` and `accounts list` classify the row by, so the
-    /// popover's pool tally can reach their status instead of reading only
-    /// the percentages. All-nil for a record not loaded from a stored row, a
-    /// row with no archive (synthetic rows), and a missing or malformed
-    /// archive: "not reported", never `allowed`.
-    var storedStatuses: RankingExporter.StoredStatuses = RankingExporter.StoredStatuses()
+    /// Overall and per-window provider verdicts from this reading's raw_data.
+    var storedStatuses: RankingExporter.StoredStatuses = .unreported
 
     /// This stored reading expressed in the shared, provider-agnostic window
     /// model. The `usage_history` columns are already kind-keyed (a session
@@ -1331,8 +1325,6 @@ class UsageStore: ObservableObject {
                     // archive (#298); nil for every reading that carries none.
                     let rawData = usageRow[8] as? String
                     record.resetCredits = OpenAIUsageResponse.parseStoredReading(rawData).credits
-                    // The provider's own verdicts ride the same archive
-                    // (#372), decoded by the exporter's shared rule.
                     record.storedStatuses = RankingExporter.parseStoredStatuses(rawData)
 
                     // Premium/Fable allocation + overage come from the latest

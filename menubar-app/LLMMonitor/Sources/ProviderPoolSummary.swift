@@ -62,16 +62,8 @@ enum ProviderTab: Equatable, Hashable {
 
 /// One account's inputs to the provider pool tally (#297).
 ///
-/// Both surfaces produce these from their own source: the macOS popover
-/// derives `status` from the stored reading — the window percentages and the
-/// archived provider verdicts — plus the in-memory token state
-/// (`ProviderPoolSummary.windowStatus`), while `llm-monitor accounts list`
-/// reads exactly what `ranking.json` exports
-/// (`RankingExporter.statusReading`). Both read those verdicts through the
-/// exporter's one decoder and classify through the same `mapStatus` table
-/// (#372), so a stored rejection moves a seat out of `usable` on one surface
-/// exactly when it does on the other. The tally rules themselves are the one
-/// shared implementation below.
+/// The popover uses the archived provider verdicts, window percentages and
+/// current credential state. The CLI uses the status exported to ranking.json.
 struct PoolAccountInput {
     let account: Account
     /// Latest stored reading; nil = this account has never reported usage
@@ -110,34 +102,16 @@ enum ProviderPoolSummary {
         var nextReset: Date? = nil
     }
 
-    /// The popover's status rule. The provider's own verdicts for the reading
-    /// — decoded from its `raw_data` archive into
-    /// `UsageRecord.storedStatuses` (#372) — are folded together with the
-    /// existing percentage check, so a stored rejection classifies here
-    /// exactly as it does in `ranking.json` and `accounts list`, while a
-    /// reading whose archive is missing or malformed keeps the
-    /// percentage-only rule it always had. The combined inputs go through the
-    /// same `RankingExporter.mapStatus` decision table the export path uses,
-    /// with the credential state the popover holds in memory — which wins
-    /// over every stored verdict. nil when there is no reading — unknown,
-    /// never "available".
+    /// Apply the popover's percentage-cap check even when the archive omits
+    /// a window verdict. With no reading, the seat's status stays unknown.
     static func windowStatus(for usage: UsageRecord?, credentialBlocked: Bool) -> String? {
         guard let usage = usage else { return nil }
         let windows = usage.rateLimit
         let stored = usage.storedStatuses
-        // One verdict per window, rejected when either input rejects: the
-        // archived verdict says `rejected`, or the window is spent
-        // (`isExhausted` — for a stored window, its figure at the cap).
-        // Allowed when either input is present and neither rejects; nil when
-        // the reading reported the window at all.
-        func verdict(stored: String?, window: RateLimitWindow?) -> String? {
-            if stored == "rejected" || window?.isExhausted == true { return "rejected" }
-            return (stored != nil || window != nil) ? "allowed" : nil
-        }
         return RankingExporter.mapStatus(
             overallStatus: stored.overall,
-            sessionStatus: verdict(stored: stored.session, window: windows.session),
-            weeklyStatus: verdict(stored: stored.weekly, window: windows.weekly),
+            sessionStatus: windows.session?.isExhausted == true ? "rejected" : stored.session,
+            weeklyStatus: windows.weekly?.isExhausted == true ? "rejected" : stored.weekly,
             credentialActive: !credentialBlocked,
             credentialRejected: false
         )

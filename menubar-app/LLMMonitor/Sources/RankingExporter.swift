@@ -517,20 +517,12 @@ enum RankingExporter {
         return (true, false)
     }
 
-    /// The provider's verdicts for one stored reading, decoded from its
-    /// `usage_history.raw_data` archive — the three inputs `mapStatus` reads
-    /// besides the credential state. A nil field means the reading did not
-    /// report that verdict; it is never read as `allowed`.
-    struct StoredStatuses: Equatable {
+    struct StoredStatuses {
         let overall: String?
         let session: String?
         let weekly: String?
 
-        init(overall: String? = nil, session: String? = nil, weekly: String? = nil) {
-            self.overall = overall
-            self.session = session
-            self.weekly = weekly
-        }
+        static let unreported = Self(overall: nil, session: nil, weekly: nil)
     }
 
     /// Parse the status blob stored in `usage_history.raw_data`. Two key
@@ -543,17 +535,11 @@ enum RankingExporter {
     ///      archive, and the external poller that populates the live DB.
     /// Only status *strings* (`allowed` / `allowed_warning` / `rejected`) are read —
     /// never token or identity fields.
-    ///
-    /// The one decoder for every surface that classifies a stored row (#372):
-    /// `statusReading` here, and the in-app pool tally through
-    /// `UsageRecord.storedStatuses`, so both read the same keys the same way.
-    /// Never fails — a missing, non-JSON, or wrongly typed blob reports
-    /// nothing, which each caller's own rule handles.
     static func parseStoredStatuses(_ raw: String?) -> StoredStatuses {
         guard let raw = raw,
               let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return StoredStatuses()
+            return .unreported
         }
         func str(_ keys: String...) -> String? {
             for key in keys {
