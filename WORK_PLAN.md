@@ -31,15 +31,18 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#210**: Remove Claude Monitor → LLM Monitor compatibility shims (~/.claude-monitor symlink, claude-monitor alias)
 - **#285**: Show each account's available usage-limit resets (weekly and per-model) alongside utilization
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings
 - **#323**: Offer an in-app "Update now" when a newer release is available
+- **#367**: accounts list counts Codex seats at 100% weekly as usable while the popover counts them exhausted
+- **#368**: Register new Loom Codex profiles on a poll tick, not only at launch or by codex list
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#366**: refactor!: remove the Claude Monitor compatibility shims
 
 ## Approved (Awaiting Merge)
 
@@ -56,6 +59,8 @@ Issues carrying `loom:curated`.
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings *(curated)*
 - **#323**: Offer an in-app "Update now" when a newer release is available *(curated)*
 - **#338**: Per-account scope (personal | work): push/export skip personal accounts; popover marks them *(curated)*
+- **#367**: accounts list counts Codex seats at 100% weekly as usable while the popover counts them exhausted *(curated)*
+- **#368**: Register new Loom Codex profiles on a poll tick, not only at launch or by codex list *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -73,10 +78,10 @@ _None._
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 6 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 5 |
+| Curated | 7 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
