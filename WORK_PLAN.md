@@ -49,6 +49,7 @@ PRs waiting on Judge (`loom:review-requested`).
 PRs that passed review (`loom:pr`). Unheld PRs are queued for Champion auto-merge; held PRs require a human merge decision.
 
 - **#325**: feat: add in-app update check and one-click self-install for macOS *(held)*
+- **#370**: fix: classify stored windows at their cap as spent in the export status path
 
 ## Proposed
 
@@ -80,7 +81,7 @@ _None._
 | Ready (`loom:issue`) | 1 |
 | In Progress (`loom:building`) | 6 |
 | PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 1 |
+| Approved PRs awaiting merge | 2 |
 | Curated | 7 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |

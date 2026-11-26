@@ -9,6 +9,11 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 - [2026-07](work_log/WORK_LOG_2026-07.md)
 - [2025-12](work_log/WORK_LOG_2025-12.md)
 
+### 2026-11-26
+
+- **PR #373**: fix: honor archived provider rejections in the popover pool tally
+- **Issue #372** (closed): Honor stored provider rejections in the popover pool tally
+
 ### 2026-11-23
 
 - **PR #360**: Dependabot: render dependabot.yml from the org policy
