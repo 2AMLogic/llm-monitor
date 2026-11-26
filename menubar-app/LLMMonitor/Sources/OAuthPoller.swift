@@ -1106,7 +1106,13 @@ class OAuthPoller: ObservableObject {
     @discardableResult
     func discoverCodexProfiles(root: String? = CodexProfiles.root(),
                                isDirectory: (String) -> Bool = CodexProfiles.isDirectory) -> Int {
-        let pending = CodexProfiles.scan(root: root, excluding: settledCodexProfileHomes, isDirectory: isDirectory)
+        // A successful listing is the one authority on what exists. A settled
+        // path that has vanished is forgotten, so a directory recreated under
+        // the same name (a reused slot) is evaluated afresh. Database rows are
+        // never touched here. A failed listing keeps the cache as it was.
+        guard let entries = CodexProfiles.listRoot(root) else { return 0 }
+        settledCodexProfileHomes.formIntersection(entries.map(\.home))
+        let pending = CodexProfiles.profiles(in: entries, excluding: settledCodexProfileHomes, isDirectory: isDirectory)
         return registerCodexProfiles(pending, requireLoginIdentity: true)
     }
 

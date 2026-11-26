@@ -1868,7 +1868,7 @@ enum SelfTest {
             try! db.run("INSERT INTO usage_history (account_id, timestamp, weekly_all_percent) VALUES (?, ?, 17)",
                         "user-beta", ISO8601DateFormatter().string(from: Date().addingTimeInterval(-10800)))
             expectEqual(poller.discoverCodexProfiles(root: root, isDirectory: probeDirectory), 0, "an empty home waits for login")
-            expectEqual(directoryProbes, [slot], "only the new entry needs a directory type lookup")
+            expectEqual(directoryProbes, [], "the listing types the new directory, so no per-entry lookup runs")
             expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 0,
                         "the first tick leaves the home available for identity matching")
 
@@ -1912,9 +1912,12 @@ enum SelfTest {
             // per-home identity read or registration SQL.
             try! db.run("DELETE FROM oauth_credentials WHERE account_id = ?", "user-beta")
             try! db.run("DELETE FROM accounts WHERE id = ?", "user-beta")
+            // A visible regular file shares the root: the listing already says
+            // it is not a directory, so it costs no type lookup either.
+            fm.createFile(atPath: root + "/pool-readme.txt", contents: Data("notes".utf8))
             directoryProbes.removeAll()
             expectEqual(poller.discoverCodexProfiles(root: root, isDirectory: probeDirectory), 0, "an unchanged root registers nothing")
-            expectEqual(directoryProbes, [], "an unchanged tick performs no directory type lookups")
+            expectEqual(directoryProbes, [], "an unchanged tick performs no directory type lookups, even with a visible file")
             expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 0,
                         "a settled home is skipped before any per-home identity read or registration SQL")
 
@@ -1936,6 +1939,27 @@ enum SelfTest {
                         "the original account's credential is preserved, not duplicated")
             expectEqual(poller.discoverCodexProfiles(root: root), 0,
                         "the conflict is settled, so later ticks do not retry it")
+
+            // A file later replaced by a profile directory is a new entry.
+            try! fm.removeItem(atPath: root + "/pool-readme.txt")
+            makeProfile("pool-readme.txt", accountId: "acct-was-file", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1,
+                        "a file replaced by a profile directory registers on the next tick")
+
+            // A conflicting name that disappears for a tick is forgotten. A
+            // different login that later reuses the name registers, and the
+            // existing rows are left alone while the path is absent.
+            try! fm.removeItem(atPath: root + "/zz-incoming")
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "the removed conflicting directory registers nothing")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = ?", "acct-owned"), 1,
+                        "removing a directory never deletes an existing row")
+            makeProfile("zz-incoming", accountId: "acct-reused", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1,
+                        "a new login reusing a previously conflicting name registers")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-reused"), root + "/zz-incoming",
+                        "the reused name is owned by the new account")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-owned"), root + "/owned",
+                        "the original owner keeps its own home")
 
             // Fail the credential insert after the account upsert. A partial
             // account would make the next tick skip credential registration.

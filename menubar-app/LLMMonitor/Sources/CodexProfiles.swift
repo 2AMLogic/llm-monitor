@@ -64,18 +64,61 @@ enum CodexProfiles {
         let home: String
     }
 
-    /// List visible profile directories in name order. Skip settled paths
-    /// before asking the filesystem for the type of an entry.
+    /// One visible entry of the profile root, with the type the directory
+    /// listing itself reported.
+    struct RootEntry: Equatable {
+        enum Kind: Equatable { case directory, other, needsLookup }
+        let name: String
+        let home: String
+        let kind: Kind
+    }
+
+    /// The visible entries of `root` in name order, or nil when the root cannot
+    /// be listed (disabled, missing, unreadable). The type comes from the
+    /// listing (`d_type`), so a regular file costs no metadata lookup; only a
+    /// symlink or a filesystem that reports no type needs one.
+    static func listRoot(_ root: String?) -> [RootEntry]? {
+        guard let root = root, let stream = opendir(root) else { return nil }
+        defer { closedir(stream) }
+        var entries: [RootEntry] = []
+        while let entry = readdir(stream) {
+            let name = withUnsafePointer(to: &entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: entry.pointee.d_name)) {
+                    String(cString: $0)
+                }
+            }
+            guard !name.hasPrefix(".") else { continue }  // also drops "." and ".."
+            let kind: RootEntry.Kind
+            switch Int32(entry.pointee.d_type) {
+            case Int32(DT_DIR): kind = .directory
+            case Int32(DT_UNKNOWN), Int32(DT_LNK): kind = .needsLookup
+            default: kind = .other
+            }
+            entries.append(RootEntry(name: name, home: (root as NSString).appendingPathComponent(name), kind: kind))
+        }
+        return entries.sorted { $0.name < $1.name }
+    }
+
+    /// Profile directories among `entries`, skipping settled paths first.
+    /// `isDirectory` is consulted only for an entry whose listing type was
+    /// ambiguous (a symlink, which may point at a profile).
+    static func profiles(in entries: [RootEntry], excluding settledHomes: Set<String> = [],
+                         isDirectory: (String) -> Bool = isDirectory) -> [Profile] {
+        entries.compactMap { entry in
+            guard !settledHomes.contains(entry.home) else { return nil }
+            switch entry.kind {
+            case .directory: break
+            case .other: return nil
+            case .needsLookup: guard isDirectory(entry.home) else { return nil }
+            }
+            return Profile(name: entry.name, home: entry.home)
+        }
+    }
+
+    /// List visible profile directories in name order.
     static func scan(root: String?, excluding settledHomes: Set<String> = [],
                      isDirectory: (String) -> Bool = isDirectory) -> [Profile] {
-        guard let root = root,
-              let names = try? FileManager.default.contentsOfDirectory(atPath: root) else { return [] }
-        return names.sorted().compactMap { name in
-            guard !name.hasPrefix(".") else { return nil }
-            let home = (root as NSString).appendingPathComponent(name)
-            guard !settledHomes.contains(home), isDirectory(home) else { return nil }
-            return Profile(name: name, home: home)
-        }
+        profiles(in: listRoot(root) ?? [], excluding: settledHomes, isDirectory: isDirectory)
     }
 
     static func isDirectory(_ path: String) -> Bool {
