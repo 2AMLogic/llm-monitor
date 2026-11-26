@@ -59,6 +59,7 @@ enum SelfTest {
         ("LoomLiveCheckSpawnAgainstStub", { testLoomLiveCheckSpawnAgainstStub() }),
         ("LoomLiveReadingPreferredOnlyWhenNewer", { testLoomLiveReadingPreferredOnlyWhenNewer() }),
         ("CodexQuotaContainerRules", { testCodexQuotaContainerRules() }),
+        ("CodexQuotaContainerFirstLogin", { testCodexQuotaContainerFirstLogin() }),
         ("CodexQuotaContainerProbeAgainstStub", { testCodexQuotaContainerProbeAgainstStub() }),
         ("ClaudeTokenFileScanning", { testClaudeTokenFileScanning() }),
         ("ClaudeTokenTargetAndAccountsEnv", { testClaudeTokenTargetAndAccountsEnv() }),
@@ -2191,6 +2192,80 @@ enum SelfTest {
     }
 
     // MARK: - Codex quota containers
+
+    private static func testCodexQuotaContainerFirstLogin() {
+        do {
+            try withSelfTestTempDir("quota-first-login") { dir in
+                let root = dir.appendingPathComponent("profiles")
+                let home = root.appendingPathComponent("late")
+                try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let db = try openDatabase(dbPath)
+                let poller = OAuthPoller(dbPath: dbPath)
+                expectEqual(poller.syncCodexProfiles(root: root.path), 1, "the empty profile registers")
+                guard let placeholder = poller.loadActiveCredentials().first,
+                      let rowID = placeholder.accountId else {
+                    expect(false, "the empty profile has a credential")
+                    return
+                }
+                poller.pollCodexSnapshot(placeholder)
+
+                func login(_ id: String, email: String) throws {
+                    let claims = try JSONSerialization.data(withJSONObject: ["email": email]).base64EncodedString()
+                    let auth = try JSONSerialization.data(withJSONObject: [
+                        "tokens": ["account_id": id, "id_token": "e30.\(claims).sig"]
+                    ])
+                    try auth.write(to: home.appendingPathComponent("auth.json"), options: .atomic)
+                }
+                var observedAt = Date().addingTimeInterval(-3600)
+                @MainActor func poll(_ poller: OAuthPoller, id: String, email: String, weekly: Double, plan: String) {
+                    guard let credential = poller.loadActiveCredentials().first, let path = credential.codexHome else {
+                        expect(false, "the snapshot registration survives restart")
+                        return
+                    }
+                    observedAt.addTimeInterval(60)
+                    poller.setCodexQuotaContainerReading(.init(
+                        observedAt: observedAt, accountId: id, email: email,
+                        rateLimit: RateLimitSnapshot(weekly: RateLimitWindow(kind: .weekly, usedPercent: weekly)),
+                        plan: plan), home: path)
+                    poller.pollCodexSnapshot(credential)
+                }
+                func history() throws -> [Double] {
+                    try db.prepare("""
+                        SELECT weekly_all_percent FROM usage_history
+                        WHERE account_id = ? AND is_synthetic = 0 ORDER BY rowid
+                        """).bind(rowID).compactMap { $0[0] as? Double }
+                }
+                try login("acct-unverified", email: "other@example.com")
+                poll(poller, id: "acct-unverified", email: "mismatch@example.com", weekly: 90, plan: "team")
+                expectEqual(try history(), [], "a conflicting handshake cannot establish the first login")
+
+                let email = "first@example.com"
+                try login("acct-first", email: email)
+                poll(poller, id: "acct-first", email: email, weekly: 78, plan: "pro")
+                expectEqual(try history(), [78], "the first verified login writes quota to the existing profile")
+                expectEqual(try db.scalar("SELECT email FROM accounts WHERE id = ?", rowID) as? String,
+                            email, "the verified email is saved on the profile")
+                expectEqual(try db.scalar("SELECT plan FROM accounts WHERE id = ?", rowID) as? String,
+                            "pro", "the first verified login writes the plan")
+
+                // A different workspace can use the same email. Only the native ID distinguishes it.
+                try login("acct-second", email: email)
+                let restarted = OAuthPoller(dbPath: dbPath)
+                expectEqual(restarted.syncCodexProfiles(root: root.path), 0, "rediscovery reuses the registration")
+                poll(restarted, id: "acct-second", email: email, weekly: 12, plan: "business")
+                expectEqual(try history(), [78], "a conflicting login cannot append to the first login's history")
+                expectEqual(try db.scalar("SELECT plan FROM accounts WHERE id = ?", rowID) as? String,
+                            "pro", "the first login's plan survives restart and re-login")
+                try login("acct-first", email: email)
+                poll(restarted, id: "acct-first", email: email, weekly: 79, plan: "pro")
+                expectEqual(try history(), [78, 79], "restoring the first login resumes its original history")
+            }
+        } catch {
+            expect(false, "first-login fixture failed: \(error)")
+        }
+    }
 
     /// The pure rules: which profiles are probed, what the container is
     /// called, and exactly what it is given.

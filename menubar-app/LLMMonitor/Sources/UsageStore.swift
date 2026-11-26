@@ -660,6 +660,11 @@ class UsageStore: ObservableObject {
         addColumnIfMissing(db, table: "accounts",
                            column: "codex_home_mode", definition: "TEXT")
 
+        // A profile discovered before login keeps its local row and history.
+        // The first verified quota probe records its native account ID here.
+        addColumnIfMissing(db, table: "accounts",
+                           column: "codex_profile_account_id", definition: "TEXT")
+
         // Migration (transcript ingest, #197): the Claude session a subagent
         // transcript belongs to.
         //

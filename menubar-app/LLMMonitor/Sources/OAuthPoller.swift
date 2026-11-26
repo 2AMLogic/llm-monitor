@@ -930,18 +930,17 @@ class OAuthPoller: ObservableObject {
         // pre-snapshot "Token refresh failed"), which read as the cause.
         // `persistCredentialError` deliberately leaves `last_poll_at` alone,
         // so the staleness backstop still sees an unpolled row (#148).
-        let loginID = CodexAuth.accountId(inHome: home)
+        let login = CodexAuth.profileIdentity(inHome: home)
         func reportNoReading(rolledOver: Bool) {
             let message = Self.codexSnapshotDiagnostic(home: home, rolledOver: rolledOver)
-            updateCredentialStatus(credential, status: loginID == nil || !rolledOver ? .missing : .valid, error: message)
+            updateCredentialStatus(credential, status: login.accountId == nil || !rolledOver ? .missing : .valid, error: message)
             if let id = credential.id { persistCredentialError(id: id, error: message) }
         }
-        let registeredEmail = storedEmail(for: accountId)
-        let nativeKey = accountId.hasPrefix(CodexProfiles.accountIdPrefix) ? nil : loginID
-        let needsEmail = registeredEmail != nil && !Self.accountIdsComparable(stored: accountId, reported: nativeKey)
-        if loginID != nil, case .drifted = Self.codexHomeDrift(
-            registeredAccountId: accountId, registeredEmail: registeredEmail, homeAccountId: nativeKey,
-            homeEmail: needsEmail ? CodexAuth.email(inHome: home) : nil
+        guard let registration = profileRegistration(accountId: accountId, home: home, login: login) else { return }
+        let nativeKey = registration.id.hasPrefix(CodexProfiles.accountIdPrefix) ? nil : login.accountId
+        if login.accountId != nil, case .drifted = Self.codexHomeDrift(
+            registeredAccountId: registration.id, registeredEmail: registration.email,
+            homeAccountId: nativeKey, homeEmail: login.email
         ) {
             // A rollout or live result for this home could also belong to the new login.
             let message = "The Loom profile is logged in to a different account than its registration."
@@ -968,8 +967,8 @@ class OAuthPoller: ObservableObject {
         }
         if let quota = codexQuotaContainerReading(home: home),
            best.map({ quota.observedAt > $0.observedAt }) ?? true,
-           quota.accountId == loginID,
-           Self.compareProfileIdentity(storedID: accountId, storedEmail: registeredEmail,
+           quota.accountId == login.accountId,
+           Self.compareProfileIdentity(storedID: registration.id, storedEmail: registration.email,
                                        loginID: quota.accountId, email: quota.email) == .match {
             best = (quota.observedAt, quota.rateLimit, quota.plan, "codex-quota-container")
         }
@@ -1098,6 +1097,40 @@ class OAuthPoller: ObservableObject {
     }
 
     // MARK: - Codex quota containers
+
+    /// A profile discovered before login has a local database key. Bind it once
+    /// the current host login agrees with the ID captured during the probe and
+    /// the email returned by the app server. Keep the credential and history on
+    /// their original key and compare subsequent readings to the persisted ID.
+    private func profileRegistration(
+        accountId: String, home: String, login: (accountId: String?, email: String?)
+    ) -> (id: String, email: String?)? {
+        do {
+            let db = try openDatabase(dbPath)
+            guard let row = try db.prepare("""
+                SELECT codex_profile_account_id, email FROM accounts WHERE id = ? AND codex_home = ?
+                """).bind(accountId, home).next() else { return nil }
+            let boundID = row[0] as? String
+            let storedEmail = row[1] as? String
+            guard boundID == nil, accountId.hasPrefix(CodexProfiles.accountIdPrefix),
+                  let quota = codexQuotaContainerReading(home: home), quota.accountId == login.accountId,
+                  let email = login.email,
+                  Self.compareIdentities(reported: quota.email, stored: email) == .match,
+                  !Self.identitiesConflict(email, storedEmail) else {
+                return (boundID ?? accountId, storedEmail)
+            }
+            // Another poller may have bound the placeholder since our read.
+            try db.run("""
+                UPDATE accounts SET codex_profile_account_id = ?, email = ?
+                WHERE id = ? AND codex_home = ? AND codex_profile_account_id IS NULL AND email IS ?
+                """, quota.accountId, email, accountId, home, storedEmail)
+            guard try db.scalar("SELECT changes()") as? Int64 == 1 else { return nil }
+            return (quota.accountId, email)
+        } catch {
+            flog.error("Could not read or bind the Codex profile registration: \(error.localizedDescription)", category: fcat)
+            return nil
+        }
+    }
 
     /// How often the quota containers run, in seconds — the usage cadence,
     /// for the same reason as `loomLiveCheckInterval`.
@@ -1270,10 +1303,10 @@ class OAuthPoller: ObservableObject {
         func normalized(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
         var registered = 0
         for profile in profiles {
-            let nativeId = CodexAuth.accountId(inHome: profile.home)
-            let email = CodexAuth.email(inHome: profile.home)
+            let (nativeId, email) = CodexAuth.profileIdentity(inHome: profile.home)
             do {
-                // Already registered to this exact home: nothing to do.
+                // Rediscovery retains the binding. The quota poll can identify
+                // a placeholder once it has a handshake for the current login.
                 if try db.scalar("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", profile.home) as? Int64 ?? 0 > 0 {
                     try db.run("UPDATE accounts SET codex_home_mode = ? WHERE codex_home = ?",
                                CodexProfiles.snapshotMode, profile.home)
