@@ -35,7 +35,6 @@ Issues currently being built (`loom:building`).
 - **#285**: Show each account's available usage-limit resets (weekly and per-model) alongside utilization
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings
 - **#323**: Offer an in-app "Update now" when a newer release is available
-- **#367**: accounts list counts Codex seats at 100% weekly as usable while the popover counts them exhausted
 - **#368**: Register new Loom Codex profiles on a poll tick, not only at launch or by codex list
 
 ## PRs Awaiting Review
@@ -49,7 +48,6 @@ PRs waiting on Judge (`loom:review-requested`).
 PRs that passed review (`loom:pr`). Unheld PRs are queued for Champion auto-merge; held PRs require a human merge decision.
 
 - **#325**: feat: add in-app update check and one-click self-install for macOS *(held)*
-- **#370**: fix: classify stored windows at their cap as spent in the export status path
 
 ## Proposed
 
@@ -60,7 +58,6 @@ Issues carrying `loom:curated`.
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings *(curated)*
 - **#323**: Offer an in-app "Update now" when a newer release is available *(curated)*
 - **#338**: Per-account scope (personal | work): push/export skip personal accounts; popover marks them *(curated)*
-- **#367**: accounts list counts Codex seats at 100% weekly as usable while the popover counts them exhausted *(curated)*
 - **#368**: Register new Loom Codex profiles on a poll tick, not only at launch or by codex list *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -79,10 +76,10 @@ _None._
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 6 |
+| In Progress (`loom:building`) | 5 |
 | PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 2 |
-| Curated | 7 |
+| Approved PRs awaiting merge | 1 |
+| Curated | 6 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
