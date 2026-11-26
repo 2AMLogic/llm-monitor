@@ -1174,18 +1174,24 @@ class OAuthPoller: ObservableObject {
                 """)
                 for row in candidates {
                     guard let id = row[0] as? String else { continue }
-                    if let home = row[2] as? String {
-                        guard let nativeId, id == nativeId || CodexAuth.accountId(inHome: home) == nativeId else { continue }
+                    if id == nativeId {
                         target = id
                         break
                     }
-                    let rowEmail = (row[1] as? String)?.lowercased()
-                    if id == nativeId || (email != nil && rowEmail == email!.lowercased()) {
-                        target = id; break
+                    if let home = row[2] as? String {
+                        guard let nativeId, CodexAuth.accountId(inHome: home) == nativeId else { continue }
+                        target = id
+                        break
                     }
-                    if email == nil, let local = rowEmail?.split(separator: "@").first,
-                       normalized(String(local)) == normalized(profile.name) {
-                        target = id; break
+                    // Remember the first legacy match, but keep looking for
+                    // the native ID in the remaining home-less rows.
+                    guard target == nil else { continue }
+                    let rowEmail = (row[1] as? String)?.lowercased()
+                    if let email, rowEmail == email.lowercased() {
+                        target = id
+                    } else if email == nil, let local = rowEmail?.split(separator: "@").first,
+                              normalized(String(local)) == normalized(profile.name) {
+                        target = id
                     }
                 }
                 let accountId = target ?? nativeId ?? CodexProfiles.accountIdPrefix + profile.name

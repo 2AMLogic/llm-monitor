@@ -2036,6 +2036,36 @@ enum SelfTest {
                    "the same tick clears the old credential error")
             expectEqual(tick(), 0, "the next tick respects the poll interval")
 
+            // B's directory sorts first, but A sorts first among rows with the
+            // shared email. The third login has only its native ID and a
+            // directory name matching an unrelated row's email local part.
+            try! db.execute("""
+                INSERT INTO accounts (id, email, provider, sort_order) VALUES
+                    ('native-a', 'team@example.com', 'openai', 1),
+                    ('native-b', 'team@example.com', 'openai', 2),
+                    ('legacy-name', 'name.match@example.com', 'openai', 3),
+                    ('native-no-email', NULL, 'openai', 4)
+                """)
+            let profiles: [(id: String, name: String, email: String?, percent: Int)] = [
+                ("native-b", "01-b", "team@example.com", 72),
+                ("native-a", "02-a", "team@example.com", 34),
+                ("native-no-email", "namematch", nil, 51)
+            ]
+            for profile in profiles {
+                makeProfile(profile.name, accountId: profile.id, email: profile.email)
+                writeSnapshot(profile.name, weeklyPercent: profile.percent)
+            }
+            expectEqual(tick(), profiles.count, "all three new logins are polled on the discovery tick")
+            for profile in profiles {
+                expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", profile.id), root + "/" + profile.name,
+                            "the exact account \(profile.id) owns its login's directory")
+                expectEqual(try! db.scalar("SELECT weekly_all_percent FROM usage_history WHERE account_id = ?",
+                                           profile.id) as? Double, Double(profile.percent),
+                            "the discovery tick records the login's own reading for \(profile.id)")
+            }
+            expect(text("SELECT codex_home FROM accounts WHERE id = ?", "legacy-name") == nil,
+                   "the directory-name match leaves the unrelated legacy row home-less")
+
             // An unchanged root: the listing is the whole cost. Deleting the
             // row makes any per-home registration work visible — the
             // unconditional full sync would resurrect it — and none may
