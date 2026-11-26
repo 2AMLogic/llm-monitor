@@ -1823,6 +1823,14 @@ enum SelfTest {
                     fm.createFile(atPath: home + "/auth.json", contents: auth)
                 }
             }
+            func writeSnapshot(_ name: String, weeklyPercent: Int) {
+                let observed = Date().addingTimeInterval(-7200)
+                let timestamp = ISO8601DateFormatter().string(from: observed)
+                let reset = Int(Date().timeIntervalSince1970) + 3 * 86400
+                let line = #"{"timestamp":"\#(timestamp)","payload":{"rate_limits":{"primary":{"used_percent":\#(weeklyPercent),"window_minutes":10080,"resets_at":\#(reset)},"secondary":null,"plan_type":"pro"}}}"#
+                let path = root + "/\(name)/sessions/2026/09/23/rollout-2026-09-23T16-55-50-x.jsonl"
+                try! Data((line + "\n").utf8).write(to: URL(fileURLWithPath: path))
+            }
             // Assertion helpers open a fresh connection per call, so they
             // always read what the poller's own short-lived connections wrote.
             func text(_ sql: String, _ arg: String, at path: String = dbPath) -> String? {
@@ -1872,11 +1880,7 @@ enum SelfTest {
                         "the first tick leaves the home available for identity matching")
 
             makeProfile("slot-7", accountId: "acct-beta", email: "beta@example.com")
-            let observed = Date().addingTimeInterval(-7200)
-            let observedISO = ISO8601DateFormatter().string(from: observed)
-            let liveLine = #"{"timestamp":"\#(observedISO)","payload":{"rate_limits":{"primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":\#(Int(Date().timeIntervalSince1970) + 3 * 86400)},"secondary":null,"plan_type":"pro"}}}"#
-            fm.createFile(atPath: slot + "/sessions/2026/09/23/rollout-2026-09-23T16-55-50-x.jsonl",
-                          contents: Data((liveLine + "\n").utf8))
+            writeSnapshot("slot-7", weeklyPercent: 43)
 
             // The due tick: discovery, then the credential load, then the
             // snapshot poll — the sequence `pollDue` runs, minus the network.
@@ -1935,7 +1939,7 @@ enum SelfTest {
 
             // A second directory whose native id already owns a different
             // home: neither the original row nor its credential may change.
-            makeProfile("owned", accountId: "acct-owned", email: nil)
+            makeProfile("owned", accountId: "acct-owned", email: "owned@example.com")
             expectEqual(poller.discoverCodexProfiles(root: root), 1, "the owned profile registers normally")
             makeProfile("zz-incoming", accountId: "acct-owned", email: nil)
             expectEqual(poller.discoverCodexProfiles(root: root), 0,
@@ -2001,6 +2005,43 @@ enum SelfTest {
                         "the reused name is owned by the new account")
             expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-owned"), root + "/owned",
                         "the original owner keeps its own home")
+
+            // Native identity and row ID can differ in either direction. One
+            // native login is already linked under a legacy ID. The other owns
+            // its native row, but a home-less legacy row also matches its email.
+            try! db.run("INSERT INTO accounts (id, email, provider) VALUES ('legacy-linked', 'shared@example.com', 'openai')")
+            makeProfile("linked", accountId: "native-linked", email: "shared@example.com")
+            writeSnapshot("linked", weeklyPercent: 21)
+            writeSnapshot("owned", weeklyPercent: 22)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "the first home links to the legacy row")
+            try! db.run("INSERT INTO accounts (id, email, provider) VALUES ('legacy-free', 'owned@example.com', 'openai')")
+            makeProfile("duplicate-linked", accountId: "native-linked", email: "shared@example.com")
+            makeProfile("duplicate-owned", accountId: "acct-owned", email: "owned@example.com")
+            makeProfile("distinct", accountId: "native-distinct", email: "shared@example.com")
+            writeSnapshot("duplicate-linked", weeklyPercent: 61)
+            writeSnapshot("duplicate-owned", weeklyPercent: 62)
+            writeSnapshot("distinct", weeklyPercent: 63)
+
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "only the distinct native login registers")
+            for credential in poller.loadActiveCredentials() where credential.isCodexSnapshotOnly {
+                poller.pollCodexSnapshot(credential)
+            }
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = ?", "native-linked"), 0,
+                        "the linked login gains no native-keyed sibling")
+            expect(text("SELECT codex_home FROM accounts WHERE id = ?", "legacy-free") == nil,
+                   "the duplicate leaves the email-matching legacy row home-less")
+            for id in ["native-linked", "legacy-free"] {
+                expectEqual(count("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ?", id), 0,
+                            "no credential is written for the duplicate under \(id)")
+                expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", id), 0,
+                            "no duplicate usage is recorded under \(id)")
+            }
+            expectEqual(try! db.scalar("SELECT COUNT(*) FROM usage_history WHERE weekly_all_percent IN (61, 62)") as? Int64, 0,
+                        "neither duplicate home's snapshot is attributed to any account")
+            for (id, percent) in [("legacy-linked", 21), ("acct-owned", 22), ("native-distinct", 63)] {
+                expectEqual(try! db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND weekly_all_percent = ?",
+                                           id, percent) as? Int64, 1, "the owning home supplies the reading for \(id)")
+            }
 
             // Fail the credential insert after the account upsert. A partial
             // account would make the next tick skip credential registration.

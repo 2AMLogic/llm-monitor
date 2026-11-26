@@ -1156,15 +1156,22 @@ class OAuthPoller: ObservableObject {
                     try db.execute("COMMIT")
                     continue
                 }
+                // Resolve existing owners before considering a home-less email
+                // match. A linked legacy row keeps its historical primary key,
+                // so its home's login can be the only record of its native ID.
                 var target: String?
                 let candidates = try db.prepare("""
-                    SELECT id, email FROM accounts
-                    WHERE COALESCE(provider, 'anthropic') = 'openai'
-                      AND (codex_home IS NULL OR TRIM(codex_home) = '')
-                    ORDER BY sort_order, id
+                    SELECT id, email, CASE WHEN TRIM(codex_home) != '' THEN codex_home END AS owned_home
+                    FROM accounts WHERE COALESCE(provider, 'anthropic') = 'openai'
+                    ORDER BY (owned_home IS NOT NULL) DESC, sort_order, id
                 """)
                 for row in candidates {
                     guard let id = row[0] as? String else { continue }
+                    if let home = row[2] as? String {
+                        guard let nativeId, id == nativeId || CodexAuth.accountId(inHome: home) == nativeId else { continue }
+                        target = id
+                        break
+                    }
                     let rowEmail = (row[1] as? String)?.lowercased()
                     if id == nativeId || (email != nil && rowEmail == email!.lowercased()) {
                         target = id; break
@@ -1186,8 +1193,8 @@ class OAuthPoller: ObservableObject {
                         codex_home_mode = excluded.codex_home_mode
                     WHERE accounts.codex_home IS NULL OR TRIM(accounts.codex_home) = ''
                 """, accountId, profile.name, email, profile.home, CodexProfiles.snapshotMode)
-                // A native or fallback key can name a row that owns a different
-                // home. The guarded upsert leaves it and its credential alone.
+                // A matched owner or a colliding fallback key leaves the
+                // original account and its credential untouched.
                 if try db.scalar("SELECT changes()") as? Int64 == 0 {
                     try db.execute("COMMIT")
                     conflictingCodexProfiles.insert(profile)
