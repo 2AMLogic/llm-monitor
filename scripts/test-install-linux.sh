@@ -28,22 +28,30 @@ start_daemon() {
     "$HOME/.local/bin/llm-monitor" </dev/null >/dev/null 2>&1 &
     echo "$!" > "$HOME/service.pid"
 }
+is_running() {
+    # A zombie retains its PID, but /proc no longer exposes its executable.
+    [ -e "/proc/$1/exe" ]
+}
 stop_daemon() {
-    if [ -f "$HOME/service.pid" ]; then
-        pid=$(cat "$HOME/service.pid" 2>/dev/null || true)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            while kill -0 "$pid" 2>/dev/null; do
-                sleep 0.01
-            done
-        fi
-        rm -f "$HOME/service.pid"
+    pid=$(live_pid)
+    if [ "$pid" != 0 ]; then
+        kill "$pid" 2>/dev/null || true
+        attempts=0
+        while is_running "$pid"; do
+            if [ "$attempts" -ge 100 ]; then
+                echo "systemctl stub timed out stopping fixture PID $pid after SIGTERM" >&2
+                return 1
+            fi
+            sleep 0.02
+            attempts=$((attempts + 1))
+        done
     fi
+    rm -f "$HOME/service.pid"
 }
 live_pid() {
     if [ -f "$HOME/service.pid" ]; then
         pid=$(cat "$HOME/service.pid" 2>/dev/null || true)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        if [ -n "$pid" ] && is_running "$pid"; then
             echo "$pid"
             return
         fi
@@ -63,7 +71,7 @@ case "$*" in
         fi
         ;;
     "--user restart llm-monitor.service")
-        stop_daemon
+        stop_daemon || exit 1
         start_daemon
         ;;
     "--user status llm-monitor.service --no-pager")
