@@ -79,9 +79,8 @@ struct OAuthCredential {
     /// (the ambient `$CODEX_HOME`, else `~/.codex`).
     let codexHome: String?
     /// `accounts.codex_home_mode`. `CodexProfiles.snapshotMode` means this
-    /// home is owned by a Loom session container and must only ever be read
-    /// from its rollout snapshots — never by spawning `codex`, never by
-    /// reading its bearer.
+    /// is a pooled profile. Its quota comes from `pollCodexSnapshot`, which
+    /// compares rollout data with the cached Loom and opt-in container readings.
     let codexHomeMode: String?
 
     init(
@@ -900,17 +899,21 @@ class OAuthPoller: ObservableObject {
         return rolledOver ? rolledOverCodexSnapshotMessage : noCodexSnapshotMessage
     }
 
-    /// Read one Loom profile's current rate limits, from whichever of the two
-    /// read-only sources saw the account most recently. Never spawns `codex`,
-    /// never reads a credential (see `CodexProfiles` / `LoomAccountsCheck`).
+    /// Read one Loom profile's current rate limits, from whichever of the
+    /// three sources saw the account most recently. The host reads identity
+    /// metadata to check the registration (see `CodexProfiles` / `LoomAccountsCheck` /
+    /// `CodexQuotaContainer`); the two probed sources are cached per cycle.
     ///
     /// 1. **Loom's live check** (`LoomAccountsCheck`, #230) — measured inside
     ///    the profile's own session container by the process that owns its
     ///    refresh chain, and cached by `refreshLoomCodexLiveReadings`.
     /// 2. **The profile's rollout snapshot** (`CodexProfiles`) — whatever Codex
     ///    itself last recorded on disk during normal use.
+    /// 3. **This app's own quota container** (`CodexQuotaContainer`) — run only
+    ///    for a profile with no Loom session container, and cached by
+    ///    `refreshCodexQuotaContainerReadings`.
     ///
-    /// The live reading wins **only when it is newer**, never merely because it
+    /// A probed reading wins **only when it is newer**, never merely because it
     /// is live: a host whose container is down reports `session_unavailable`
     /// with no measurement at all, and letting that displace a good local
     /// reading is precisely the stale-overwrite the freshness rules (#148)
@@ -927,11 +930,23 @@ class OAuthPoller: ObservableObject {
         // pre-snapshot "Token refresh failed"), which read as the cause.
         // `persistCredentialError` deliberately leaves `last_poll_at` alone,
         // so the staleness backstop still sees an unpolled row (#148).
+        let login = CodexAuth.profileIdentity(inHome: home)
         func reportNoReading(rolledOver: Bool) {
             let message = Self.codexSnapshotDiagnostic(home: home, rolledOver: rolledOver)
-            let loggedOut = CodexAuth.accountId(inHome: home) == nil
-            updateCredentialStatus(credential, status: loggedOut || !rolledOver ? .missing : .valid, error: message)
+            updateCredentialStatus(credential, status: login.accountId == nil || !rolledOver ? .missing : .valid, error: message)
             if let id = credential.id { persistCredentialError(id: id, error: message) }
+        }
+        guard let registration = profileRegistration(accountId: accountId, home: home, login: login) else { return }
+        let nativeKey = registration.id.hasPrefix(CodexProfiles.accountIdPrefix) ? nil : login.accountId
+        if login.accountId != nil, case .drifted = Self.codexHomeDrift(
+            registeredAccountId: registration.id, registeredEmail: registration.email,
+            homeAccountId: nativeKey, homeEmail: login.email
+        ) {
+            // A rollout or live result for this home could also belong to the new login.
+            let message = "The Loom profile is logged in to a different account than its registration."
+            updateCredentialStatus(credential, status: .drifted, error: message)
+            if let id = credential.id { persistCredentialError(id: id, error: message) }
+            return
         }
         let rollout = CodexProfiles.latestSnapshot(home: home)
         let usableRollout = rollout.flatMap { $0.rateLimit.isEmpty ? nil : $0 }
@@ -941,16 +956,27 @@ class OAuthPoller: ObservableObject {
         let rateLimit: RateLimitSnapshot
         let plan: String?
         let source: String
-        if let live = live, usableRollout.map({ live.observedAt > $0.observedAt }) ?? true {
-            observedAt = live.observedAt
-            rateLimit = live.rateLimit
-            plan = nil  // `accounts check` reports availability, not the plan name.
-            source = "loom-accounts-check-live"
-        } else if let snapshot = usableRollout {
-            observedAt = snapshot.observedAt
-            rateLimit = snapshot.rateLimit
-            plan = snapshot.plan
-            source = "codex-rollout-snapshot"
+        // Strictly-newer wins at each step, so on a tie the rollout snapshot
+        // beats either probe and Loom's live check beats this app's container.
+        var best = usableRollout.map {
+            (observedAt: $0.observedAt, rateLimit: $0.rateLimit, plan: $0.plan, source: "codex-rollout-snapshot")
+        }
+        if let live = live, best.map({ live.observedAt > $0.observedAt }) ?? true {
+            // `accounts check` reports availability, not the plan name.
+            best = (live.observedAt, live.rateLimit, nil, "loom-accounts-check-live")
+        }
+        if let quota = codexQuotaContainerReading(home: home),
+           best.map({ quota.observedAt > $0.observedAt }) ?? true,
+           quota.accountId == login.accountId,
+           Self.compareProfileIdentity(storedID: registration.id, storedEmail: registration.email,
+                                       loginID: quota.accountId, email: quota.email) == .match {
+            best = (quota.observedAt, quota.rateLimit, quota.plan, "codex-quota-container")
+        }
+        if let best = best {
+            observedAt = best.observedAt
+            rateLimit = best.rateLimit
+            plan = best.plan
+            source = best.source
         } else {
             // Neither source has a current reading. `rolledOver` distinguishes
             // "this profile has never recorded one" from "its newest one has
@@ -1070,6 +1096,182 @@ class OAuthPoller: ObservableObject {
         return measured
     }
 
+    // MARK: - Codex quota containers
+
+    /// A profile discovered before login has a local database key. Bind it once
+    /// the current host login agrees with the ID captured during the probe and
+    /// the email returned by the app server. Keep the credential and history on
+    /// their original key and compare subsequent readings to the persisted ID.
+    private func profileRegistration(
+        accountId: String, home: String, login: (accountId: String?, email: String?)
+    ) -> (id: String, email: String?)? {
+        do {
+            let db = try openDatabase(dbPath)
+            guard let row = try db.prepare("""
+                SELECT codex_profile_account_id, email FROM accounts WHERE id = ? AND codex_home = ?
+                """).bind(accountId, home).next() else { return nil }
+            let boundID = row[0] as? String
+            let storedEmail = row[1] as? String
+            guard boundID == nil, accountId.hasPrefix(CodexProfiles.accountIdPrefix),
+                  let quota = codexQuotaContainerReading(home: home), quota.accountId == login.accountId,
+                  let email = login.email,
+                  Self.compareIdentities(reported: quota.email, stored: email) == .match,
+                  !Self.identitiesConflict(email, storedEmail) else {
+                return (boundID ?? accountId, storedEmail)
+            }
+            // Another poller may have bound the placeholder since our read.
+            try db.run("""
+                UPDATE accounts SET codex_profile_account_id = ?, email = ?
+                WHERE id = ? AND codex_home = ? AND codex_profile_account_id IS NULL AND email IS ?
+                """, quota.accountId, email, accountId, home, storedEmail)
+            guard try db.scalar("SELECT changes()") as? Int64 == 1 else { return nil }
+            return (quota.accountId, email)
+        } catch {
+            flog.error("Could not read or bind the Codex profile registration: \(error.localizedDescription)", category: fcat)
+            return nil
+        }
+    }
+
+    /// How often the quota containers run, in seconds — the usage cadence,
+    /// for the same reason as `loomLiveCheckInterval`.
+    var codexQuotaContainerInterval: TimeInterval = 600
+
+    private var lastCodexQuotaContainerRun: Date?
+    /// The newest container reading per profile home. Kept across a failed
+    /// run like `loomLiveReadings`: it carries its own timestamp, so the
+    /// newer-wins rule and the staleness backstop retire it.
+    /// UTF-8 keys preserve distinct filesystem paths through quota attribution.
+    private var codexQuotaContainerReadings: [Data: CodexQuotaContainer.Reading] = [:]
+    private enum CodexQuotaImageState { case unknown, building, ready, failed }
+    private var codexQuotaImageState = CodexQuotaImageState.unknown
+    /// Last thing said about the feature as a whole and about each profile,
+    /// so a steady state is logged once rather than every ten minutes.
+    private var lastCodexQuotaContainerNotice: String?
+    private var lastCodexQuotaProbeFailure: [String: String] = [:]
+
+    /// Snapshot registrations can use a profile-generated or legacy key. When
+    /// the native IDs cannot be compared, only matching email confirms identity.
+    nonisolated static func compareProfileIdentity(
+        storedID: String, storedEmail: String?, loginID: String, email: String?
+    ) -> CodexIdentityComparison {
+        let emailMatch = compareIdentities(reported: email, stored: storedEmail)
+        if case .conflict = emailMatch { return emailMatch }
+        if !storedID.hasPrefix(CodexProfiles.accountIdPrefix), accountIdsComparable(stored: storedID, reported: loginID) {
+            return compareIdentities(reported: loginID, stored: storedID)
+        }
+        return emailMatch
+    }
+
+    func codexQuotaContainerReading(home: String, now: Date = Date()) -> CodexQuotaContainer.Reading? {
+        codexQuotaContainerReadings[Data(home.utf8)]?.current(at: now)
+    }
+
+    func setCodexQuotaContainerReading(_ reading: CodexQuotaContainer.Reading, home: String) {
+        codexQuotaContainerReadings[Data(home.utf8)] = reading
+    }
+
+    private func noteCodexQuotaContainer(_ notice: String, warning: Bool = false) {
+        guard lastCodexQuotaContainerNotice != notice else { return }
+        lastCodexQuotaContainerNotice = notice
+        if warning { flog.warning(notice, category: fcat) } else { flog.info(notice, category: fcat) }
+    }
+
+    /// When enabled, maintain a quota container and read quota for each logged-in
+    /// snapshot-mode profile without a Loom session container.
+    /// Returns how many were measured.
+    ///
+    /// Called after `refreshLoomCodexLiveReadings` and throttled the same way.
+    /// Every failure leaves the cache alone and the other two sources in
+    /// charge. The built-in image is built in the background the first time
+    /// it is found missing, so a slow first build never holds up a poll.
+    @discardableResult
+    func refreshCodexQuotaContainerReadings(
+        for credentials: [OAuthCredential], force: Bool = false,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) async -> Int {
+        let homes = credentials.filter { $0.isCodexSnapshotOnly }.compactMap { $0.codexHome }
+        guard !homes.isEmpty, CodexQuotaContainer.isEnabled(environment: environment) else { return 0 }
+        let now = Date()
+        if !force, let last = lastCodexQuotaContainerRun,
+           now.timeIntervalSince(last) < codexQuotaContainerInterval {
+            return 0
+        }
+        lastCodexQuotaContainerRun = now
+        guard let docker = CodexQuotaContainer.resolveDocker(environment: environment) else {
+            noteCodexQuotaContainer("Codex quota containers unavailable: no docker binary found")
+            return 0
+        }
+        guard let containers = await CodexQuotaContainer.listContainers(docker: docker) else {
+            noteCodexQuotaContainer("Codex quota containers skipped: the container runtime is not answering",
+                                    warning: true)
+            return 0
+        }
+        let dataDirectory = URL(fileURLWithPath: dbPath).deletingLastPathComponent()
+        guard let installation = CodexQuotaContainer.installation(in: dataDirectory) else {
+            noteCodexQuotaContainer("Codex quota containers skipped: installation ID unavailable", warning: true)
+            return 0
+        }
+        let plan = installation.plan(homes: homes, containers: containers)
+        let image = CodexQuotaContainer.image(environment: environment)
+        if !plan.eligibleHomes.isEmpty, image.isBuiltIn, codexQuotaImageState != .ready {
+            if await CodexQuotaContainer.imageExists(docker: docker, image: image.name) {
+                codexQuotaImageState = .ready
+            } else {
+                if codexQuotaImageState == .unknown {
+                    codexQuotaImageState = .building
+                    noteCodexQuotaContainer("Codex quota container image \(image.name) not found — building it")
+                    Task { [weak self] in
+                        let failure = await CodexQuotaContainer.buildImage(docker: docker)
+                        guard let self = self else { return }
+                        self.codexQuotaImageState = failure == nil ? .ready : .failed
+                        if let failure = failure {
+                            self.noteCodexQuotaContainer(
+                                "Codex quota container image build failed: \(failure)", warning: true)
+                        } else {
+                            self.noteCodexQuotaContainer("Codex quota container image \(image.name) built")
+                            // Do not make the first reading wait a whole cadence.
+                            self.lastCodexQuotaContainerRun = nil
+                        }
+                    }
+                }
+                return 0
+            }
+        }
+
+        let reconciled = await installation.reconcile(
+            docker: docker, image: image.name, plan: plan, containers: containers)
+        for (home, reason) in reconciled.failures {
+            let profile = (home as NSString).lastPathComponent
+            let message = "container could not be started: \(reason)"
+            if lastCodexQuotaProbeFailure[profile] != message {
+                lastCodexQuotaProbeFailure[profile] = message
+                flog.warning("Codex quota container for profile \(profile): \(message)", category: fcat)
+            }
+        }
+        let ready = reconciled.ready
+        guard !ready.isEmpty else { return 0 }
+        let results = await installation.probeAll(docker: docker, homes: ready)
+        var measured = 0
+        for (home, result) in results {
+            let profile = (home as NSString).lastPathComponent
+            switch result {
+            case .reading(let reading):
+                setCodexQuotaContainerReading(reading, home: home)
+                lastCodexQuotaProbeFailure[profile] = nil
+                measured += 1
+            case .failed(let reason):
+                if lastCodexQuotaProbeFailure[profile] != reason {
+                    lastCodexQuotaProbeFailure[profile] = reason
+                    flog.warning("Codex quota container for profile \(profile) measured nothing: \(reason)",
+                                 category: fcat)
+                }
+            }
+        }
+        noteCodexQuotaContainer("Codex quota containers: \(measured)/\(ready.count) profile(s) measured "
+                                + "(profiles without a Loom session container)")
+        return measured
+    }
+
     /// Whether `home` lives under Loom's Codex profile root, i.e. is owned by
     /// Loom and must only be registered in snapshot mode.
     nonisolated static func isLoomCodexProfile(_ home: String, root: String? = CodexProfiles.root()) -> Bool {
@@ -1101,10 +1303,10 @@ class OAuthPoller: ObservableObject {
         func normalized(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
         var registered = 0
         for profile in profiles {
-            let nativeId = CodexAuth.accountId(inHome: profile.home)
-            let email = CodexAuth.email(inHome: profile.home)
+            let (nativeId, email) = CodexAuth.profileIdentity(inHome: profile.home)
             do {
-                // Already registered to this exact home: nothing to do.
+                // Rediscovery retains the binding. The quota poll can identify
+                // a placeholder once it has a handshake for the current login.
                 if try db.scalar("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", profile.home) as? Int64 ?? 0 > 0 {
                     try db.run("UPDATE accounts SET codex_home_mode = ? WHERE codex_home = ?",
                                CodexProfiles.snapshotMode, profile.home)
@@ -2089,6 +2291,7 @@ class OAuthPoller: ObservableObject {
         // Warmed before the loop so every snapshot-mode row in this pass reads
         // the same report, rather than one probe per account (#230).
         await refreshLoomCodexLiveReadings(for: credentials)
+        await refreshCodexQuotaContainerReadings(for: credentials)
 
         for credential in credentials {
             await pollWithRetry(credential)
@@ -2109,6 +2312,7 @@ class OAuthPoller: ObservableObject {
         // Self-throttling on its own cadence, so calling it every tick is cheap
         // when it is not due (#230).
         await refreshLoomCodexLiveReadings(for: credentials)
+        await refreshCodexQuotaContainerReadings(for: credentials)
 
         let now = Date()
         var polled = 0

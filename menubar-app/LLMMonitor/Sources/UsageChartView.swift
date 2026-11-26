@@ -40,23 +40,232 @@ struct NamedLimitTrace: Identifiable {
     let color: Color
 }
 
-struct UsageChartWindow: View {
-    let account: Account
+private struct ChartHistory {
     let dataPoints: [UsageDataPoint]
-    let fullDataPoints: [FullUsageDataPoint]
+    let latest: FullUsageDataPoint?
     let tokenDataPoints: [TokenDataPoint]
-    /// True when `tokenDataPoints` is a host-wide total (#201) rather than
-    /// data actually attributed to `account` — see
-    /// `UsageStore.loadHostTotalTokenHistory`. Must gate every label the
-    /// token chart shows so a host-total fallback is never presented as if
-    /// it were this account's own spend.
     let tokenDataIsHostTotal: Bool
     let calibrationDataPoints: [CalibrationDataPoint]
+    let namedLimitTraces: [NamedLimitTrace]
+    let latestComparison: Date?
+    let sessionEstimate: (minutes: Double, limitType: String)?
+    let weeklyEstimate: (minutes: Double, limitType: String)?
+
+    // A nonisolated async load runs on the generic executor. Only the completed
+    // snapshot crosses back to SwiftUI, including the fits reused on redraw.
+    static func load(for accountId: String, accounts: [Account], store: UsageStore) async throws -> ChartHistory {
+        try Task.checkCancellation()
+        let data = store.loadHistory(for: accountId)
+        let full = store.loadFullHistory(for: accountId)
+        try Task.checkCancellation()
+        let attributed = store.loadTokenHistory(for: accountId)
+        let useHostTotal = attributed.isEmpty && store.hasAnyTokenUsageData()
+        let tokens = useHostTotal ? store.loadHostTotalTokenHistory() : attributed
+        try Task.checkCancellation()
+        let limits = store.loadNamedLimitHistory(for: accountId).sorted { $0.key < $1.key }
+        let colors = ChartWindowController.namedLimitColors
+        let namedTraces = limits.enumerated().map { index, limit in
+            NamedLimitTrace(id: limit.key, name: limit.key,
+                            dataPoints: limit.value.sorted { $0.timestamp < $1.timestamp },
+                            color: colors[index % colors.count])
+        }
+        let session = full.compactMap { point in point.sessionPercent.map { (point.timestamp, $0) } }
+        let weekly = full.compactMap { point in point.weeklyAllPercent.map { (point.timestamp, $0) } }
+        return ChartHistory(
+            dataPoints: data, latest: full.last,
+            tokenDataPoints: tokens, tokenDataIsHostTotal: useHostTotal,
+            calibrationDataPoints: store.loadCalibrationHistory(for: accountId),
+            namedLimitTraces: namedTraces,
+            latestComparison: store.latestComparisonTimestamp(among: Set(accounts.map(\.id)).subtracting([accountId])),
+            sessionEstimate: estimateTimeToLimit(points: session, limitName: "session limits"),
+            weeklyEstimate: estimateTimeToLimit(points: weekly, limitName: "weekly limits")
+        )
+    }
+
+    /// Linear regression result: slope (percent per minute) and intercept
+    private struct LinearFit {
+        let slope: Double      // percent per minute (positive = increasing usage)
+        let intercept: Double  // percent at time 0
+        let r2: Double         // R-squared (quality of fit)
+    }
+
+    /// Helper to compute linear regression from x,y arrays
+    private static func computeRegression(xs: [Double], ys: [Double]) -> (slope: Double, intercept: Double)? {
+        let n = Double(xs.count)
+        guard n >= 2 else { return nil }
+
+        let sumX = xs.reduce(0, +)
+        let sumY = ys.reduce(0, +)
+        let sumXY = zip(xs, ys).map { $0 * $1 }.reduce(0, +)
+        let sumX2 = xs.map { $0 * $0 }.reduce(0, +)
+
+        let denom = n * sumX2 - sumX * sumX
+        guard denom != 0 else { return nil }
+
+        let slope = (n * sumXY - sumX * sumY) / denom
+        let intercept = (sumY - slope * sumX) / n
+        return (slope, intercept)
+    }
+
+    /// Fit a line to usage data using robust regression with 3σ outlier exclusion.
+    /// Starts from the most recent points and iteratively adds earlier points,
+    /// stopping when a point would be a statistical outlier.
+    private static func fitLinearModel(points: [(Date, Double)]) -> LinearFit? {
+        guard points.count >= 2 else { return nil }
+
+        // Use the most recent point as time reference (x=0 at the end)
+        let baseTime = points.last!.0.timeIntervalSince1970
+
+        // Convert all points to (x, y) where x is minutes before now (negative values)
+        let allXY: [(x: Double, y: Double)] = points.map { point in
+            let x = (point.0.timeIntervalSince1970 - baseTime) / 60.0
+            return (x, point.1)
+        }
+
+        // Start with the last 2 points
+        var includedIndices: [Int] = [allXY.count - 1, allXY.count - 2]
+
+        // Iteratively try to add earlier points
+        for i in stride(from: allXY.count - 3, through: 0, by: -1) {
+            let candidate = allXY[i]
+
+            // First check: candidate's y must be <= the earliest included point's y
+            // (usage should not decrease going forward in time)
+            let earliestIncluded = allXY[includedIndices.last!]
+            if candidate.y > earliestIncluded.y {
+                // Reset detected, stop here
+                break
+            }
+
+            // Get current included points
+            let currentXs = includedIndices.map { allXY[$0].x }
+            let currentYs = includedIndices.map { allXY[$0].y }
+
+            // Fit line to current points
+            guard let regression = computeRegression(xs: currentXs, ys: currentYs) else { break }
+
+            // Calculate residuals and standard deviation for current points
+            let residuals = zip(currentXs, currentYs).map { x, y in
+                y - (regression.slope * x + regression.intercept)
+            }
+            let meanResidual = residuals.reduce(0, +) / Double(residuals.count)
+            let variance = residuals.map { pow($0 - meanResidual, 2) }.reduce(0, +) / Double(residuals.count)
+            let stdDev = sqrt(variance)
+
+            // Calculate predicted value and residual for candidate
+            let predictedY = regression.slope * candidate.x + regression.intercept
+            let candidateResidual = candidate.y - predictedY
+
+            // Check if candidate is within 3σ (use max of stdDev and 1.0 to handle low-variance cases)
+            let threshold = max(stdDev, 1.0) * 3.0
+            if abs(candidateResidual) <= threshold {
+                // Point is consistent with the trend, include it
+                includedIndices.append(i)
+            } else {
+                // Point is an outlier, stop adding more
+                break
+            }
+        }
+
+        guard includedIndices.count >= 2 else { return nil }
+
+        // Final regression on all included points
+        let finalXs = includedIndices.map { allXY[$0].x }
+        let finalYs = includedIndices.map { allXY[$0].y }
+
+        guard let finalRegression = computeRegression(xs: finalXs, ys: finalYs) else { return nil }
+
+        // Calculate R-squared
+        let meanY = finalYs.reduce(0, +) / Double(finalYs.count)
+        let ssTotal = finalYs.map { pow($0 - meanY, 2) }.reduce(0, +)
+        let ssResidual = zip(finalXs, finalYs).map { x, y in
+            pow(y - (finalRegression.slope * x + finalRegression.intercept), 2)
+        }.reduce(0, +)
+        let r2 = ssTotal > 0 ? 1 - ssResidual / ssTotal : 0
+
+        return LinearFit(slope: finalRegression.slope, intercept: finalRegression.intercept, r2: r2)
+    }
+
+    /// Estimate time until a usage metric reaches 100%
+    private static func estimateTimeToLimit(points: [(Date, Double)], limitName: String) -> (minutes: Double, limitType: String)? {
+        guard let fit = fitLinearModel(points: points) else { return nil }
+
+        // Need positive slope (increasing usage) to estimate exhaustion
+        guard fit.slope > 0.001 else { return nil }  // At least 0.001% per minute
+
+        // Get current percent (last point)
+        guard let currentPercent = points.last?.1 else { return nil }
+
+        // Time to reach 100%
+        let remaining = 100.0 - currentPercent
+        guard remaining > 0 else { return (0, limitName) }
+
+        let minutesToExhaust = remaining / fit.slope
+        return (minutesToExhaust, limitName)
+    }
+}
+
+private struct ChartComparisons {
+    var accounts: [AccountTrace] = []
+    var tokens: [TokenTrace] = []
+
+    static func load(for accountId: String, accounts: [Account], store: UsageStore) async throws -> Self {
+        try Task.checkCancellation()
+        var result = Self()
+        let colors = ChartWindowController.otherAccountColors
+        let tokens = store.loadTokenHistoryByAccount()
+        for (index, account) in accounts.enumerated() where account.id != accountId {
+            try Task.checkCancellation()
+            let color = colors[index % colors.count]
+            let points = store.loadHistory(for: account.id)
+            if !points.isEmpty {
+                result.accounts.append(AccountTrace(id: account.id, name: account.displayName,
+                                                    dataPoints: points, color: color, isPrimary: false))
+            }
+            if let points = tokens[account.id] {
+                result.tokens.append(TokenTrace(id: account.id, name: account.displayName,
+                                                dataPoints: points, color: color, isPrimary: false))
+            }
+        }
+        return result
+    }
+}
+
+private struct ChartHistoryLoader: View {
+    let account: Account
+    let accounts: [Account]
     let store: UsageStore
     let oauthPoller: OAuthPoller?
-    let otherAccountsData: [AccountTrace]  // Data for other accounts
-    let otherTokenData: [TokenTrace]  // Token data for other accounts
-    let namedLimitTraces: [NamedLimitTrace]  // Per-model sub-limits for this account (empty for Anthropic)
+    @State private var history: ChartHistory?
+
+    var body: some View {
+        Group {
+            if let history {
+                UsageChartWindow(account: account, accounts: accounts, history: history,
+                                 store: store, oauthPoller: oauthPoller)
+            } else {
+                ProgressView("Loading usage history…")
+                    .frame(width: 620, height: 610)
+            }
+        }
+        .task {
+            guard history == nil,
+                  let loaded = try? await ChartHistory.load(for: account.id, accounts: accounts, store: store),
+                  !Task.isCancelled else { return }
+            history = loaded
+        }
+    }
+}
+
+private struct UsageChartWindow: View {
+    let account: Account
+    let accounts: [Account]
+    let history: ChartHistory
+    let store: UsageStore
+    let oauthPoller: OAuthPoller?
+    @State private var comparisons: ChartComparisons?
+    private var otherAccountsData: [AccountTrace] { comparisons?.accounts ?? [] }
+    private var otherTokenData: [TokenTrace] { comparisons?.tokens ?? [] }
     @Environment(\.colorScheme) var colorScheme
     @StateObject private var updateChecker = UpdateChecker.shared
     @State private var isEditingName = false
@@ -72,16 +281,8 @@ struct UsageChartWindow: View {
 
     /// The 7-day window: ends at the latest data point (or now), starts 7 days before
     var chartDateRange: (start: Date, end: Date) {
-        // Find the latest timestamp across all data
-        var latestDate = Date()
-        if let primaryLatest = dataPoints.last?.timestamp {
-            latestDate = primaryLatest
-        }
-        for trace in otherAccountsData {
-            if let traceLatest = trace.dataPoints.last?.timestamp, traceLatest > latestDate {
-                latestDate = traceLatest
-            }
-        }
+        let primaryEnd = history.dataPoints.last?.timestamp ?? Date()
+        let latestDate = max(primaryEnd, history.latestComparison ?? primaryEnd)
         let sevenDaysAgo = latestDate.addingTimeInterval(-7 * 24 * 60 * 60)
         return (sevenDaysAgo, latestDate)
     }
@@ -91,8 +292,8 @@ struct UsageChartWindow: View {
         let (windowStart, windowEnd) = chartDateRange
         let windowInterval = windowEnd.timeIntervalSince(windowStart)
         guard windowInterval > 0,
-              let firstData = dataPoints.first?.timestamp,
-              let lastData = dataPoints.last?.timestamp else {
+              let firstData = history.dataPoints.first?.timestamp,
+              let lastData = history.dataPoints.last?.timestamp else {
             return (0.0, 1.0)
         }
         // Calculate where active account's data falls within the 7-day window
@@ -105,10 +306,10 @@ struct UsageChartWindow: View {
 
     /// Filtered data points based on current range selection
     var filteredDataPoints: [UsageDataPoint] {
-        guard dataPoints.count >= 2 else { return dataPoints }
+        guard history.dataPoints.count >= 2 else { return history.dataPoints }
         let startDate = dateForRangePosition(rangeStart)
         let endDate = dateForRangePosition(rangeEnd)
-        return dataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate }
+        return history.dataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate }
     }
 
     /// Filtered other accounts data based on current range selection
@@ -129,10 +330,10 @@ struct UsageChartWindow: View {
 
     /// Filtered token data points based on current range selection
     var filteredTokenDataPoints: [TokenDataPoint] {
-        guard tokenDataPoints.count >= 2 else { return tokenDataPoints }
+        guard history.tokenDataPoints.count >= 2 else { return history.tokenDataPoints }
         let startDate = dateForRangePosition(rangeStart)
         let endDate = dateForRangePosition(rangeEnd)
-        return tokenDataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate }
+        return history.tokenDataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate }
     }
 
     /// Filtered other accounts token data based on current range selection
@@ -155,10 +356,10 @@ struct UsageChartWindow: View {
     /// Empty when the account has no named limits — callers must check this
     /// before rendering anything so the overlay stays entirely hidden.
     var filteredNamedLimitTraces: [NamedLimitTrace] {
-        guard !namedLimitTraces.isEmpty else { return [] }
+        guard !history.namedLimitTraces.isEmpty else { return [] }
         let startDate = dateForRangePosition(rangeStart)
         let endDate = dateForRangePosition(rangeEnd)
-        return namedLimitTraces.map { trace in
+        return history.namedLimitTraces.map { trace in
             NamedLimitTrace(
                 id: trace.id,
                 name: trace.name,
@@ -170,10 +371,10 @@ struct UsageChartWindow: View {
 
     /// Filtered calibration data points based on the current range selection.
     var filteredCalibrationDataPoints: [CalibrationDataPoint] {
-        guard calibrationDataPoints.count >= 2 else { return calibrationDataPoints }
+        guard history.calibrationDataPoints.count >= 2 else { return history.calibrationDataPoints }
         let startDate = dateForRangePosition(rangeStart)
         let endDate = dateForRangePosition(rangeEnd)
-        return calibrationDataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate }
+        return history.calibrationDataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate }
     }
 
     /// Maximum `tokensPerPoint` value in the filtered range (for Y-axis
@@ -190,11 +391,11 @@ struct UsageChartWindow: View {
     /// the `.calibration` mode out of the picker exactly as `hasTokenData`
     /// already gates `.tokens`.
     var hasCalibrationData: Bool {
-        !calibrationDataPoints.isEmpty
+        !history.calibrationDataPoints.isEmpty
     }
 
     /// Modes actually worth offering for this account. `.percent` is always
-    /// present (it is what `dataPoints` — already asserted non-empty above —
+    /// present (it is what `history.dataPoints` — already asserted non-empty above —
     /// backs); `.tokens` and `.calibration` are offered only when there is
     /// data for them, so a mode with nothing to show is never reachable.
     var availableChartModes: [ChartMode] {
@@ -238,14 +439,14 @@ struct UsageChartWindow: View {
 
     /// Check if we have token data to display
     var hasTokenData: Bool {
-        !tokenDataPoints.isEmpty
+        !history.tokenDataPoints.isEmpty
     }
 
     /// Token chart section title — distinguishes a genuine per-account series
     /// from the #201 host-total fallback so the two are never visually
     /// indistinguishable.
     var tokenChartTitle: String {
-        tokenDataIsHostTotal ? "Token Usage (Host Total)" : "Token Usage"
+        history.tokenDataIsHostTotal ? "Token Usage (Host Total)" : "Token Usage"
     }
 
     /// Convert range position (0-1) to actual date within 7-day window
@@ -394,7 +595,7 @@ struct UsageChartWindow: View {
             }
             .padding(.bottom, 8)
 
-            if dataPoints.isEmpty {
+            if history.dataPoints.isEmpty {
                 VStack(spacing: 12) {
                     Image(systemName: "chart.line.uptrend.xyaxis")
                         .font(.largeTitle)
@@ -430,11 +631,15 @@ struct UsageChartWindow: View {
                             .frame(width: availableChartModes.count > 2 ? 230 : 160)
                         }
 
-                        if !otherAccountsData.isEmpty {
+                        if history.latestComparison != nil {
                             Button(action: { showOtherAccounts.toggle() }) {
                                 HStack(spacing: 4) {
-                                    Image(systemName: showOtherAccounts ? "eye.fill" : "eye.slash")
-                                        .font(.caption)
+                                    if showOtherAccounts && comparisons == nil {
+                                        ProgressView().controlSize(.small)
+                                    } else {
+                                        Image(systemName: showOtherAccounts ? "eye.fill" : "eye.slash")
+                                            .font(.caption)
+                                    }
                                     Text(showOtherAccounts ? "Hide others" : "Show others")
                                         .font(.caption)
                                 }
@@ -451,7 +656,7 @@ struct UsageChartWindow: View {
                     // see UsageStore.loadHostTotalTokenHistory). Must be
                     // labeled every time it's shown so it's never mistaken
                     // for this account's own spend.
-                    if chartMode == .tokens && tokenDataIsHostTotal {
+                    if chartMode == .tokens && history.tokenDataIsHostTotal {
                         Text("Not yet attributed to a specific account — shown as a host-wide total.")
                             .font(.caption)
                             .foregroundColor(.secondary)
@@ -607,7 +812,7 @@ struct UsageChartWindow: View {
                             }
                         }
                         .frame(height: 220)
-                    } else if calibrationDataPoints.isEmpty {
+                    } else if history.calibrationDataPoints.isEmpty {
                         // Calibration mode with nothing to plot (#199) —
                         // unreachable via the picker (it's gated out of
                         // `availableChartModes`), kept as a defensive
@@ -701,9 +906,9 @@ struct UsageChartWindow: View {
                     // Legend for named per-model sub-limits — only rendered when the
                     // account actually has at least one, so an Anthropic account (or
                     // an OpenAI account before this shipped) shows nothing extra.
-                    if chartMode == .percent && !namedLimitTraces.isEmpty {
+                    if chartMode == .percent && !history.namedLimitTraces.isEmpty {
                         HStack(spacing: 16) {
-                            ForEach(namedLimitTraces) { trace in
+                            ForEach(history.namedLimitTraces) { trace in
                                 HStack(spacing: 4) {
                                     Rectangle()
                                         .fill(trace.color)
@@ -719,9 +924,9 @@ struct UsageChartWindow: View {
                     }
 
                     // Range selector (always show if we have data, using 7-day window)
-                    if !dataPoints.isEmpty {
+                    if !history.dataPoints.isEmpty {
                         RangeSelector(
-                            dataPoints: dataPoints,
+                            dataPoints: history.dataPoints,
                             otherAccountsData: showOtherAccounts ? otherAccountsData : [],
                             chartDateRange: chartDateRange,
                             rangeStart: $rangeStart,
@@ -799,6 +1004,12 @@ struct UsageChartWindow: View {
                 .padding(16)
             }
         }
+        .task(id: showOtherAccounts) {
+            guard showOtherAccounts, comparisons == nil,
+                  let loaded = try? await ChartComparisons.load(for: account.id, accounts: accounts, store: store),
+                  !Task.isCancelled else { return }
+            comparisons = loaded
+        }
         .onAppear {
             // Initialize display name from account
             if displayName.isEmpty {
@@ -819,9 +1030,8 @@ struct UsageChartWindow: View {
                 // what this alert has always promised (#106).
                 store.clearAccountHistory(accountId: account.id)
                 // Close this window
-                if let window = ChartWindowController.windows[account.id] {
+                if let window = ChartWindowController.windows[.account(account.id)] {
                     window.close()
-                    ChartWindowController.windows.removeValue(forKey: account.id)
                 }
             }
         } message: {
@@ -830,15 +1040,15 @@ struct UsageChartWindow: View {
     }
 
     var latestSessionPercent: Double? {
-        fullDataPoints.last?.sessionPercent
+        history.latest?.sessionPercent
     }
 
     var latestWeeklyPercent: Double? {
-        fullDataPoints.last?.weeklyAllPercent
+        history.latest?.weeklyAllPercent
     }
 
     func usageConsumedWithLabel(targetMinutes: Int) -> (String, Double) {
-        guard let oldestPoint = dataPoints.first else {
+        guard let oldestPoint = history.dataPoints.first else {
             return (formatDuration(minutes: targetMinutes), 0)
         }
 
@@ -848,7 +1058,7 @@ struct UsageChartWindow: View {
         // Use the smaller of target time or available data range
         let effectiveMinutes = min(targetMinutes, dataAgeMinutes)
         let cutoff = now.addingTimeInterval(-Double(effectiveMinutes) * 60)
-        let recentPoints = dataPoints.filter { $0.timestamp >= cutoff }
+        let recentPoints = history.dataPoints.filter { $0.timestamp >= cutoff }
         let consumed = recentPoints.reduce(0) { $0 + $1.usageDelta }
 
         // Show actual time window if less than target
@@ -881,133 +1091,11 @@ struct UsageChartWindow: View {
             store.updateAccountName(accountId: account.id, newName: trimmed)
             displayName = trimmed
             // Update window title
-            if let window = ChartWindowController.windows[account.id] {
+            if let window = ChartWindowController.windows[.account(account.id)] {
                 window.title = "Usage History - \(trimmed)"
             }
         }
         isEditingName = false
-    }
-
-    /// Linear regression result: slope (percent per minute) and intercept
-    struct LinearFit {
-        let slope: Double      // percent per minute (positive = increasing usage)
-        let intercept: Double  // percent at time 0
-        let r2: Double         // R-squared (quality of fit)
-    }
-
-    /// Helper to compute linear regression from x,y arrays
-    private func computeRegression(xs: [Double], ys: [Double]) -> (slope: Double, intercept: Double)? {
-        let n = Double(xs.count)
-        guard n >= 2 else { return nil }
-
-        let sumX = xs.reduce(0, +)
-        let sumY = ys.reduce(0, +)
-        let sumXY = zip(xs, ys).map { $0 * $1 }.reduce(0, +)
-        let sumX2 = xs.map { $0 * $0 }.reduce(0, +)
-
-        let denom = n * sumX2 - sumX * sumX
-        guard denom != 0 else { return nil }
-
-        let slope = (n * sumXY - sumX * sumY) / denom
-        let intercept = (sumY - slope * sumX) / n
-        return (slope, intercept)
-    }
-
-    /// Fit a line to usage data using robust regression with 3σ outlier exclusion.
-    /// Starts from the most recent points and iteratively adds earlier points,
-    /// stopping when a point would be a statistical outlier.
-    func fitLinearModel(points: [(Date, Double)]) -> LinearFit? {
-        guard points.count >= 2 else { return nil }
-
-        // Use the most recent point as time reference (x=0 at the end)
-        let baseTime = points.last!.0.timeIntervalSince1970
-
-        // Convert all points to (x, y) where x is minutes before now (negative values)
-        let allXY: [(x: Double, y: Double)] = points.map { point in
-            let x = (point.0.timeIntervalSince1970 - baseTime) / 60.0
-            return (x, point.1)
-        }
-
-        // Start with the last 2 points
-        var includedIndices: [Int] = [allXY.count - 1, allXY.count - 2]
-
-        // Iteratively try to add earlier points
-        for i in stride(from: allXY.count - 3, through: 0, by: -1) {
-            let candidate = allXY[i]
-
-            // First check: candidate's y must be <= the earliest included point's y
-            // (usage should not decrease going forward in time)
-            let earliestIncluded = allXY[includedIndices.last!]
-            if candidate.y > earliestIncluded.y {
-                // Reset detected, stop here
-                break
-            }
-
-            // Get current included points
-            let currentXs = includedIndices.map { allXY[$0].x }
-            let currentYs = includedIndices.map { allXY[$0].y }
-
-            // Fit line to current points
-            guard let regression = computeRegression(xs: currentXs, ys: currentYs) else { break }
-
-            // Calculate residuals and standard deviation for current points
-            let residuals = zip(currentXs, currentYs).map { x, y in
-                y - (regression.slope * x + regression.intercept)
-            }
-            let meanResidual = residuals.reduce(0, +) / Double(residuals.count)
-            let variance = residuals.map { pow($0 - meanResidual, 2) }.reduce(0, +) / Double(residuals.count)
-            let stdDev = sqrt(variance)
-
-            // Calculate predicted value and residual for candidate
-            let predictedY = regression.slope * candidate.x + regression.intercept
-            let candidateResidual = candidate.y - predictedY
-
-            // Check if candidate is within 3σ (use max of stdDev and 1.0 to handle low-variance cases)
-            let threshold = max(stdDev, 1.0) * 3.0
-            if abs(candidateResidual) <= threshold {
-                // Point is consistent with the trend, include it
-                includedIndices.append(i)
-            } else {
-                // Point is an outlier, stop adding more
-                break
-            }
-        }
-
-        guard includedIndices.count >= 2 else { return nil }
-
-        // Final regression on all included points
-        let finalXs = includedIndices.map { allXY[$0].x }
-        let finalYs = includedIndices.map { allXY[$0].y }
-
-        guard let finalRegression = computeRegression(xs: finalXs, ys: finalYs) else { return nil }
-
-        // Calculate R-squared
-        let meanY = finalYs.reduce(0, +) / Double(finalYs.count)
-        let ssTotal = finalYs.map { pow($0 - meanY, 2) }.reduce(0, +)
-        let ssResidual = zip(finalXs, finalYs).map { x, y in
-            pow(y - (finalRegression.slope * x + finalRegression.intercept), 2)
-        }.reduce(0, +)
-        let r2 = ssTotal > 0 ? 1 - ssResidual / ssTotal : 0
-
-        return LinearFit(slope: finalRegression.slope, intercept: finalRegression.intercept, r2: r2)
-    }
-
-    /// Estimate time until a usage metric reaches 100%
-    func estimateTimeToLimit(points: [(Date, Double)], limitName: String) -> (minutes: Double, limitType: String)? {
-        guard let fit = fitLinearModel(points: points) else { return nil }
-
-        // Need positive slope (increasing usage) to estimate exhaustion
-        guard fit.slope > 0.001 else { return nil }  // At least 0.001% per minute
-
-        // Get current percent (last point)
-        guard let currentPercent = points.last?.1 else { return nil }
-
-        // Time to reach 100%
-        let remaining = 100.0 - currentPercent
-        guard remaining > 0 else { return (0, limitName) }
-
-        let minutesToExhaust = remaining / fit.slope
-        return (minutesToExhaust, limitName)
     }
 
     /// Discards a projection whose exhaustion instant lands at or after the
@@ -1035,22 +1123,8 @@ struct UsageChartWindow: View {
             return nil
         }
 
-        // Build session and weekly data point arrays
-        var sessionPoints: [(Date, Double)] = []
-        var weeklyPoints: [(Date, Double)] = []
-
-        for point in fullDataPoints {
-            if let session = point.sessionPercent {
-                sessionPoints.append((point.timestamp, session))
-            }
-            if let weekly = point.weeklyAllPercent {
-                weeklyPoints.append((point.timestamp, weekly))
-            }
-        }
-
-        // Estimate time for each limit type
-        var sessionEstimate = estimateTimeToLimit(points: sessionPoints, limitName: "session limits")
-        var weeklyEstimate = estimateTimeToLimit(points: weeklyPoints, limitName: "weekly limits")
+        var sessionEstimate = history.sessionEstimate
+        var weeklyEstimate = history.weeklyEstimate
 
         // Discard any estimate whose projected exhaustion instant lands at or
         // after its own window's reset (#221) — an impossible projection
@@ -1309,11 +1383,17 @@ struct UsageConsumedBox: View {
 // actions and view bodies, which always run on the main thread — @MainActor
 // isolation matches actual usage rather than papering over it.
 @MainActor
-enum ChartWindowController {
-    static var windows: [String: NSWindow] = [:]
+final class ChartWindowController: NSObject, NSWindowDelegate {
+    private static let shared = ChartWindowController()
+    enum WindowKey: Hashable {
+        case account(String)
+        case total(AccountProvider)
+    }
+
+    private(set) static var windows: [WindowKey: NSWindow] = [:]
 
     // Colors for other accounts
-    static let otherAccountColors: [Color] = [
+    nonisolated static let otherAccountColors: [Color] = [
         .orange, .green, .purple, .pink, .cyan, .yellow, .mint, .indigo
     ]
 
@@ -1322,113 +1402,46 @@ enum ChartWindowController {
     // positionally by sorted `limit_name` (not by hashing the name into this
     // array), so a renamed model gets whatever slot its new name sorts into —
     // never silently inheriting another model's prior color out of coincidence.
-    static let namedLimitColors: [Color] = [
+    nonisolated static let namedLimitColors: [Color] = [
         .teal, .brown, .indigo, .pink, .mint, .orange, .purple, .cyan
     ]
 
     static func showChart(for account: Account, store: UsageStore, oauthPoller: OAuthPoller? = nil) {
-        // Close existing window for this account if open
-        if let existing = windows[account.id] {
-            existing.close()
-            windows.removeValue(forKey: account.id)
-        }
+        let chartView = ChartHistoryLoader(account: account, accounts: store.accounts,
+                                           store: store, oauthPoller: oauthPoller)
+        present(chartView, key: .account(account.id), title: "Usage History - \(account.displayName)",
+                size: NSSize(width: 620, height: 610))
+    }
 
-        let dataPoints = store.loadHistory(for: account.id)
-        let fullDataPoints = store.loadFullHistory(for: account.id)
+    static func showTotal(for provider: AccountProvider, store: UsageStore) {
+        let chart = ProviderHistoryChart(provider: provider, store: store)
+        present(chart, key: .total(provider), title: "Usage History - \(provider.displayName) total",
+                size: NSSize(width: 660, height: 520))
+    }
 
-        // #201: `loadTokenHistory` reads only rows attributed to this
-        // account (`token_sessions.override_account_id`/`inferred_account_id`),
-        // which is NULL for every row #197's transcript importer writes —
-        // there is no external session_id -> account_id mapping in this repo
-        // yet (rjwalters/loom#8059). Rather than render an empty chart
-        // identically to a host with zero ingested tokens, fall back to an
-        // explicitly-labeled host-wide total when this account has nothing
-        // attributed but the host has ingested data somewhere.
-        var tokenDataPoints = store.loadTokenHistory(for: account.id)
-        var tokenDataIsHostTotal = false
-        if tokenDataPoints.isEmpty && store.hasAnyTokenUsageData() {
-            tokenDataPoints = store.loadHostTotalTokenHistory()
-            tokenDataIsHostTotal = true
-        }
-
-        // #199: the per-day tokens-per-point series. Independent of the
-        // token-history fallback above — it is read from
-        // `quota_calibration_daily`, which `QuotaCalibration.recompute`
-        // already scopes per account (falling back to the pool row), so it
-        // needs no host-total substitution of its own.
-        let calibrationDataPoints = store.loadCalibrationHistory(for: account.id)
-
-        // Named per-model sub-limits (OpenAI additional_rate_limits[]), one
-        // series per provider-chosen limit_name. Empty for Anthropic accounts
-        // and for any account with none recorded — the chart hides the
-        // overlay entirely in that case.
-        let namedLimitHistory = store.loadNamedLimitHistory(for: account.id)
-        let namedLimitTraces: [NamedLimitTrace] = namedLimitHistory.keys.sorted().enumerated().compactMap {
-            index, limitName in
-            guard let points = namedLimitHistory[limitName], !points.isEmpty else { return nil }
-            let colorIndex = index % namedLimitColors.count
-            return NamedLimitTrace(
-                id: limitName,
-                name: limitName,
-                dataPoints: points.sorted { $0.timestamp < $1.timestamp },
-                color: namedLimitColors[colorIndex]
-            )
-        }
-
-        // Load data for other accounts
-        var otherAccountsData: [AccountTrace] = []
-        var otherTokenData: [TokenTrace] = []
-        for (index, otherAccount) in store.accounts.enumerated() {
-            if otherAccount.id != account.id {
-                let otherData = store.loadHistory(for: otherAccount.id)
-                let otherTokens = store.loadTokenHistory(for: otherAccount.id)
-                let colorIndex = index % otherAccountColors.count
-                if !otherData.isEmpty {
-                    otherAccountsData.append(AccountTrace(
-                        id: otherAccount.id,
-                        name: otherAccount.displayName,
-                        dataPoints: otherData,
-                        color: otherAccountColors[colorIndex],
-                        isPrimary: false
-                    ))
-                }
-                if !otherTokens.isEmpty {
-                    otherTokenData.append(TokenTrace(
-                        id: otherAccount.id,
-                        name: otherAccount.displayName,
-                        dataPoints: otherTokens,
-                        color: otherAccountColors[colorIndex],
-                        isPrimary: false
-                    ))
-                }
-            }
-        }
-
-        let chartView = UsageChartWindow(
-            account: account,
-            dataPoints: dataPoints,
-            fullDataPoints: fullDataPoints,
-            tokenDataPoints: tokenDataPoints,
-            tokenDataIsHostTotal: tokenDataIsHostTotal,
-            calibrationDataPoints: calibrationDataPoints,
-            store: store,
-            oauthPoller: oauthPoller,
-            otherAccountsData: otherAccountsData,
-            otherTokenData: otherTokenData,
-            namedLimitTraces: namedLimitTraces
-        )
-        let hostingController = NSHostingController(rootView: chartView)
+    private static func present<Content: View>(_ content: Content, key: WindowKey, title: String, size: NSSize) {
+        windows[key]?.close()
+        let hostingController = NSHostingController(rootView: content)
 
         let window = NSWindow(contentViewController: hostingController)
-        window.title = "Usage History - \(account.displayName)"
+        window.title = title
         window.styleMask = [.titled, .closable, .resizable]
-        window.setContentSize(NSSize(width: 620, height: 610))
+        window.setContentSize(size)
         window.center()
 
-        windows[account.id] = window
+        window.isReleasedWhenClosed = false
+        window.delegate = shared
+        windows[key] = window
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              let entry = Self.windows.first(where: { $0.value === window }) else { return }
+        Self.windows.removeValue(forKey: entry.key)
+        window.contentViewController = nil
     }
 }
 

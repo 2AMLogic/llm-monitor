@@ -7,7 +7,7 @@ private let flog = FileLogger.shared
 private let fcat = "API"
 
 // Auto-updated by build script from installed claude-code version
-private let claudeCodeUserAgent = "claude-code/2.1.233"
+private let claudeCodeUserAgent = "claude-code/2.1.330"
 
 // MARK: - Ping Response (parsed from rate-limit headers)
 

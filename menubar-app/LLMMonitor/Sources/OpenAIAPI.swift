@@ -746,11 +746,11 @@ enum CodexAuth {
     /// created but not logged into. This returns nil for every "can't tell"
     /// case instead, so registration can fall back to matching on email.
     static func accountId(inHome home: String?) -> String? {
-        let path = authPath(inHome: home)
-        guard let data = FileManager.default.contents(atPath: path),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tokens = root["tokens"] as? [String: Any],
-              let id = (tokens["account_id"] as? String)?
+        accountId(in: authTokens(inHome: home))
+    }
+
+    private static func accountId(in tokens: [String: Any]?) -> String? {
+        guard let id = (tokens?["account_id"] as? String)?
                   .trimmingCharacters(in: .whitespacesAndNewlines),
               !id.isEmpty else { return nil }
         return id
@@ -764,11 +764,23 @@ enum CodexAuth {
     /// JWT is decoded locally; its signature is irrelevant here because the
     /// claim only names a row and authenticates nothing.
     static func email(inHome home: String?) -> String? {
-        let path = authPath(inHome: home)
-        guard let data = FileManager.default.contents(atPath: path),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tokens = root["tokens"] as? [String: Any],
-              let idToken = tokens["id_token"] as? String else { return nil }
+        email(in: authTokens(inHome: home))
+    }
+
+    /// Take both identity fields from one file read, even if a login replaces auth.json.
+    static func profileIdentity(inHome home: String) -> (accountId: String?, email: String?) {
+        let tokens = authTokens(inHome: home)
+        return (accountId(in: tokens), email(in: tokens))
+    }
+
+    private static func authTokens(inHome home: String?) -> [String: Any]? {
+        guard let data = FileManager.default.contents(atPath: authPath(inHome: home)),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return root["tokens"] as? [String: Any]
+    }
+
+    private static func email(in tokens: [String: Any]?) -> String? {
+        guard let idToken = tokens?["id_token"] as? String else { return nil }
         let parts = idToken.split(separator: ".")
         guard parts.count >= 2 else { return nil }
         var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+")

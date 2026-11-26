@@ -25,7 +25,13 @@ OAuth tokens you provide, and renders the data locally on your Mac.
   90%, red above 95%.
 - **Summary table popover.** All accounts at a glance: session %, weekly %,
   reset times, data freshness, token health, and a one-click chart launcher
-  per row.
+  per row. Each provider tab has a **Total** row pinned beneath
+  the sortable accounts. Its headroom is the sum of the displayed scores.
+  Its chart shows cumulative weekly quota consumed across those accounts over
+  the last seven days (100 points per full weekly allowance), alongside hourly
+  billable tokens. Resets preserve the running total. Token
+  records use their mapped account’s provider when available, then a
+  recognizable model family.
 - **Headroom score** (0–100). A single number — `100 − max(session %,
   weekly %)` — answering "which account should I be using". Default sort.
 - **Click any column header to sort.** Account, Headroom, percents, reset
@@ -162,28 +168,144 @@ creates the placeholder if it isn't there and does nothing at all if it is
 (including after the identity has actually been provisioned), so it is safe to
 keep in a shared master list across the whole fleet.
 
-### Loom Codex Profiles (read-only)
+### Loom Codex Profiles
 
 If this host runs Loom, every profile in `~/.loom/codex-profiles/<name>`
 (or `$LOOM_CODEX_PROFILE_ROOT`) appears automatically as an OpenAI account.
 There is nothing to register.
 
-These homes belong to Loom's session containers, which serialize OpenAI's
-rotating refresh token. So llm-monitor **never runs `codex` against them and
-never reads their credentials**. It reads only the rate-limit snapshot Codex
-records in each profile's `sessions/**/rollout-*.jsonl` during normal use.
+Loom owns these profiles and manages their rotating credentials. LLM Monitor
+reads the rate-limit snapshot Codex records in `sessions/**/rollout-*.jsonl`
+and a live reading from `loom-daemon accounts check --live`. For a
+session-managed profile, Loom takes that live reading inside the account’s
+Docker container. If you enable quota containers, LLM Monitor can also read
+quota for profiles that have no Loom session container. The newest usable
+observation wins.
 
 Snapshots have trade-offs:
 
-- **A reading is only as fresh as the account's last Codex turn.** It is
-  stamped with when Codex recorded it, so an idle profile shows as stale
-  rather than current.
+- **A rollout snapshot is as fresh as the last Codex turn.** An idle
+  profile can still have a current reading from a successful live check.
 - **Expired windows are dropped.** Once a window's reset time has passed, the
   reading shows as unknown rather than as its old percentage.
 - **Registration is refused.** `codex add --home` rejects a profile path; a
   profile needs no registration.
 
 `llm-monitor codex list` shows each profile's latest snapshot and its age.
+
+#### Optional quota containers
+
+Set `LLM_MONITOR_CODEX_QUOTA_CONTAINER=1` in LLM Monitor's environment to
+enable this fallback. It is off by default. On a host that uses Loom without
+session containers, a profile's rollout snapshot can go stale while it is idle.
+With the fallback enabled, LLM Monitor keeps one small quota container for
+each logged-in profile whose Loom session container is absent.
+
+```bash
+docker run -d --init --restart unless-stopped \
+  --name llm-monitor-codex-quota-<profile> \
+  --label "llm-monitor.quota-owner=$(cat ~/.llm-monitor/codex-quota-owner)" \
+  --label "llm-monitor.codex-home=$HOME/.loom/codex-profiles/<profile>" \
+  --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
+  --read-only --tmpfs /tmp -e HOME=/tmp -e CODEX_HOME=/codex-home \
+  -v ~/.loom/codex-profiles/<profile>:/codex-home \
+  llm-monitor-codex-quota:<codex version> sleep infinity
+```
+
+The container only idles (a few MB of memory) and comes back by itself after
+a reboot. On the 10-minute usage cadence the app runs
+`docker exec -i <id> codex -s read-only -a never app-server` in it, asks for
+the account's rate limits over stdio, and `codex` exits. Each cycle the app
+manages containers bearing its installation ID, quota name prefix and home label.
+The ID is generated on first use and saved beside `usage.db` in `codex-quota-owner`.
+When copying a data directory for a second installation, omit the ID file so
+the copy gets its own ID. The monitor starts stopped containers, replaces ones
+whose image or mount has changed, and removes ones whose profiles are gone.
+If another installation or an older container without an owner ID holds the
+name, the profile uses the other quota sources. To retire an older container, verify its profile mount and owner
+manually before removing it by ID.
+
+- **It needs Docker** (or a compatible CLI named `docker`) reachable by the
+  app. `LLM_MONITOR_DOCKER_BIN` names a nonstandard binary. Without one the
+  feature is silently off.
+- **The image is built automatically** the first time it is missing: Alpine,
+  CA certificates and the static Codex release binary, nothing else. The
+  first build downloads the Codex release from GitHub. Set
+  `LLM_MONITOR_CODEX_QUOTA_IMAGE` to run an image of your own that has
+  `codex` on its `PATH`; that image is never built by the app.
+- **A Loom session reserves its profile even while stopped.** If
+  `docker ps -a` lists either `loom-codex-session-<profile>` or the container
+  named in the profile’s `.session-managed.json`, LLM Monitor leaves that
+  profile and its quota container alone. The app checks both names again
+  immediately before each probe. If the listing fails or an existing marker
+  cannot be read, the probe is skipped. If two registered homes map to the
+  same quota container name, both use the other quota sources and the shared
+  container is left alone.
+- **The whole profile directory is mounted read-write, on purpose.** Codex
+  saves a refreshed login by renaming a new `auth.json` into place under a
+  lock file in the same directory. Mounting only `auth.json` would make that
+  save fail after the refresh token had already been rotated. LLM Monitor
+  reads the account ID from `auth.json` to identify the login. Only containerized
+  Codex uses the login tokens on this path. The monitor checks the login and
+  reported identity before writing quota or plan, and drops windows whose
+  reset time has passed, including when it reuses a cached observation. Codex
+  also updates its own state files in the profile while it runs.
+- To disable the fallback, unset `LLM_MONITOR_CODEX_QUOTA_CONTAINER` and
+  restart LLM Monitor. Existing quota containers stay in place. To remove them by ID, run
+
+  ```sh
+  owner=$(cat ~/.llm-monitor/codex-quota-owner) && [ -n "$owner" ] &&
+    docker ps -a --no-trunc --filter 'name=^/llm-monitor-codex-quota-' \
+      --filter "label=llm-monitor.quota-owner=$owner" \
+      --format '{{if .Label "llm-monitor.codex-home"}}{{.ID}}{{end}}' |
+    while read -r id; do
+      [ -z "$id" ] || docker rm -f "$id"
+    done
+  ```
+
+`debug.log` reports how many profiles were measured, and names (never paths)
+for any profile that could not be.
+
+#### Docker setup for live Codex quota
+
+Run the following on the same host and as the same user that runs LLM Monitor.
+On macOS, start Docker Desktop (or your Docker-compatible runtime). From the
+repository you want the session to use, check the Docker server and Loom’s
+machine-level account registry.
+
+```bash
+docker info --format '{{.ServerVersion}}'
+registry="${LOOM_SHARED_ACCOUNTS_ROOT:-$HOME}"
+loom-daemon accounts list --provider codex --workspace "$registry"
+```
+
+Choose the short name of an existing Codex profile. For a new account, run
+`loom-daemon accounts add codex NAME --device-auth --workspace "$registry"`
+and finish the login. Start the owning session and verify its quota report.
+Replace `my-codex` with the profile name.
+
+```bash
+profile=my-codex
+loom-daemon accounts session start "$profile" --workspace "$registry" --mount-workspace "$PWD"
+loom-daemon accounts session status "$profile" --workspace "$registry"
+loom-daemon accounts check --provider codex --live --json --workspace "$registry"
+```
+
+A numeric `7d_utilization` or `5h_utilization` means Loom measured that
+window. A value of `0` is a valid reading. For `session_unavailable`, check
+that Docker is reachable and the named session is running. For
+`not_logged_in`, reauthenticate the profile with Loom. If the shell check
+works but the menu bar stays stale, verify that the launched app can find
+`loom-daemon` and that its child process can find the Docker CLI. A
+Finder-launched app can have a different `PATH` from your terminal. The app
+accepts `LLM_MONITOR_LOOM_DAEMON_BIN` for a nonstandard Loom install.
+To test the shell environment on macOS, quit the menu bar app, run
+`/Applications/LLMMonitor.app/Contents/MacOS/LLMMonitor` from the terminal
+where the check succeeded, and compare freshness after the next poll.
+
+The live check supplies **quota utilization and reset times**. The hourly
+token plot uses counters from the transcript importer. A successful live
+check can therefore populate the quota chart while token history stays empty.
 
 ### Adding an OpenAI (Codex) Account
 

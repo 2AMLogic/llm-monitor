@@ -59,6 +59,9 @@ enum SelfTest {
         ("LoomDaemonBinaryAndWorkspaceResolution", { testLoomDaemonBinaryAndWorkspaceResolution() }),
         ("LoomLiveCheckSpawnAgainstStub", { testLoomLiveCheckSpawnAgainstStub() }),
         ("LoomLiveReadingPreferredOnlyWhenNewer", { testLoomLiveReadingPreferredOnlyWhenNewer() }),
+        ("CodexQuotaContainerRules", { testCodexQuotaContainerRules() }),
+        ("CodexQuotaContainerFirstLogin", { testCodexQuotaContainerFirstLogin() }),
+        ("CodexQuotaContainerProbeAgainstStub", { testCodexQuotaContainerProbeAgainstStub() }),
         ("ClaudeTokenFileScanning", { testClaudeTokenFileScanning() }),
         ("ClaudeTokenTargetAndAccountsEnv", { testClaudeTokenTargetAndAccountsEnv() }),
         ("ClaudeAccountRekey", { testClaudeAccountRekey() }),
@@ -101,6 +104,7 @@ enum SelfTest {
         ("HistoryDecimationKeepsFirstLastAndBigJumps", { testHistoryDecimationKeepsFirstLastAndBigJumps() }),
         ("FullHistoryDecimationMatchesLoadHistory", { testFullHistoryDecimationMatchesLoadHistory() }),
         ("FullHistoryDecimationAlwaysKeepsNilWeeklyPercent", { testFullHistoryDecimationAlwaysKeepsNilWeeklyPercent() }),
+        ("ProviderTotals", { testProviderTotals() }),
         ("HistoryCutoffExcludesOlderRows", { testHistoryCutoffExcludesOlderRows() }),
         ("TokenHistoryRoundTripAndCutoff", { testTokenHistoryRoundTripAndCutoff() }),
         ("UnattributedTokenDataFallsBackToHostTotal", { testUnattributedTokenDataFallsBackToHostTotal() }),
@@ -2185,12 +2189,26 @@ enum SelfTest {
                 )
             }
 
+            func quota(at observedAt: Date, weekly: Double, accountId: String = "acct-agent-1",
+                       email: String? = nil, reset: Date = Date().addingTimeInterval(3 * 86400),
+                       plan: String = "promax") -> CodexQuotaContainer.Reading {
+                CodexQuotaContainer.Reading(
+                    observedAt: observedAt, accountId: accountId, email: email,
+                    rateLimit: RateLimitSnapshot(weekly: RateLimitWindow(
+                        kind: .weekly, usedPercent: weekly,
+                        resetAt: reset, status: "allowed")),
+                    plan: plan)
+            }
+            let profileHome = credential()?.codexHome ?? home
+            let expired = quota(at: Date(), weekly: 21, reset: Date().addingTimeInterval(-3600), plan: "expired")
+            poller.setCodexQuotaContainerReading(expired, home: profileHome)
+
             // 1. A live reading OLDER than the rollout snapshot must not win.
             poller.setLoomCodexLiveReadings(
                 ["agent-1": reading(at: snapshotAt.addingTimeInterval(-3600), weekly: 5)])
             if let credential = credential() { poller.pollCodexSnapshot(credential) }
             expectEqual(weeklyRows().last?.1, 43,
-                        "an older live reading never overwrites the newer rollout snapshot")
+                        "the valid rollout wins over the older live reading and the all-expired container result")
             expectEqual(weeklyRows().last?.0, snapshotISO, "…and the row keeps the snapshot's own timestamp")
 
             // 2. A newer live reading wins, and carries its own observation time.
@@ -2219,6 +2237,493 @@ enum SelfTest {
             expectEqual(try! openDatabase(dbPath).scalar(
                 "SELECT COUNT(*) FROM oauth_credentials WHERE account_id = 'acct-agent-1' AND last_error IS NOT NULL") as? Int64,
                 0, "the fallback path is a normal successful poll, not an error state")
+
+            // 5. This app's own quota container is a third source under the
+            //    same rule: older never wins, newer does, with its own time.
+            let reset = Date().addingTimeInterval(60)
+            var mixed = quota(at: Date(), weekly: 21, reset: reset)
+            let session = RateLimitWindow(kind: .session, usedPercent: 5)
+            mixed.rateLimit.session = session
+            mixed.rateLimit.named = ["old": mixed.rateLimit.weekly!, "current": session]
+            poller.setCodexQuotaContainerReading(mixed, home: profileHome)
+            let atReset = poller.codexQuotaContainerReading(home: profileHome, now: reset)
+            expectEqual(atReset?.rateLimit.session, session, "a window without a reset remains usable")
+            expect(atReset?.rateLimit.weekly == nil && atReset?.rateLimit.named == ["current": session],
+                   "a cached reading drops each weekly and named window at its reset")
+            poller.setLoomCodexLiveReadings(["agent-1": reading(at: liveAt, weekly: 61)])
+            poller.setCodexQuotaContainerReading(quota(at: liveAt.addingTimeInterval(-60), weekly: 9), home: profileHome)
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(weeklyRows().last?.1, 61, "an older quota-container reading never displaces a newer one")
+            let quotaAt = liveAt.addingTimeInterval(1800)
+            poller.setCodexQuotaContainerReading(quota(at: quotaAt, weekly: 88), home: profileHome)
+            poller.setCodexQuotaContainerReading(quota(at: quotaAt, weekly: 21), home: "/p/\u{e9}")
+            expect(poller.codexQuotaContainerReading(home: "/p/e\u{301}") == nil,
+                   "a byte-distinct home cannot inherit another home's cached reading")
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(weeklyRows().last?.1, 88, "the newest of the three sources is the quota container")
+            expectEqual(weeklyRows().last?.0, ISO8601DateFormatter().string(from: quotaAt),
+                        "…and the row carries the container probe's own timestamp")
+            expectEqual(try! openDatabase(dbPath).scalar(
+                "SELECT plan FROM accounts WHERE id = 'acct-agent-1'") as? String,
+                "promax", "the container reading supplies the plan the live check cannot")
+
+            let rowsBeforeLogin = weeklyRows().count
+            let authURL = URL(fileURLWithPath: home).appendingPathComponent("auth.json")
+            try! Data(#"{"tokens":{"account_id":"acct-agent-2"}}"#.utf8).write(to: authURL)
+            poller.setCodexQuotaContainerReading(quota(at: quotaAt.addingTimeInterval(60), weekly: 79),
+                                                 home: profileHome)
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(weeklyRows().count, rowsBeforeLogin,
+                        "a re-login invalidates the previous login's cached observation")
+            let next = quota(at: Date(), weekly: 83, accountId: "acct-agent-2",
+                             email: "b@example.com", plan: "business")
+            poller.setCodexQuotaContainerReading(next, home: profileHome)
+            poller.setLoomCodexLiveReadings(["agent-1": reading(at: Date(), weekly: 74)])
+            if let credential = credential() { poller.pollCodexSnapshot(credential) }
+            expectEqual(weeklyRows().count, rowsBeforeLogin, "account B's quota never enters account A's history")
+            expectEqual(weeklyRows().last?.1, 88, "account A retains its own quota after re-login")
+            expectEqual(try! openDatabase(dbPath).scalar(
+                "SELECT plan FROM accounts WHERE id = 'acct-agent-1'") as? String,
+                "promax", "account B's plan never replaces account A's plan")
+            expectEqual(OAuthPoller.compareProfileIdentity(storedID: "acct-agent-2", storedEmail: "a@example.com",
+                                                          loginID: next.accountId, email: next.email),
+                        .conflict(reported: "b@example.com"), "a contradictory handshake email disqualifies a reading")
+            expect(OAuthPoller.compareProfileIdentity(storedID: "user-legacy", storedEmail: "B@example.com",
+                                                      loginID: next.accountId, email: next.email) == .match
+                   && OAuthPoller.compareProfileIdentity(storedID: "user-legacy", storedEmail: nil,
+                                                         loginID: next.accountId, email: next.email) == .indeterminate,
+                   "a legacy registration requires matching email when IDs are incomparable")
+        }
+    }
+
+    // MARK: - Codex quota containers
+
+    private static func testCodexQuotaContainerFirstLogin() {
+        do {
+            try withSelfTestTempDir("quota-first-login") { dir in
+                let root = dir.appendingPathComponent("profiles")
+                let home = root.appendingPathComponent("late")
+                try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let db = try openDatabase(dbPath)
+                let poller = OAuthPoller(dbPath: dbPath)
+                expectEqual(poller.syncCodexProfiles(root: root.path), 1, "the empty profile registers")
+                guard let placeholder = poller.loadActiveCredentials().first,
+                      let rowID = placeholder.accountId else {
+                    expect(false, "the empty profile has a credential")
+                    return
+                }
+                poller.pollCodexSnapshot(placeholder)
+
+                func login(_ id: String, email: String) throws {
+                    let claims = try JSONSerialization.data(withJSONObject: ["email": email]).base64EncodedString()
+                    let auth = try JSONSerialization.data(withJSONObject: [
+                        "tokens": ["account_id": id, "id_token": "e30.\(claims).sig"]
+                    ])
+                    try auth.write(to: home.appendingPathComponent("auth.json"), options: .atomic)
+                }
+                var observedAt = Date().addingTimeInterval(-3600)
+                @MainActor func poll(_ poller: OAuthPoller, id: String, email: String, weekly: Double, plan: String) {
+                    guard let credential = poller.loadActiveCredentials().first, let path = credential.codexHome else {
+                        expect(false, "the snapshot registration survives restart")
+                        return
+                    }
+                    observedAt.addTimeInterval(60)
+                    poller.setCodexQuotaContainerReading(.init(
+                        observedAt: observedAt, accountId: id, email: email,
+                        rateLimit: RateLimitSnapshot(weekly: RateLimitWindow(kind: .weekly, usedPercent: weekly)),
+                        plan: plan), home: path)
+                    poller.pollCodexSnapshot(credential)
+                }
+                func history() throws -> [Double] {
+                    try db.prepare("""
+                        SELECT weekly_all_percent FROM usage_history
+                        WHERE account_id = ? AND is_synthetic = 0 ORDER BY rowid
+                        """).bind(rowID).compactMap { $0[0] as? Double }
+                }
+                try login("acct-unverified", email: "other@example.com")
+                poll(poller, id: "acct-unverified", email: "mismatch@example.com", weekly: 90, plan: "team")
+                expectEqual(try history(), [], "a conflicting handshake cannot establish the first login")
+
+                let email = "first@example.com"
+                try login("acct-first", email: email)
+                poll(poller, id: "acct-first", email: email, weekly: 78, plan: "pro")
+                expectEqual(try history(), [78], "the first verified login writes quota to the existing profile")
+                expectEqual(try db.scalar("SELECT email FROM accounts WHERE id = ?", rowID) as? String,
+                            email, "the verified email is saved on the profile")
+                expectEqual(try db.scalar("SELECT plan FROM accounts WHERE id = ?", rowID) as? String,
+                            "pro", "the first verified login writes the plan")
+
+                // A different workspace can use the same email. Only the native ID distinguishes it.
+                try login("acct-second", email: email)
+                let restarted = OAuthPoller(dbPath: dbPath)
+                expectEqual(restarted.syncCodexProfiles(root: root.path), 0, "rediscovery reuses the registration")
+                poll(restarted, id: "acct-second", email: email, weekly: 12, plan: "business")
+                expectEqual(try history(), [78], "a conflicting login cannot append to the first login's history")
+                expectEqual(try db.scalar("SELECT plan FROM accounts WHERE id = ?", rowID) as? String,
+                            "pro", "the first login's plan survives restart and re-login")
+                try login("acct-first", email: email)
+                poll(restarted, id: "acct-first", email: email, weekly: 79, plan: "pro")
+                expectEqual(try history(), [78, 79], "restoring the first login resumes its original history")
+            }
+        } catch {
+            expect(false, "first-login fixture failed: \(error)")
+        }
+    }
+
+    /// The pure rules: which profiles are probed, what the container is
+    /// called, and exactly what it is given.
+    private static func testCodexQuotaContainerRules() {
+        expectEqual(CodexQuotaContainer.containerName(profile: "agent-1"), "llm-monitor-codex-quota-agent-1",
+                    "a profile names its own container")
+        expectEqual(CodexQuotaContainer.containerName(profile: "a b/c"), "llm-monitor-codex-quota-a-b-c",
+                    "characters a container name cannot carry are replaced")
+        expectEqual(CodexQuotaContainer.containerName(profile: "…"), nil,
+                    "a profile with nothing nameable is skipped rather than given an invalid name")
+
+        let installation = CodexQuotaContainer(ownerID: UUID())
+        let owner = installation.ownerID.uuidString
+        let homes = ["/p/agent-1", "/p/agent-2", "/p/agent-3"]
+
+        let name = "llm-monitor-codex-quota-agent-1"
+        let args = installation.createArguments(
+            name: name, home: "/p/agent-1", image: "img:1", uid: 501, gid: 20)
+        expectEqual(Array(args.suffix(3)), ["img:1", "sleep", "infinity"],
+                    "the persistent container idles on sleep and runs nothing else")
+        expect(args.contains("-d") && !args.contains("--rm")
+               && args.contains("unless-stopped"),
+               "the container is detached, kept, and restarted with the runtime")
+        expect(args.contains("--read-only") && args.contains("no-new-privileges"), "it is locked down")
+        expectEqual(args.filter { $0 == "-v" }.count, 1, "exactly one mount: the profile home")
+        expect(args.contains("/p/agent-1:/codex-home") && args.contains("CODEX_HOME=/codex-home"),
+               "the whole home directory is mounted (never auth.json alone) and named as CODEX_HOME")
+        expect(args.contains("llm-monitor.quota-owner=\(owner)"), "a new container identifies its installation")
+        expect(args.contains("501:20"), "it runs as the invoking user")
+        expectEqual(CodexQuotaContainer.execArguments(containerID: "abc123"), ["exec", "-i", "abc123"],
+                    "a reading is an exec in the existing container")
+
+        // Reconcile decisions from one `docker ps -a` read.
+        let listing = [
+            "abc123\t\(name)\trunning\timg:1\t/p/agent-1\t\(owner)",
+            "def456\tllm-monitor-codex-quota-agent-2\texited\timg:1\t/p/agent-2\t\(owner)",
+            "bad654\tllm-monitor-codex-quota-gone\trunning\timg:1\t/p/gone\t\(owner)",
+            "aaa111\tloom-codex-session-agent-2\trunning\tloom:1\t",
+        ].joined(separator: "\n")
+        let listed = CodexQuotaContainer.parseContainerList(listing) ?? [:]
+        expectEqual(listed.count, 4, "every row of the listing is read")
+        expectEqual(listed["loom-codex-session-agent-2"]?.home, "", "a container that is not ours has no home label")
+        expectEqual(installation.action(existing: listed[name], home: "/p/agent-1", image: "img:1"),
+                    .none, "a running container with the right image and mount is left alone")
+        expectEqual(installation.action(
+            existing: listed["llm-monitor-codex-quota-agent-2"], home: "/p/agent-2", image: "img:1"),
+            .start("def456"), "a stopped one is started, not recreated")
+        expectEqual(installation.action(existing: listed[name], home: "/p/agent-1", image: "img:2"),
+                    .replace("abc123"), "a new image (a Codex version bump) replaces the container")
+        expectEqual(installation.action(existing: listed[name], home: "/elsewhere/agent-1", image: "img:1"),
+                    .replace("abc123"), "a moved profile root replaces the container")
+        expectEqual(installation.action(existing: nil, home: "/p/agent-3", image: "img:1"),
+                    .create, "a profile with no container gets one")
+        var checkedHomes: [String] = []
+        let plan = installation.plan(homes: homes, containers: listed) { home in
+            checkedHomes.append(home)
+            return home != "/p/agent-3"
+        }
+        expectEqual(checkedHomes.sorted(), ["/p/agent-1", "/p/agent-3"], "a reserved profile needs no login check")
+        expectEqual(plan.eligibleHomes, ["/p/agent-1"], "only logged-in profiles without a Loom session qualify")
+        expectEqual(plan.orphanIDs, ["bad654"],
+                    "only quota containers for departed profiles are removed")
+
+        let collisions = installation.plan(
+            homes: ["/p/agent-1", "/p/agent 1", "/p/n-\u{e9}", "/p/n-e\u{301}", "/p/unique", "/p/unique"],
+            containers: listed
+        ) { _ in true }
+        expectEqual(collisions.eligibleHomes, ["/p/unique"],
+                    "homes that sanitize to the same name are skipped and a repeated home is probed once")
+        expect(!collisions.orphanIDs.contains("abc123"), "a shared container name is reserved from cleanup")
+
+        expectEqual(CodexQuotaContainer.image(environment: [:]).name, CodexQuotaContainer.builtInImage,
+                    "with no override the built-in image is used")
+        expect(CodexQuotaContainer.image(environment: [:]).isBuiltIn, "…and this app builds it")
+        let override = CodexQuotaContainer.image(environment: ["LLM_MONITOR_CODEX_QUOTA_IMAGE": "reg/x@sha256:ab"])
+        expect(override.name == "reg/x@sha256:ab" && !override.isBuiltIn, "an override image is run as given, never built")
+        expect(CodexQuotaContainer.dockerfile.contains("rust-v${CODEX_VERSION}"),
+               "the built-in image pins the Codex release by build argument")
+
+        for value in ["", "0", "true", "yes", "unexpected"] {
+            expect(!CodexQuotaContainer.isEnabled(environment: ["LLM_MONITOR_CODEX_QUOTA_CONTAINER": value]),
+                   "only the exact opt-in value enables quota containers")
+        }
+        expect(!CodexQuotaContainer.isEnabled(environment: ["CLAUDE_MONITOR_CODEX_QUOTA_CONTAINER": "1"]),
+               "the legacy prefix cannot enable quota containers without the explicit opt-in")
+        expectEqual(CodexQuotaContainer.resolveDocker(
+            environment: ["LLM_MONITOR_DOCKER_BIN": "/nonexistent/docker", "PATH": "/usr/bin"]), nil,
+            "a broken docker override fails rather than falling back to PATH")
+    }
+
+    private final class QuotaProbeBox<T>: @unchecked Sendable { var value: T? }
+
+    /// Bounded wait on a non-throwing async call (one writer before the
+    /// signal, one reader after the wait — as `AsyncOutcomeBox`).
+    private static func blockOnQuotaProbe<T: Sendable>(_ operation: @escaping @Sendable () async -> T) -> T? {
+        let box = QuotaProbeBox<T>()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.value = await operation()
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + 60) == .success else { return nil }
+        return box.value
+    }
+
+    /// Drive the poller against a recording Docker stub, then exercise probe timeout cleanup.
+    private static func testCodexQuotaContainerProbeAgainstStub() {
+        withSelfTestTempDir("quota-container") { dir in
+            do {
+                guard let installation = CodexQuotaContainer.installation(in: dir) else {
+                    expect(false, "the fixture installation gets an owner ID")
+                    return
+                }
+                let owner = installation.ownerID.uuidString
+                let log = dir.appendingPathComponent("docker.log").path
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let profileRoot = dir.appendingPathComponent("profiles")
+                let home = profileRoot.appendingPathComponent("agent-1").path
+                let wedgedHome = dir.appendingPathComponent("agent-2").path
+                for profile in ["agent-1", "reserved-running", "reserved-stopped"] {
+                    let profileDir = profileRoot.appendingPathComponent(profile)
+                    try FileManager.default.createDirectory(at: profileDir, withIntermediateDirectories: true)
+                    try Data(#"{"tokens":{"account_id":"\#(profile)"}}"#.utf8)
+                        .write(to: profileDir.appendingPathComponent("auth.json"))
+                }
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+                expectEqual(poller.syncCodexProfiles(root: profileRoot.path), 3, "all three test profiles register")
+                let listing = dir.appendingPathComponent("listing")
+                let afterCreate = dir.appendingPathComponent("after-create")
+                let afterExec = dir.appendingPathComponent("after-exec")
+                let stoppedHome = profileRoot.appendingPathComponent("reserved-stopped").path
+                let reserved = [
+                    "aaa111\tloom-codex-session-reserved-running\trunning\tloom:1\t",
+                    "aaa222\tloom-codex-session-reserved-stopped\texited\tloom:1\t",
+                    "aaa333\tllm-monitor-codex-quota-reserved-stopped\texited\timg:1\t\(stoppedHome)\t\(owner)",
+                ]
+                let initial = reserved + ["aaa444\tllm-monitor-codex-quota-old\texited\timg:1\t/p/old\t\(owner)"]
+                let provisioned = reserved + ["abc123\tllm-monitor-codex-quota-agent-1\trunning\timg:1\t\(home)\t\(owner)"]
+                func writeListing(_ rows: [String], to file: URL) throws {
+                    try rows.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+                }
+                func onlyListedContainers() throws -> Bool {
+                    let calls = try String(contentsOfFile: log, encoding: .utf8).split(whereSeparator: \.isNewline)
+                    return calls.count == 1 && calls[0].hasPrefix("ps -a ")
+                }
+                try writeListing(initial, to: listing)
+                try writeListing(provisioned, to: afterCreate)
+                let oneLine: (String) -> String = { $0.replacingOccurrences(of: "\n", with: "") }
+                let rateReply = dir.appendingPathComponent("rate-reply")
+                @MainActor func writeRateReply(reset: Date) throws {
+                    let payload = oneLine(codexRateLimitsFixture).replacingOccurrences(
+                        of: "1785967226", with: String(Int(reset.timeIntervalSince1970)))
+                    try Data((#"{"id":3,"result":\#(payload)}"# + "\n").utf8).write(to: rateReply)
+                }
+                try writeRateReply(reset: Date().addingTimeInterval(86400))
+                let stub = try writeStub(in: dir, name: "docker", body: """
+                #!/bin/sh
+                echo "$*" >> '\(log)'
+                case "$1" in
+                  ps)
+                    [ "$2" = "-a" ] || exit 1
+                    cat '\(listing.path)' ;;
+                  rm|start) exit 0 ;;
+                  run) cp '\(afterCreate.path)' '\(listing.path)' && echo abc123 ;;
+                  exec)
+                    if [ -f '\(afterExec.path)' ]; then cp '\(afterExec.path)' '\(listing.path)'; fi
+                    case "$3" in def456) sleep 30; exit 0 ;; abc123) ;; *) exit 1 ;; esac
+                    echo '{"id":1,"result":{"userAgent":"stub"}}'
+                    echo '{"id":2,"result":\(oneLine(codexAccountFixture))}'
+                    cat '\(rateReply.path)'
+                    cat > /dev/null ;;
+                esac
+                """)
+
+                // The synchronous selftest runs on the main actor. Pump its run loop
+                // while the real poller awaits the Docker stub.
+                @MainActor func refresh(environment: [String: String]) -> Int? {
+                    var measured: Int?
+                    let task = Task {
+                        measured = await poller.refreshCodexQuotaContainerReadings(
+                            for: poller.loadActiveCredentials(), force: true, environment: environment)
+                    }
+                    let deadline = Date().addingTimeInterval(30)
+                    while measured == nil && Date() < deadline {
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+                    }
+                    if measured == nil { task.cancel() }
+                    return measured
+                }
+
+                var environment = ["LLM_MONITOR_DOCKER_BIN": stub, "LLM_MONITOR_CODEX_QUOTA_IMAGE": "img:1"]
+                expectEqual(refresh(environment: environment), 0, "an unset opt-in skips the quota poll")
+                expect(!FileManager.default.fileExists(atPath: log),
+                       "without opt-in the poller makes no Docker calls to create or probe containers")
+                environment["LLM_MONITOR_CODEX_QUOTA_CONTAINER"] = "1"
+                expectEqual(refresh(environment: environment), 1, "opt-in measures the profile without a Loom session")
+                let logged = try String(contentsOfFile: log, encoding: .utf8)
+                expect(!logged.contains("reserved-running") && !logged.contains("reserved-stopped") && !logged.contains("aaa333"),
+                       "existing Loom sessions reserve their profiles and their idle quota containers in either state")
+                expect(logged.contains("run -d --init --restart unless-stopped --name llm-monitor-codex-quota-agent-1")
+                       && logged.contains("-v \(home):/codex-home img:1 sleep infinity"),
+                       "the persistent container is created idle over the mounted home")
+                expect(logged.contains("rm -f aaa444"),
+                       "a labeled orphan is removed by its listed ID")
+
+                expectEqual(poller.codexQuotaContainerReading(home: home)?.rateLimit.weekly?.usedPercent, 37,
+                            "a containerized handshake maps exactly like a host one")
+                expect(logged.contains("exec -i abc123 codex -s read-only -a never app-server"),
+                       "a reading is codex app-server exec'd in the profile's own container")
+                expect(!logged.contains("rm -f abc123"),
+                       "a successful probe leaves the persistent container in place")
+
+                let captured = poller.codexQuotaContainerReading(home: home)
+                expectEqual(captured?.accountId, "agent-1", "a probe records the login that supplied its numbers")
+                expectEqual(captured?.email, "fixture@example.com", "a probe retains the handshake identity")
+                try writeRateReply(reset: Date().addingTimeInterval(-3600))
+                expectEqual(refresh(environment: environment), 0, "an all-expired handshake supplies no measurement")
+                try writeRateReply(reset: Date().addingTimeInterval(86400))
+
+                let foreignOrphan = "ddd111\tllm-monitor-codex-quota-diagnostics\trunning\timg:1\t"
+                let foreignOccupant = "ddd222\tllm-monitor-codex-quota-agent-1\trunning\timg:1\t"
+                try writeListing(reserved + [foreignOrphan, foreignOccupant], to: listing)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 0, "an unlabeled occupant keeps its name")
+                expect(try onlyListedContainers(),
+                       "an unlabeled orphan and occupant cause no removals, starts, creates or execs")
+
+                let peerDir = dir.appendingPathComponent("second-monitor")
+                try FileManager.default.createDirectory(at: peerDir, withIntermediateDirectories: true)
+                guard let peer = CodexQuotaContainer.installation(in: peerDir) else {
+                    expect(false, "a second installation gets an owner ID")
+                    return
+                }
+                expect(peer.ownerID != installation.ownerID, "independent data directories have distinct owners")
+                expectEqual(CodexQuotaContainer.installation(in: dir)?.ownerID, installation.ownerID,
+                            "an installation recognizes its own containers after restart")
+                let peerOwner = peer.ownerID.uuidString
+                let peerOrphan = "eee111\tllm-monitor-codex-quota-peer\trunning\timg:1\t/peer/data\t\(peerOwner)"
+                let legacy = "eee333\tllm-monitor-codex-quota-legacy\trunning\timg:1\t/legacy"
+                try writeListing(provisioned + [peerOrphan, legacy], to: listing)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 1, "both installations can keep distinct profiles")
+                let separate = try String(contentsOfFile: log, encoding: .utf8)
+                expect(!separate.contains("rm -f"), "foreign and pre-owner containers survive orphan cleanup")
+                let peerOccupant = "eee222\tllm-monitor-codex-quota-agent-1\texited\timg:old\t/peer/agent-1\t\(peerOwner)"
+                try writeListing(reserved + [peerOccupant], to: listing)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 0, "another installation keeps its colliding name")
+                expect(try onlyListedContainers(), "the collision triggers no removal, start, creation or exec")
+                try writeListing(["eee222\tllm-monitor-codex-quota-agent-1\trunning\timg:1\t\(home)\t\(peerOwner)"], to: listing)
+                try Data().write(to: URL(fileURLWithPath: log))
+                _ = blockOnQuotaProbe { await installation.probe(docker: stub, home: home) }
+                expect(try onlyListedContainers(), "a foreign replacement with the same mount is never probed")
+
+                let outdated = "ddd333\tllm-monitor-codex-quota-agent-1\trunning\timg:old\t\(home)\t\(owner)"
+                try writeListing(reserved + [outdated, foreignOrphan], to: listing)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 1, "a labeled, outdated quota container is replaced")
+                let removals = try String(contentsOfFile: log, encoding: .utf8)
+                    .split(whereSeparator: \.isNewline).filter { $0.hasPrefix("rm ") }
+                expectEqual(removals, ["rm -f ddd333"], "only the verified ID is removed during replacement")
+
+                let marker = URL(fileURLWithPath: home).appendingPathComponent(".session-managed.json")
+                try Data("{}".utf8).write(to: marker)
+                try writeListing(reserved, to: listing)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 0, "a marker without an owner skips the profile")
+                expect(try onlyListedContainers(), "unknown ownership prevents mutations")
+                try Data(#"{"schema_version":1,"container_name":"loom-codex-session-work","adopted_at_unix":1}"#.utf8)
+                    .write(to: marker)
+                for state in ["running", "exited"] {
+                    let owner = "bbb111\tloom-codex-session-work\t\(state)\tloom:1\t"
+                    try writeListing(reserved + [owner], to: listing)
+                    try Data().write(to: URL(fileURLWithPath: log))
+                    expectEqual(refresh(environment: environment), 0, "a registry alias reserves its profile when \(state)")
+                    expect(try onlyListedContainers(),
+                           "an aliased owner prevents both quota creation and exec when \(state)")
+                }
+
+                // A stopped Loom session appears during docker run, after the initial plan.
+                try writeListing(initial, to: listing)
+                try writeListing(provisioned + ["bbb111\tloom-codex-session-agent-1\texited\tloom:1\t"], to: afterCreate)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 0, "a Loom reservation during provisioning skips the probe")
+                let raced = try String(contentsOfFile: log, encoding: .utf8)
+                expect(raced.contains("run -d") && !raced.contains("exec -i"),
+                       "the quota container was created but no exec followed the new reservation")
+
+                let secondRoot = dir.appendingPathComponent("other-profiles")
+                let secondHome = secondRoot.appendingPathComponent("agent-1")
+                try FileManager.default.createDirectory(at: secondHome, withIntermediateDirectories: true)
+                try Data(#"{"tokens":{"account_id":"another-account"}}"#.utf8)
+                    .write(to: secondHome.appendingPathComponent("auth.json"))
+                expectEqual(poller.syncCodexProfiles(root: secondRoot.path), 1, "a distinct account registers the same basename")
+                try writeListing(provisioned, to: listing)
+                try Data().write(to: URL(fileURLWithPath: log))
+                expectEqual(refresh(environment: environment), 0, "neither active home can use the shared container name")
+                expect(try onlyListedContainers(),
+                       "ambiguous homes cause no Docker mutations or execs")
+
+                // Reserve the next batch's profile during the first batch's exec.
+                try FileManager.default.createDirectory(atPath: wedgedHome, withIntermediateDirectories: true)
+                try Data(#"{"tokens":{"account_id":"wedged"}}"#.utf8)
+                    .write(to: URL(fileURLWithPath: wedgedHome).appendingPathComponent("auth.json"))
+                let bothReady = provisioned + ["def456\tllm-monitor-codex-quota-agent-2\trunning\timg:1\t\(wedgedHome)\t\(owner)"]
+                try writeListing(bothReady, to: listing)
+                let batchMarker = URL(fileURLWithPath: wedgedHome).appendingPathComponent(".session-managed.json")
+                try Data(#"{"container_name":"loom-codex-session-other"}"#.utf8).write(to: batchMarker)
+                try writeListing(bothReady + ["bbb222\tloom-codex-session-other\texited\tloom:1\t"], to: afterExec)
+                let batches = blockOnQuotaProbe {
+                    await installation.probeAll(docker: stub, homes: [home, wedgedHome], concurrency: 1)
+                }
+                expectEqual(batches?.count, 2, "both probe batches finish")
+                let batched = try String(contentsOfFile: log, encoding: .utf8)
+                expect(batched.contains("exec -i abc123") && !batched.contains("exec -i def456"),
+                       "the later batch rechecks ownership before exec")
+
+                // A replaced mount and a failed ownership check both prevent exec.
+                try Data().write(to: URL(fileURLWithPath: log))
+                try writeListing(["abc999\tllm-monitor-codex-quota-agent-1\trunning\timg:1\t\(secondHome.path)\t\(owner)"], to: listing)
+                _ = blockOnQuotaProbe { await installation.probe(docker: stub, home: home) }
+                try FileManager.default.removeItem(at: listing)
+                _ = blockOnQuotaProbe { await installation.probe(docker: stub, home: home) }
+                let skipped = try String(contentsOfFile: log, encoding: .utf8).split(whereSeparator: \.isNewline)
+                expect(skipped.count == 2 && skipped.allSatisfy { $0.hasPrefix("ps -a ") },
+                       "a wrong mount or an unavailable listing skips exec")
+
+                // A probe that hangs removes the container so the next cycle
+                // starts from a clean one.
+                try FileManager.default.removeItem(at: afterExec)
+                try writeListing(bothReady, to: listing)
+                var budget = CodexAppServerClient.Timeouts()
+                budget.initialize = 2
+                budget.method = 2
+                budget.overall = 4
+                let timeouts = budget
+                let bad = blockOnQuotaProbe {
+                    await installation.probe(docker: stub, home: wedgedHome, timeouts: timeouts)
+                }
+                if case .failed(let reason)? = bad {
+                    expect(!reason.contains(dir.path), "a probe failure never carries the home path")
+                } else {
+                    checks += 1
+                    failures.append("a wedged probe must fail, got \(String(describing: bad))")
+                }
+                let after = (try? String(contentsOfFile: log, encoding: .utf8)) ?? ""
+                expect(after.contains("rm -f def456"),
+                       "a timed-out probe removes its container; reconcile recreates it")
+            } catch {
+                checks += 1
+                failures.append("quota-container stub test threw: \(error)")
+            }
         }
     }
 
@@ -4865,6 +5370,74 @@ enum SelfTest {
         }
     }
 
+    private static func testProviderTotals() {
+        let now = UsageRecord.parseISO("2026-11-21T12:05:00Z")!
+        let accounts = ["a", "b", "stale", "drift"].map { poolAccount($0, .anthropic) }
+        let rows = accounts.map { account in
+            (account: account, usage: poolUsage(account.id, session: nil, weekly: 20.4,
+                age: account.id == "stale" ? 3600 : 0, now: now))
+        }
+        expectEqual(ProviderPoolSummary.totalHeadroom(rows: rows, tokenStatuses: ["drift": .drifted],
+            pollInterval: 600, now: now), 160, "the total sums displayed scores above 100 and omits suppressed readings")
+        expect(ProviderPoolSummary.totalHeadroom(rows: [], tokenStatuses: [:], pollInterval: 600) == nil,
+               "no known headroom displays a dash")
+
+        withSelfTestTempDir("provider-totals") { dir in
+            do {
+                let db = try openDatabase(dir.appendingPathComponent("usage.db").path)
+                try UsageStore.applySchema(db)
+                try db.execute("""
+                    INSERT INTO accounts (id, provider) VALUES ('a','anthropic'), ('b','anthropic'), ('o','openai');
+                    INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, weekly_reset, is_synthetic) VALUES
+                        ('a','2026-11-14T12:55:00Z',40,NULL,0),
+                        ('a','2026-11-14T13:04:00Z',50,NULL,0),
+                        ('a','2026-11-14T13:05:00Z',60,NULL,0),
+                        ('a','2026-11-14T13:05:59Z',60,NULL,1),
+                        ('a','2026-11-14T13:06:00Z',0,NULL,1),
+                        ('a','2026-11-14T13:06:00Z',4,NULL,0),
+                        ('a','2026-11-14T13:07:00Z',6,NULL,0),
+                        ('a','2026-11-21T11:50:00Z',90,'2026-11-21T12:02:00Z',0),
+                        ('b','2026-11-21T11:55:00Z',80,NULL,0),
+                        ('o','2026-11-21T11:59:00Z',50,NULL,0),
+                        ('b','2026-11-21T12:02:00.500Z',3,NULL,0),
+                        ('b','2026-11-21T12:02:00Z',0,NULL,1),
+                        ('b','2026-11-21T12:02:00Z',2,NULL,0),
+                        ('b','2026-11-21T12:03:00Z',1,NULL,0),
+                        ('a','2026-11-21T12:04:00Z',95,'2026-11-28T12:02:00Z',0),
+                        ('a','2026-11-21T12:06:00Z',100,NULL,0);
+                    INSERT INTO token_sessions(session_id,first_message_ts,override_account_id,parent_session_id)
+                        VALUES ('parent','2026-11-21','o',NULL),('child','2026-11-21',NULL,'parent');
+                    INSERT INTO token_usage(session_id,timestamp,model,input_tokens,output_tokens,cache_creation_tokens,cache_read_tokens)
+                        VALUES ('child','2026-11-21T11:50:00Z','claude-test',5,6,2,99),
+                               ('anonymous','2026-11-21T11:55:00Z','claude-test',20,0,0,0),
+                               ('anonymous','2026-11-21T11:55:00Z','glm-test',30,0,0,0),
+                               ('anonymous','2026-11-21T11:55:00Z','unknown',40,0,0,0),
+                               ('anonymous','2026-11-21T12:06:00Z','claude-test',50,0,0,0);
+                    """)
+                func history(_ provider: AccountProvider) throws -> ProviderUsageHistory {
+                    try ProviderUsageHistory.load(db: db, provider: provider, now: now)
+                }
+                let anthropic = try history(.anthropic)
+                let points = anthropic.quota.map(\.points)
+                expectEqual(points.first, 0, "the pre-window reading sets the baseline without adding spend")
+                expectEqual(points.dropFirst().first, 26, "every increase within the hour counts, including spend after a reset")
+                expectEqual(points.dropFirst(2).first, 26, "an account going quiet keeps the points already recorded")
+                expectEqual(points.dropLast().last, 110, "a returning account adds its increase and a new account sets its baseline")
+                expectEqual(points.last, 208, "ordered reset markers and confirmed rollovers count new spend exactly once")
+                expect(zip(points, points.dropFirst()).allSatisfy { $0 <= $1 }, "provider consumption never decreases")
+                expectEqual(anthropic.tokens.map(\.count), [20], "only Anthropic's recorded tokens appear on its tab")
+                let openai = try history(.openai)
+                expectEqual(openai.quota.last?.points, 0, "a first weekly reading does not charge earlier spend to the period")
+                expectEqual(openai.tokens.map(\.count), [13], "a parent account mapping wins over a model label")
+                let zai = try history(.zai)
+                expectEqual(zai.tokens.map(\.count), [30], "unmapped GLM tokens reach the Z.ai chart")
+                expect(zai.quota.isEmpty, "a token-only chart has no fabricated weekly usage")
+            } catch {
+                failures.append("provider totals test threw: \(error)")
+            }
+        }
+    }
+
     /// The shared `cutoffISOString(daysBack:)` helper must exclude a row
     /// older than the window and include one inside it — exercised through
     /// `loadHistory` since the helper itself is private to `UsageStore`.
@@ -4888,6 +5461,15 @@ enum SelfTest {
                 let history = store.loadHistory(for: "acct-cutoff", daysBack: 30)
                 expectEqual(history.count, 1, "a row outside the daysBack window is excluded")
                 expectEqual(history.first?.weeklyPercent, 30.0, "the in-window row is the one returned")
+
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, weekly_all_percent)
+                    VALUES ('session-only', ?, NULL), ('unlisted', ?, 50)
+                """, isoTimestamp(secondsAgo: 30), isoTimestamp(secondsAgo: 15))
+                expectEqual(store.latestComparisonTimestamp(among: ["acct-cutoff", "session-only"]),
+                            history.first?.timestamp, "the comparison range ends at the newest visible weekly reading")
+                expect(store.latestComparisonTimestamp(among: ["session-only"]) == nil,
+                       "an account without weekly data offers no comparison")
             } catch {
                 checks += 1
                 failures.append("loadHistory cutoff test threw: \(error)")
@@ -4918,6 +5500,14 @@ enum SelfTest {
                         (session_id, timestamp, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
                     VALUES ('sess-1', ?, 100, 50, 10, 5)
                 """, isoTimestamp(secondsAgo: 60))
+                try db.run("""
+                    INSERT INTO token_sessions (session_id, first_message_ts, override_account_id, inferred_account_id)
+                    VALUES ('overridden', ?, 'second', 'acct-token'), ('unattributed', ?, NULL, NULL)
+                """, isoTimestamp(secondsAgo: 60), isoTimestamp(secondsAgo: 60))
+                try db.run("""
+                    INSERT INTO token_usage (session_id, timestamp, input_tokens)
+                    VALUES ('overridden', ?, 42), ('unattributed', ?, 99)
+                """, isoTimestamp(secondsAgo: 60), isoTimestamp(secondsAgo: 60))
                 // Well outside the 30-day window below — must not contribute.
                 try db.run("""
                     INSERT INTO token_usage
@@ -4933,6 +5523,11 @@ enum SelfTest {
                 expectEqual(history.first?.cacheCreationTokens, 10, "cache_creation_tokens round-trips")
                 expectEqual(history.first?.cacheReadTokens, 5, "cache_read_tokens round-trips")
                 expectEqual(history.first?.billableTokens, 160, "billableTokens excludes cache reads")
+
+                let comparisons = store.loadTokenHistoryByAccount(daysBack: 30)
+                expectEqual(Set(comparisons.keys), ["acct-token", "second"], "comparison series omit unattributed spend")
+                expectEqual(comparisons["acct-token"]?.first?.billableTokens, 160, "the inferred account keeps its own spend")
+                expectEqual(comparisons["second"]?.first?.billableTokens, 42, "the override takes precedence in comparisons")
             } catch {
                 checks += 1
                 failures.append("loadTokenHistory round-trip test threw: \(error)")

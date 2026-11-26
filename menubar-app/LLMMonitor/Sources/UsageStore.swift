@@ -663,6 +663,11 @@ class UsageStore: ObservableObject {
         addColumnIfMissing(db, table: "accounts",
                            column: "codex_home_mode", definition: "TEXT")
 
+        // A profile discovered before login keeps its local row and history.
+        // The first verified quota probe records its native account ID here.
+        addColumnIfMissing(db, table: "accounts",
+                           column: "codex_profile_account_id", definition: "TEXT")
+
         // Migration (transcript ingest, #197): the Claude session a subagent
         // transcript belongs to.
         //
@@ -1419,7 +1424,39 @@ class UsageStore: ObservableObject {
         return filteredPoints
     }
 
-    func loadHistory(for accountId: String, daysBack: Int = 7, minChangePercent: Double = 1.0) -> [UsageDataPoint] {
+    nonisolated func loadProviderHistory(for provider: AccountProvider) async throws -> ProviderUsageHistory {
+        try Task.checkCancellation()
+        let db = try openDatabase(dbPath, readonly: true)
+        try db.execute("BEGIN")
+        let history = try ProviderUsageHistory.load(db: db, provider: provider, now: Date())
+        try db.execute("COMMIT")
+        return history
+    }
+
+    /// The hidden comparison traces still set the slider's seven-day domain.
+    /// Read the newest plottable timestamp without building those traces.
+    nonisolated func latestComparisonTimestamp(among accounts: Set<String>, daysBack: Int = 7) -> Date? {
+        guard !accounts.isEmpty else { return nil }
+        do {
+            let db = try openDatabase(dbPath, readonly: true)
+            let stmt = try db.prepare("""
+                SELECT account_id, timestamp FROM usage_history
+                WHERE timestamp >= ? AND weekly_all_percent IS NOT NULL
+                ORDER BY timestamp DESC
+            """)
+            for row in stmt.bind(cutoffISOString(daysBack: daysBack)) {
+                if let id = row[0] as? String, accounts.contains(id),
+                   let date = UsageRecord.parseISO(row[1] as? String) {
+                    return date
+                }
+            }
+        } catch {
+            print("Error loading comparison timestamp: \(error)")
+        }
+        return nil
+    }
+
+    nonisolated func loadHistory(for accountId: String, daysBack: Int = 7, minChangePercent: Double = 1.0) -> [UsageDataPoint] {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
                 return []
@@ -1468,7 +1505,7 @@ class UsageStore: ObservableObject {
         }
     }
 
-    func loadFullHistory(for accountId: String, daysBack: Int = 7, minChangePercent: Double = 1.0) -> [FullUsageDataPoint] {
+    nonisolated func loadFullHistory(for accountId: String, daysBack: Int = 7, minChangePercent: Double = 1.0) -> [FullUsageDataPoint] {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
                 return []
@@ -1570,42 +1607,50 @@ class UsageStore: ObservableObject {
     }
 
     /// Load hourly token usage for an account from Claude Code data
-    func loadTokenHistory(for accountId: String, daysBack: Int = 7) -> [TokenDataPoint] {
+    nonisolated func loadTokenHistory(for accountId: String, daysBack: Int = 7) -> [TokenDataPoint] {
+        loadTokenHistoryByAccount(for: accountId, daysBack: daysBack)[accountId] ?? []
+    }
+
+    /// Group the visible comparison accounts in one pass over recent token usage.
+    nonisolated func loadTokenHistoryByAccount(for accountId: String? = nil, daysBack: Int = 7) -> [String: [TokenDataPoint]] {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
-                return []
+                return [:]
             }
 
             let db = try openDatabase(dbPath, readonly: true)
             let cutoffString = cutoffISOString(daysBack: daysBack)
 
+            let attribution = "COALESCE(ts.override_account_id, ts.inferred_account_id)"
+            let predicate = accountId == nil ? "IS NOT NULL" : "= ?"
             let sql = """
                 SELECT
                     strftime('%Y-%m-%dT%H:00:00Z', tu.timestamp) as hour,
                     SUM(tu.input_tokens) as input_tokens,
                     SUM(tu.output_tokens) as output_tokens,
                     SUM(tu.cache_creation_tokens) as cache_creation_tokens,
-                    SUM(tu.cache_read_tokens) as cache_read_tokens
+                    SUM(tu.cache_read_tokens) as cache_read_tokens,
+                    \(attribution) AS account
                 FROM token_usage tu
                 JOIN token_sessions ts ON tu.session_id = ts.session_id
-                WHERE COALESCE(ts.override_account_id, ts.inferred_account_id) = ?
-                  AND tu.timestamp >= ?
-                GROUP BY hour
+                WHERE tu.timestamp >= ? AND \(attribution) \(predicate)
+                GROUP BY account, hour
                 ORDER BY hour ASC
             """
 
-            var dataPoints: [TokenDataPoint] = []
+            var dataPoints: [String: [TokenDataPoint]] = [:]
             let statement = try db.prepare(sql)
 
-            for row in statement.bind(accountId, cutoffString) {
-                if let hourStr = row[0] as? String,
+            let bindings = [cutoffString] + (accountId.map { [$0] } ?? [])
+            for row in statement.bind(values: bindings) {
+                if let account = row[5] as? String, let hourStr = row[0] as? String,
                    let date = UsageRecord.parseISO(hourStr) {
                     let inputTokens = (row[1] as? Int64) ?? 0
                     let outputTokens = (row[2] as? Int64) ?? 0
                     let cacheCreationTokens = (row[3] as? Int64) ?? 0
                     let cacheReadTokens = (row[4] as? Int64) ?? 0
 
-                    dataPoints.append(TokenDataPoint(
+                    dataPoints[account, default: []].append(TokenDataPoint(
                         timestamp: date,
                         inputTokens: inputTokens,
                         outputTokens: outputTokens,
@@ -1619,7 +1664,7 @@ class UsageStore: ObservableObject {
 
         } catch {
             print("Error loading token history: \(error)")
-            return []
+            return [:]
         }
     }
 
@@ -1692,14 +1737,13 @@ class UsageStore: ObservableObject {
     /// nothing to show under any surface; a caller with `true` here but
     /// `hasTokenData(for:) == false` for every account should fall back to
     /// `loadHostTotalTokenHistory`.
-    func hasAnyTokenUsageData() -> Bool {
+    nonisolated func hasAnyTokenUsageData() -> Bool {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
                 return false
             }
             let db = try openDatabase(dbPath, readonly: true)
-            let count = try db.scalar("SELECT COUNT(*) FROM token_usage") as? Int64 ?? 0
-            return count > 0
+            return try db.scalar("SELECT 1 FROM token_usage LIMIT 1") != nil
         } catch {
             print("Error checking token_usage presence: \(error)")
             return false

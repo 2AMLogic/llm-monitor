@@ -3,7 +3,7 @@ import Foundation
 /// Read-only visibility into Loom's pooled Codex profiles
 /// (`~/.loom/codex-profiles/<name>/`, or `$LOOM_CODEX_PROFILE_ROOT`).
 ///
-/// ### Why snapshots, never a live call
+/// ### Why snapshots, never a direct live call
 ///
 /// Loom's session containers **own** these homes. OpenAI rotates the refresh
 /// token on every use, so exactly one process may ever refresh a given
@@ -13,8 +13,13 @@ import Foundation
 /// break that account's auth chain. So a profile is registered in
 /// **snapshot mode** (`accounts.codex_home_mode = 'snapshot'`): it is read
 /// only from the `rate_limits` object Codex itself writes into the profile's
-/// `sessions/**/rollout-*.jsonl` during normal use. No credential is read, no
-/// process is started, and nothing is written into the profile.
+/// `sessions/**/rollout-*.jsonl` during normal use. This file reads no
+/// credential, starts no process, and writes nothing into the profile.
+///
+/// The snapshot is one of three sources `pollCodexSnapshot` chooses between
+/// (the newest observation wins): the rollout snapshot, `LoomAccountsCheck`'s
+/// live reading, and the opt-in `CodexQuotaContainer` reading for a profile
+/// whose Loom session container is absent from `docker ps -a`.
 ///
 /// The price is freshness: a reading is only as current as the account's
 /// last Codex turn. The reading is timestamped with **when Codex recorded

@@ -65,6 +65,7 @@ class PopoverHeightManager: ObservableObject {
     /// Sentinel `userHeight`: as tall as the rows need, limited only by the screen.
     private static let showAllRows: CGFloat = 100_000
     private var rowCount = 0
+    private var hasSingleProvider = false
     private var showsCalibrationNotice = false
     private var dragStartHeight: CGFloat?
     private var dragStartMouseY: CGFloat = 0
@@ -74,6 +75,7 @@ class PopoverHeightManager: ObservableObject {
 
     /// Recompute the width from the providers now visible in the table.
     func setVisibleProviders(_ providers: Set<AccountProvider>) {
+        hasSingleProvider = providers.count == 1
         let w = SummaryColumns.tableWidth(among: providers)
         if w != currentWidth { currentWidth = w }
     }
@@ -90,7 +92,9 @@ class PopoverHeightManager: ObservableObject {
     /// Unclamped height that shows every row without scrolling. Includes the
     /// provider tab strip (#297), which is present exactly when rows are.
     private func contentHeight(rowCount: Int) -> CGFloat {
-        Self.chromeHeight + Self.providerTabsHeight
+        // With multiple providers, All already has at least one extra account
+        // row. Reserve an extra row only when a single provider fills the list.
+        Self.chromeHeight + Self.providerTabsHeight + (hasSingleProvider ? Self.rowHeight + 1 : 0)
             + (showsCalibrationNotice ? Self.calibrationNoticeHeight : 0)
             + CGFloat(rowCount) * Self.rowHeight
     }

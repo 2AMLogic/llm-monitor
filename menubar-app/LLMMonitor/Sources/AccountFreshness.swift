@@ -48,6 +48,15 @@ enum AccountFreshness {
         return isStale(age: now.timeIntervalSince(lastUpdated), pollInterval: pollInterval)
     }
 
+    /// The reading used by both an account's table cells and the headroom total.
+    static func displayUsage(
+        for account: Account, usage: UsageRecord?, tokenStatus: TokenStatus?,
+        pollInterval: TimeInterval, now: Date = Date()
+    ) -> UsageRecord? {
+        let stale = isStale(lastUpdated: usage?.timestamp, pollInterval: pollInterval, now: now)
+        return account.isAbsent || shouldSuppressPercent(isStale: stale, tokenStatus: tokenStatus) ? nil : usage
+    }
+
     /// True when a single-account summary display (the menubar badge, or any
     /// future surface with the same shape) must suppress its last-known
     /// percentage rather than present a frozen number as current. Two causes

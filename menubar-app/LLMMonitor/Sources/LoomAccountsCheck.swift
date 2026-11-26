@@ -14,12 +14,15 @@ import Darwin
 ///
 /// ### Why a live reading is allowed here when a direct one is not
 ///
-/// `CodexProfiles`' header explains why this app must never spawn `codex`
-/// against a Loom-owned `CODEX_HOME`: OpenAI rotates the refresh token on every
-/// use, exactly one process may refresh a given home, and for a session-managed
-/// profile that process is its session container. That rule is unchanged, and
-/// the three guards that enforce it (`pollOpenAI` → `pollCodexSnapshot`,
-/// `OAuthPoller.isLoomCodexProfile`, `codex list`) are untouched.
+/// `CodexProfiles`' header explains why this app does not spawn `codex`
+/// against a Loom-owned `CODEX_HOME` while a session container owns it: OpenAI
+/// rotates the refresh token on every use, exactly one process may refresh a
+/// given home, and for a session-managed profile that process is its session
+/// container. The opt-in `CodexQuotaContainer` path can run `codex` on a
+/// profile home only when the profile has no Loom session container in any state.
+/// The three guards (`pollOpenAI` → `pollCodexSnapshot`,
+/// `OAuthPoller.isLoomCodexProfile`, `codex list`) are untouched, and this
+/// file's own path still spawns no `codex`.
 ///
 /// What changes is *who* asks. `loom-daemon accounts check --live` probes each
 /// account **from inside its own session container** (ADR-0017) — the one

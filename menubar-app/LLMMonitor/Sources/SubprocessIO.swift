@@ -36,6 +36,79 @@ enum SubprocessIO {
     /// thread-safe, so this is a no-op after the first call.
     static func ignoreSIGPIPE() { _ = sigpipeIgnored }
 
+    /// What a finished (or abandoned) child left behind.
+    struct Captured: Sendable {
+        /// The exit status, or nil when the child was killed at the deadline.
+        let status: Int32?
+        let stdout: Data
+        let stderr: Data
+        var succeeded: Bool { status == 0 }
+    }
+
+    /// Run one short-lived tool to completion and capture both streams — the
+    /// spawn/drain/deadline loop a one-shot helper call needs, spelled once.
+    /// `input`, when given, is written to the child's stdin and the pipe
+    /// closed; otherwise stdin is `/dev/null`. Nil only when nothing could be
+    /// spawned. Suspends on `Task.sleep` rather than `waitUntilExit()` (which
+    /// hangs off the main thread), and a child still running at `timeout`
+    /// takes SIGTERM then SIGKILL and comes back with a nil status.
+    static func runCapturing(
+        executable: String,
+        arguments: [String],
+        input: Data? = nil,
+        timeout: TimeInterval
+    ) async -> Captured? {
+        ignoreSIGPIPE()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        let inPipe = input == nil ? nil : Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        process.standardInput = inPipe ?? FileHandle.nullDevice
+        let outDrain = PipeDrain(outPipe.fileHandleForReading)
+        let errDrain = PipeDrain(errPipe.fileHandleForReading)
+        do {
+            try process.run()
+        } catch {
+            try? outPipe.fileHandleForWriting.close()
+            try? errPipe.fileHandleForWriting.close()
+            await outDrain.finishAndClose(timeout: 1)
+            await errDrain.finishAndClose(timeout: 1)
+            return nil
+        }
+        if let input = input, let inPipe = inPipe {
+            // EPIPE (the child exited without reading) is the child's failure
+            // to report through its status, not ours to throw.
+            try? inPipe.fileHandleForWriting.write(contentsOf: input)
+            try? inPipe.fileHandleForWriting.close()
+        }
+        var killed = false
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning {
+            if Date() >= deadline {
+                killed = true
+                process.terminate()
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                break
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        await outDrain.finishAndClose(timeout: 5)
+        await errDrain.finishAndClose(timeout: 5)
+        // An unfinished drain means a grandchild still holds the pipe; what
+        // was read so far is all there is to report (#234).
+        let stdout = outDrain.isFinished ? outDrain.waitForEOF() : Data()
+        let stderr = errDrain.isFinished ? errDrain.waitForEOF() : Data()
+        return Captured(
+            status: killed || process.isRunning ? nil : process.terminationStatus,
+            stdout: stdout, stderr: stderr
+        )
+    }
+
     private static let sigpipeIgnored: Bool = {
         signal(SIGPIPE, SIG_IGN)
         return true
