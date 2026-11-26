@@ -109,5 +109,10 @@ dist/
 # Per-host Loom account pool state (written by the daemon; never shared)
 .loom/accounts.json
 
+# loom-daemon's per-workspace ranking cache (written by `accounts check
+# --ranking`, rewritten every cycle). Ignored here, outside the managed block,
+# until a Loom resync brings that block its own rule (#380).
+.loom/account-ranking.*
+
 # Repo Skills Codex-side machine-local install metadata (never committed)
 .agents/skills/repo/.install-local.json
