@@ -1912,12 +1912,12 @@ enum SelfTest {
             let dbPath = dir.appendingPathComponent("usage.db").path
             UsageStore(dbPath: dbPath).ensureDatabase()
 
-            func makeProfile(_ name: String, accountId: String?, email: String?) {
+            func makeProfile(_ name: String, accountId: String?, email: String?, tokens fixtureTokens: [String: String] = [:]) {
                 let home = (root as NSString).appendingPathComponent(name)
                 try? fm.createDirectory(atPath: home + "/sessions/2026/09/23", withIntermediateDirectories: true)
                 if let accountId = accountId {
-                    var tokens: [String: Any] = ["account_id": accountId, "access_token": "fixture-access",
-                                                 "refresh_token": "fixture-refresh"]
+                    var tokens = fixtureTokens
+                    tokens["account_id"] = accountId
                     if let email = email {
                         let claims = try! JSONSerialization.data(withJSONObject: ["email": email])
                         let b64 = claims.base64EncodedString().replacingOccurrences(of: "=", with: "")
@@ -1952,7 +1952,8 @@ enum SelfTest {
             // "Launch": one profile on disk, plus a home-less OpenAI row whose
             // identity the next profile will match — the pre-profile history
             // the linking rule keeps attached.
-            makeProfile("alpha", accountId: "acct-alpha", email: nil)
+            makeProfile("alpha", accountId: "acct-alpha", email: nil,
+                        tokens: ["access_token": "fixture-access", "refresh_token": "fixture-refresh"])
             let db = try! openDatabase(dbPath)
             try! db.run("INSERT INTO accounts (id, account_name, email, provider) VALUES (?, ?, ?, 'openai')",
                         "user-beta", "beta@example.com", "beta@example.com")
@@ -2123,29 +2124,67 @@ enum SelfTest {
             expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND weekly_all_percent = 18",
                               "user-oldshift"), 1, "the reading belongs to the legacy account")
 
-            // A registered home whose directory was absent can be reused by a
-            // different workspace's login. The row's own native ID contradicts
-            // the login, so it must neither change mode nor receive the reading.
+            // Occupied paths can reappear before login completes. Exercise the
+            // regular codex-home credentials without launching a host Codex CLI.
+            let previousBinary = ProcessInfo.processInfo.environment[CodexBinary.overrideEnvKey]
+            setenv(CodexBinary.overrideEnvKey, dir.appendingPathComponent("no-codex").path, 1)
+            defer {
+                if let previousBinary { setenv(CodexBinary.overrideEnvKey, previousBinary, 1) }
+                else { unsetenv(CodexBinary.overrideEnvKey) }
+            }
             let formerOwnerID = "f0f0f0f0-0000-4000-8000-000000000006"
             let reusedLoginID = "a1a1a1a1-0000-4000-8000-000000000007"
-            let reusedHome = root + "/reused-slot"
-            try! db.run("INSERT INTO accounts (id, email, provider, codex_home) VALUES (?, ?, 'openai', ?)",
-                        formerOwnerID, "former@example.com", reusedHome)
-            try! db.run("""
-                INSERT INTO oauth_credentials (account_id, label, provider, source, is_active, last_poll_at, created_at, updated_at)
-                VALUES (?, 'former', 'openai', 'codex-home', 1, ?, 'now', 'now')
-                """, formerOwnerID, ISO8601DateFormatter().string(from: Date()))
+            for (id, name) in [(formerOwnerID, "reused-slot"), ("user-former", "legacy-slot"),
+                               ("user-returning", "returning-slot")] {
+                try! db.run("INSERT INTO accounts (id, email, provider, codex_home) VALUES (?, ?, 'openai', ?)",
+                            id, name + "@example.com", root + "/" + name)
+                try! db.run("""
+                    INSERT INTO oauth_credentials (account_id, label, provider, source, is_active, created_at, updated_at)
+                    VALUES (?, ?, 'openai', 'codex-home', 1, 'now', 'now')
+                    """, id, name)
+            }
+            // Older databases may have two stored owners for the same path.
+            for id in ["user-shared-first", "user-shared-second"] {
+                try! db.run("INSERT INTO accounts (id, email, provider, codex_home) VALUES (?, 'shared-slot@example.com', 'openai', ?)",
+                            id, root + "/shared-slot")
+            }
+            makeProfile("shared-slot", accountId: "dddddddd-0000-4000-8000-000000000010", email: "shared-slot@example.com")
+            try! fm.createDirectory(atPath: root + "/reused-slot", withIntermediateDirectories: false)
+            let returningWorkspace = "cccccccc-0000-4000-8000-000000000009"
+            makeProfile("returning-slot", accountId: returningWorkspace, email: nil)
+            makeProfile("legacy-slot", accountId: "bbbbbbbb-0000-4000-8000-000000000008", email: "other@example.com")
+            writeSnapshot("legacy-slot", weeklyPercent: 61)
+            expectEqual(tick(), 3, "the three occupied paths' credentials are polled")
+            func retainsOriginalMode(_ id: String) -> Bool {
+                count("SELECT COUNT(*) FROM accounts WHERE id = ? AND codex_home_mode IS NULL", id) == 1
+            }
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ? AND codex_home_mode IS NULL", root + "/shared-slot"),
+                        2, "a shared path and email cannot identify a single owner")
+            expect(retainsOriginalMode(formerOwnerID), "an empty directory cannot convert its stored workspace owner")
+            expect(retainsOriginalMode("user-former"), "a conflicting login email cannot convert its legacy owner")
+            expect(retainsOriginalMode("user-returning"), "a workspace ID alone cannot confirm a legacy user ID")
+
             makeProfile("reused-slot", accountId: reusedLoginID, email: nil)
             writeSnapshot("reused-slot", weeklyPercent: 73)
-            expectEqual(tick(), 1, "only the former owner's own credential is due; the new login adds none")
-            expect(text("SELECT codex_home_mode FROM accounts WHERE id = ?", formerOwnerID) != CodexProfiles.snapshotMode,
-                   "a login that is not the owner leaves the owner's mode unchanged")
+            makeProfile("returning-slot", accountId: returningWorkspace, email: "RETURNING-slot@example.com")
+            writeSnapshot("returning-slot", weeklyPercent: 26)
+            // Make the next tick due now, including for a mistakenly converted owner.
+            let previousInterval = poller.pollInterval
+            poller.pollInterval = 0
+            expect(tick() > 0, "the tick after login completes polls the due credentials")
+            poller.pollInterval = previousInterval
+            expect(retainsOriginalMode(formerOwnerID), "the new workspace cannot convert the former owner")
+            expect(retainsOriginalMode("user-former"), "the legacy owner's mode stays unchanged on later ticks")
             let recordedAccountIDs = try! db.prepare("SELECT DISTINCT account_id FROM usage_history")
                 .map { $0[0] as! String }
-            expect(!recordedAccountIDs.contains(formerOwnerID),
-                   "the new login's reading is never archived under the former owner")
-            expect(!recordedAccountIDs.contains(reusedLoginID),
-                   "the skipped login has no usage history")
+            expect(!recordedAccountIDs.contains(formerOwnerID), "the former workspace receives no usage")
+            expect(!recordedAccountIDs.contains(reusedLoginID), "the skipped login has no usage history")
+            expect(!recordedAccountIDs.contains("user-former"), "the legacy owner receives no usage")
+            expectEqual(text("SELECT codex_home_mode FROM accounts WHERE id = ?", "user-returning"),
+                        CodexProfiles.snapshotMode, "a matching email converts its legacy owner after login")
+            expectEqual(try! db.scalar("SELECT weekly_all_percent FROM usage_history WHERE account_id = 'user-returning'") as? Double,
+                        26, "the returning owner receives its own snapshot on that tick")
+            for name in ["reused-slot", "legacy-slot", "shared-slot"] { try! fm.removeItem(atPath: root + "/" + name) }
 
             // An unchanged root: the listing is the whole cost. Deleting the
             // row makes any per-home registration work visible — the

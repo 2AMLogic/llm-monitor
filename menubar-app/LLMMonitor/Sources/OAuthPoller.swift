@@ -1152,41 +1152,41 @@ class OAuthPoller: ObservableObject {
         let pendingNativeIDs = Set(logins.compactMap { $0.nativeId.map(identityKey) })
         var registered = 0
         for (profile, nativeId, email) in logins {
+            // An incomplete login stays eligible even if its path already has an owner.
+            if requireLoginIdentity && nativeId == nil && email == nil { continue }
             let nativeKey = nativeId.map(identityKey)
             do {
                 try db.execute("BEGIN IMMEDIATE")
                 // Holding the write lock keeps the home lookup, account and token-free
                 // credential consistent across concurrent startup, CLI and tick syncs.
-                if try db.scalar("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", profile.home) as? Int64 ?? 0 > 0 {
-                    // The directory's former owner may not be the login now in it
-                    // (a slot reused by another workspace). Converting that row to
-                    // snapshot mode would archive the new login's readings under the
-                    // old account, so a contradicting native ID leaves it untouched.
-                    var occupiedByOther = false
-                    if let nativeId {
-                        for owner in try db.prepare("SELECT id FROM accounts WHERE codex_home = ?").bind(profile.home) {
-                            guard let ownerId = owner[0] as? String,
-                                  Self.accountIdsComparable(stored: ownerId, reported: nativeId),
-                                  identityKey(ownerId) != nativeKey else { continue }
-                            occupiedByOther = true
-                        }
-                    }
-                    if occupiedByOther {
+                let owners = try db.prepare("SELECT id, email, codex_home_mode FROM accounts WHERE codex_home = ?")
+                    .bind(profile.home)
+                if let owner = try owners.stepRow() {
+                    let hasMultipleOwners = try owners.stepRow() != nil
+                    let identity = Self.compareCodexHomeIdentity(storedAccountId: owner[0] as? String ?? "",
+                                                                 storedEmail: owner[1] as? String,
+                                                                 reportedAccountId: nativeId, reportedEmail: email)
+                    let needsConversion = owner[2] as? String != CodexProfiles.snapshotMode
+                    switch (hasMultipleOwners, identity) {
+                    case (true, _), (_, .conflict):
                         try db.execute("COMMIT")
                         skippedCodexEntries.insert(profile)
-                        flog.info("Skipped Loom Codex profile because its directory belongs to a different account", category: fcat)
+                        flog.info("Skipped Loom Codex profile because its directory has conflicting ownership", category: fcat)
                         continue
+                    case (_, .indeterminate) where needsConversion:
+                        // Login may publish the email after an ID that cannot identify
+                        // this legacy owner. Retry the same directory on the next tick.
+                        try db.execute("COMMIT")
+                        continue
+                    default:
+                        break
                     }
-                    try db.run("UPDATE accounts SET codex_home_mode = ? WHERE codex_home = ?",
-                               CodexProfiles.snapshotMode, profile.home)
+                    if needsConversion {
+                        try db.run("UPDATE accounts SET codex_home_mode = ? WHERE codex_home = ?",
+                                   CodexProfiles.snapshotMode, profile.home)
+                    }
                     try db.execute("COMMIT")
                     settledCodexProfiles.insert(profile)
-                    continue
-                }
-                if requireLoginIdentity && nativeId == nil && email == nil {
-                    // Login can create the directory a tick before publishing
-                    // auth.json. Leave the home unclaimed and retry next tick.
-                    try db.execute("COMMIT")
                     continue
                 }
                 // Resolve existing owners before considering a home-less email
@@ -3025,11 +3025,23 @@ class OAuthPoller: ObservableObject {
     nonisolated static func codexHomeConflicts(
         storedAccountId: String, storedEmail: String?, reportedAccountId: String?, reportedEmail: String?
     ) -> Bool {
-        guard !storedAccountId.isEmpty else { return false }
-        if accountIdsComparable(stored: storedAccountId, reported: reportedAccountId) {
-            return identitiesConflict(reportedAccountId, storedAccountId)
+        if case .conflict = compareCodexHomeIdentity(storedAccountId: storedAccountId, storedEmail: storedEmail,
+                                                     reportedAccountId: reportedAccountId, reportedEmail: reportedEmail) {
+            return true
         }
-        return identitiesConflict(reportedEmail, storedEmail)
+        return false
+    }
+
+    /// Live polling checks for a contradiction. Converting a stored owner to
+    /// snapshot mode requires a match, since rollout readings carry no identity.
+    nonisolated private static func compareCodexHomeIdentity(
+        storedAccountId: String, storedEmail: String?, reportedAccountId: String?, reportedEmail: String?
+    ) -> CodexIdentityComparison {
+        guard !storedAccountId.isEmpty else { return .indeterminate }
+        if accountIdsComparable(stored: storedAccountId, reported: reportedAccountId) {
+            return compareIdentities(reported: reportedAccountId, stored: storedAccountId)
+        }
+        return compareIdentities(reported: reportedEmail, stored: storedEmail)
     }
 
     /// Whether a stored account id and one a home reports are the **same kind
