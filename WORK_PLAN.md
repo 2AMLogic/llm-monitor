@@ -8,6 +8,8 @@ Prioritized roadmap derived from current GitHub label state. Regenerated automat
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
 - **#325**: feat: add in-app update check and one-click self-install for macOS
+- **#366**: refactor!: remove the Claude Monitor compatibility shims
+- **#371**: feat: register Loom Codex profiles discovered mid-run on the poll tick
 
 ## Very Important
 
@@ -36,18 +38,21 @@ Issues currently being built (`loom:building`).
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings
 - **#323**: Offer an in-app "Update now" when a newer release is available
 - **#368**: Register new Loom Codex profiles on a poll tick, not only at launch or by codex list
+- **#380**: check-main-clean.sh exits 3 on a clean main because loom-daemon writes .loom/account-ranking.codex there
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#366**: refactor!: remove the Claude Monitor compatibility shims
+- **#381**: chore: gitignore loom-daemon's account-ranking cache
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review (`loom:pr`). Unheld PRs are queued for Champion auto-merge; held PRs require a human merge decision.
 
 - **#325**: feat: add in-app update check and one-click self-install for macOS *(held)*
+- **#366**: refactor!: remove the Claude Monitor compatibility shims *(held)*
+- **#371**: feat: register Loom Codex profiles discovered mid-run on the poll tick *(held)*
 
 ## Proposed
 
@@ -59,6 +64,7 @@ Issues carrying `loom:curated`.
 - **#323**: Offer an in-app "Update now" when a newer release is available *(curated)*
 - **#338**: Per-account scope (personal | work): push/export skip personal accounts; popover marks them *(curated)*
 - **#368**: Register new Loom Codex profiles on a poll tick, not only at launch or by codex list *(curated)*
+- **#380**: check-main-clean.sh exits 3 on a clean main because loom-daemon writes .loom/account-ranking.codex there *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -72,14 +78,14 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 1 |
+| Operator merge-risk holds | 3 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 5 |
+| In Progress (`loom:building`) | 6 |
 | PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 1 |
-| Curated | 6 |
+| Approved PRs awaiting merge | 3 |
+| Curated | 7 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->

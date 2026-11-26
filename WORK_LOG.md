@@ -11,6 +11,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-11-26
 
+- **Issue #377** (closed): Describe Codex profile discovery in CLAUDE.md without naming the scan helper
+- **PR #378**: docs: drop CodexProfiles.scan() reference from CLAUDE.md
 - **Issue #375** (closed): CI flake in build-linux when the Ubuntu security index changes during SQLite setup
 - **PR #373**: fix: honor archived provider rejections in the popover pool tally
 - **Issue #372** (closed): Honor stored provider rejections in the popover pool tally
@@ -179,18 +181,3 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 - **PR #223**: fix(chart): time-to-limit projection ignores the window's reset instant
 - **Issue #219** (closed): feat(monitoring): evaluate Stage-11-Agentics/glideslope as reference implementation for LLM monitoring
 - **PR #222**: docs: evaluate glideslope as a reference implementation (#219)
-
-### 2026-09-26
-
-- **PR #218**: feat: read rolled Claude tokens from ~/.claude-oauth and the Loom pool
-- **PR #216**: fix: persist Codex snapshot diagnostics; export ranking.json on launch
-- **PR #217**: fix(security): ignore sibling copies of the Loom token pool
-
-### 2026-09-25
-
-- **PR #207**: chore(deps): bump the github-actions group across 1 directory with 2 updates
-- **PR #214**: feat: read-only visibility into Loom's Codex profiles
-- **PR #211**: refactor!: rename Claude Monitor to LLM Monitor (2.0)
-- **PR #209**: feat: z.ai (GLM Coding Plan) accounts as a third provider
-- **Issue #212** (closed): Flaky selftest: CodexAppServer argfail-stub race under host load
-- **PR #213**: fix: surface codex's stderr when it exits before the handshake (#212)
