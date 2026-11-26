@@ -1029,7 +1029,8 @@ class OAuthPoller: ObservableObject {
     /// none of them is an error worth marking an account unhealthy for.
     @discardableResult
     func refreshLoomCodexLiveReadings(
-        for credentials: [OAuthCredential], force: Bool = false
+        for credentials: [OAuthCredential], force: Bool = false,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) async -> Int {
         guard credentials.contains(where: { $0.isCodexSnapshotOnly }) else { return 0 }
         let now = Date()
@@ -1039,8 +1040,8 @@ class OAuthPoller: ObservableObject {
         // Stamped before the run, not after: a slow or failing probe must not
         // become a hot loop (the same rule the transcript ingest follows).
         lastLoomLiveCheck = now
-        guard let binary = LoomAccountsCheck.resolveBinary(),
-              let workspace = LoomAccountsCheck.workspace() else {
+        guard let workspace = LoomAccountsCheck.workspace(environment: environment),
+              let binary = LoomAccountsCheck.resolveBinary(environment: environment) else {
             if !reportedLoomDaemonUnavailable {
                 reportedLoomDaemonUnavailable = true
                 flog.info("Loom live Codex check unavailable (no loom-daemon binary, or the shared "
@@ -1048,7 +1049,7 @@ class OAuthPoller: ObservableObject {
             }
             return 0
         }
-        guard let report = await LoomAccountsCheck.run(binary: binary, workspace: workspace) else {
+        guard let report = await LoomAccountsCheck.run(binary: binary, workspace: workspace, environment: environment) else {
             flog.warning("Loom live Codex check produced no readable report — keeping rollout snapshots",
                          category: fcat)
             return 0
@@ -1084,48 +1085,141 @@ class OAuthPoller: ObservableObject {
     /// has one (what every other OpenAI row is keyed on), else
     /// `codex-profile:<name>`.
     ///
-    /// **Linking an existing row.** Before creating a new row, an existing
-    /// OpenAI row with no `codex_home` of its own is adopted when it is
-    /// plainly the same identity: its id matches, its email matches the
-    /// profile's `email` claim, or (for a profile that was never logged in and
-    /// so has no claim) its email's local part matches the profile name once
-    /// punctuation is ignored (`robb@…` → `robb`, `r.j.walters@…` →
-    /// `rjwalters`). That keeps a pre-profile account's history attached
-    /// instead of leaving a dead row beside a new one. A row that already has
-    /// a home is never taken over.
+    /// A matching native ID links the profile to its existing OpenAI row.
+    /// If a home-less row has no conflicting native identity, it can also
+    /// match by email or, when the login has no email claim, by the email's
+    /// local part and profile name ignoring punctuation (`r.j.walters@…`
+    /// matches `rjwalters`). Linking preserves the account's history.
+    ///
+    /// Also seeds the per-tick discovery state, so the first `pollDue` after
+    /// launch costs one directory listing (see `discoverCodexProfiles`).
     @discardableResult
     func syncCodexProfiles(root: String? = CodexProfiles.root()) -> Int {
-        let profiles = CodexProfiles.scan(root: root)
+        syncCodexProfiles(CodexProfiles.listRoot(root), incremental: false)
+    }
+
+    /// Run before loading credentials so a new home can be polled on this tick.
+    /// When every home is settled, only the root listing touches the filesystem.
+    @discardableResult
+    func discoverCodexProfiles(root: String? = CodexProfiles.root()) -> Int {
+        syncCodexProfiles(CodexProfiles.listRoot(root), incremental: true)
+    }
+
+    func syncCodexProfiles(_ listing: CodexProfiles.RootListing?, incremental: Bool,
+                           lookupKind: (String) -> CodexProfiles.RootEntry.Kind = CodexProfiles.lookupKind) -> Int {
+        guard let listing else { return 0 }
+        let listed = Set(listing.entries)
+        settledCodexProfiles.formIntersection(listed)
+        // A regular file or conflicting home can be replaced between listings
+        // with the same name and inode. Recheck both when the root changes.
+        if let previous = codexRootModificationTime, let current = listing.modificationTime,
+           previous.tv_sec == current.tv_sec && previous.tv_nsec == current.tv_nsec {
+            skippedCodexEntries.formIntersection(listed)
+        } else {
+            skippedCodexEntries.removeAll()
+        }
+        codexRootModificationTime = listing.modificationTime
+        let pending = incremental ? listing.entries.filter {
+            !settledCodexProfiles.contains($0) && !skippedCodexEntries.contains($0)
+        } : listing.entries
+        let profiles = pending.filter { entry in
+            guard entry.kind == .needsLookup else { return entry.kind == .directory }
+            let kind = lookupKind(entry.home)
+            if kind == .other { skippedCodexEntries.insert(entry) }
+            return kind == .directory
+        }
+        return registerCodexProfiles(profiles, requireLoginIdentity: incremental)
+    }
+
+    private func registerCodexProfiles(_ profiles: [CodexProfiles.RootEntry], requireLoginIdentity: Bool) -> Int {
         guard !profiles.isEmpty, FileManager.default.fileExists(atPath: dbPath),
               let db = try? openDatabase(dbPath) else { return 0 }
         func normalized(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
+        func identityKey(_ id: String) -> String { UUID(uuidString: id)?.uuidString ?? id }
+        // A home-less row may have a local or imported key. Only a recognized
+        // native key can contradict the login, and only within its own namespace.
+        func allowsLegacyMatch(_ id: String, nativeId: String?) -> Bool {
+            guard UUID(uuidString: id) != nil || Self.isLegacyUserId(id) else { return true }
+            return !Self.accountIdsComparable(stored: id, reported: nativeId)
+        }
+        // Reserve native IDs across the batch before a legacy match can claim
+        // the row belonging to a profile later in directory order. Only the
+        // opaque account ID and email claim are used for registration.
+        let logins = profiles.map { profile in
+            (profile: profile, nativeId: CodexAuth.accountId(inHome: profile.home),
+             email: CodexAuth.email(inHome: profile.home))
+        }
+        let pendingNativeIDs = Set(logins.compactMap { $0.nativeId.map(identityKey) })
         var registered = 0
-        for profile in profiles {
-            let nativeId = CodexAuth.accountId(inHome: profile.home)
-            let email = CodexAuth.email(inHome: profile.home)
+        for (profile, nativeId, email) in logins {
+            // An incomplete login stays eligible even if its path already has an owner.
+            if requireLoginIdentity && nativeId == nil && email == nil { continue }
+            let nativeKey = nativeId.map(identityKey)
             do {
-                // Already registered to this exact home: nothing to do.
-                if try db.scalar("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", profile.home) as? Int64 ?? 0 > 0 {
-                    try db.run("UPDATE accounts SET codex_home_mode = ? WHERE codex_home = ?",
-                               CodexProfiles.snapshotMode, profile.home)
+                try db.execute("BEGIN IMMEDIATE")
+                // Holding the write lock keeps the home lookup, account and token-free
+                // credential consistent across concurrent startup, CLI and tick syncs.
+                let owners = try db.prepare("SELECT id, email, codex_home_mode FROM accounts WHERE codex_home = ?")
+                    .bind(profile.home)
+                if let owner = try owners.stepRow() {
+                    let hasMultipleOwners = try owners.stepRow() != nil
+                    let identity = Self.compareCodexHomeIdentity(storedAccountId: owner[0] as? String ?? "",
+                                                                 storedEmail: owner[1] as? String,
+                                                                 reportedAccountId: nativeId, reportedEmail: email)
+                    let needsConversion = owner[2] as? String != CodexProfiles.snapshotMode
+                    switch (hasMultipleOwners, identity) {
+                    case (true, _), (_, .conflict):
+                        try db.execute("COMMIT")
+                        skippedCodexEntries.insert(profile)
+                        flog.info("Skipped Loom Codex profile because its directory has conflicting ownership", category: fcat)
+                        continue
+                    case (_, .indeterminate) where needsConversion:
+                        // Login may publish the email after an ID that cannot identify
+                        // this legacy owner. Retry the same directory on the next tick.
+                        try db.execute("COMMIT")
+                        continue
+                    default:
+                        break
+                    }
+                    if needsConversion {
+                        try db.run("UPDATE accounts SET codex_home_mode = ? WHERE codex_home = ?",
+                                   CodexProfiles.snapshotMode, profile.home)
+                    }
+                    try db.execute("COMMIT")
+                    settledCodexProfiles.insert(profile)
                     continue
                 }
+                // Resolve existing owners before considering a home-less email
+                // match. A linked legacy row keeps its historical primary key,
+                // so its home's login can be the only record of its native ID.
                 var target: String?
                 let candidates = try db.prepare("""
-                    SELECT id, email FROM accounts
-                    WHERE COALESCE(provider, 'anthropic') = 'openai'
-                      AND (codex_home IS NULL OR TRIM(codex_home) = '')
-                    ORDER BY sort_order, id
+                    SELECT id, email, CASE WHEN TRIM(codex_home) != '' THEN codex_home END AS owned_home
+                    FROM accounts WHERE COALESCE(provider, 'anthropic') = 'openai'
+                    ORDER BY (owned_home IS NOT NULL) DESC, sort_order, id
                 """)
                 for row in candidates {
                     guard let id = row[0] as? String else { continue }
-                    let rowEmail = (row[1] as? String)?.lowercased()
-                    if id == nativeId || (email != nil && rowEmail == email!.lowercased()) {
-                        target = id; break
+                    let key = identityKey(id)
+                    if key == nativeKey {
+                        target = id
+                        break
                     }
-                    if email == nil, let local = rowEmail?.split(separator: "@").first,
-                       normalized(String(local)) == normalized(profile.name) {
-                        target = id; break
+                    if let home = row[2] as? String {
+                        guard let nativeKey, CodexAuth.accountId(inHome: home).map(identityKey) == nativeKey else { continue }
+                        target = id
+                        break
+                    }
+                    // Remember the first legacy match, but keep looking for
+                    // the native ID in the remaining home-less rows.
+                    guard target == nil, !pendingNativeIDs.contains(key),
+                          allowsLegacyMatch(id, nativeId: nativeId) else { continue }
+                    let rowEmail = (row[1] as? String)?.lowercased()
+                    if let email, rowEmail == email.lowercased() {
+                        target = id
+                    } else if email == nil, let local = rowEmail?.split(separator: "@").first,
+                              normalized(String(local)) == normalized(profile.name) {
+                        target = id
                     }
                 }
                 let accountId = target ?? nativeId ?? CodexProfiles.accountIdPrefix + profile.name
@@ -1138,7 +1232,16 @@ class OAuthPoller: ObservableObject {
                         provider = 'openai',
                         codex_home = excluded.codex_home,
                         codex_home_mode = excluded.codex_home_mode
+                    WHERE accounts.codex_home IS NULL OR TRIM(accounts.codex_home) = ''
                 """, accountId, profile.name, email, profile.home, CodexProfiles.snapshotMode)
+                // A matched owner or a colliding fallback key leaves the
+                // original account and its credential untouched.
+                if try db.scalar("SELECT changes()") as? Int64 == 0 {
+                    try db.execute("COMMIT")
+                    skippedCodexEntries.insert(profile)
+                    flog.info("Skipped Loom Codex profile because its account already owns a home", category: fcat)
+                    continue
+                }
                 // A credential row with no token: its presence (active) is what
                 // puts the account in the poll set; it never holds a secret.
                 if let credId = try db.scalar(
@@ -1155,12 +1258,19 @@ class OAuthPoller: ObservableObject {
                         VALUES (?, ?, 'loom-codex-profile', 'openai', NULL, NULL, NULL, 1, ?, ?)
                     """, accountId, profile.name, now, now)
                 }
+                try db.execute("COMMIT")
+                settledCodexProfiles.insert(profile)
                 registered += 1
-                flog.info("Registered Loom Codex profile \(profile.name) in snapshot mode"
-                          + (target != nil ? " (linked to existing account \(accountId.prefix(8))…)" : ""),
-                          category: fcat)
+                flog.info("Registered Loom Codex profile in snapshot mode", category: fcat)
             } catch {
-                flog.error("syncCodexProfiles: \(profile.name): \(error.localizedDescription)", category: fcat)
+                try? db.execute("ROLLBACK")
+                // SQLite error text can contain bound values (e.g. a trigger's
+                // RAISE message). Only the numeric result code is safe to log.
+                if let error = error as? SQLiteError {
+                    flog.error("Codex profile registration failed (SQLite code \(error.code))", category: fcat)
+                } else {
+                    flog.error("Codex profile registration failed", category: fcat)
+                }
             }
         }
         return registered
@@ -1581,7 +1691,7 @@ class OAuthPoller: ObservableObject {
     /// that isn't there, and is a no-op once one exists — including after the
     /// identity has been provisioned for real.
     @discardableResult
-    func syncFromAccountFiles() async -> [EnvImportResult] {
+    func syncFromAccountFiles(includeCodexProfiles: Bool = true) async -> [EnvImportResult] {
         let fm = FileManager.default
         var merged: [ParsedAccountEntry] = []
         var indexByEmail: [String: Int] = [:]
@@ -1607,8 +1717,9 @@ class OAuthPoller: ObservableObject {
         // z.ai keys live in their own chezmoi-managed directory rather than in
         // the account list files; sync them on the same launch cadence.
         let zaiResults = await syncZaiKeyFiles()
-        // Likewise Loom's Codex profiles, which need no network at all.
-        syncCodexProfiles()
+        if includeCodexProfiles {
+            syncCodexProfiles()
+        }
 
         guard !merged.isEmpty else {
             flog.info("syncFromAccountFiles: no account list files found", category: fcat)
@@ -2062,8 +2173,13 @@ class OAuthPoller: ObservableObject {
     /// override this via --interval; the app keeps the default.
     var pollInterval: TimeInterval = 600  // 10 minutes
 
-    /// Last poll time per credential ID
-    private var lastPollTimes: [Int64: Date] = [:]
+    /// A credential can keep its ID when registration switches its source to
+    /// profile snapshots. Only a poll in the same mode counts toward its interval.
+    private var lastPolls: [Int64: (time: Date, snapshotOnly: Bool)] = [:]
+
+    private var settledCodexProfiles: Set<CodexProfiles.RootEntry> = []
+    private var skippedCodexEntries: Set<CodexProfiles.RootEntry> = []
+    private var codexRootModificationTime: timespec?
 
     /// How often to probe the Fable tier per account (seconds). Independent of the
     /// Haiku poll — a few times an hour is enough to track Fable availability/usage
@@ -2093,34 +2209,38 @@ class OAuthPoller: ObservableObject {
         for credential in credentials {
             await pollWithRetry(credential)
             if let credId = credential.id {
-                lastPollTimes[credId] = Date()
+                lastPolls[credId] = (Date(), credential.isCodexSnapshotOnly)
             }
         }
     }
 
     /// Poll any accounts whose poll interval has elapsed. Returns count of accounts polled.
-    func pollDue() async -> Int {
+    func pollDue(environment: [String: String] = ProcessInfo.processInfo.environment) async -> Int {
         // A token rolled while the app runs is picked up within one tick; an
         // unchanged token file costs a file read and no network call.
-        await syncClaudeTokenFiles()
+        await syncClaudeTokenFiles(directories: ClaudeTokenFiles.directories(environment: environment))
+        // Likewise a Loom Codex profile directory that appeared since the last
+        // tick (#368) — an unchanged root costs one directory listing. Runs
+        // before `loadActiveCredentials` so the new row joins the poll set on
+        // the tick that discovers it.
+        discoverCodexProfiles(root: CodexProfiles.root(environment: environment))
         let credentials = loadActiveCredentials()
         reportStrandedCodexIdentities()
         guard !credentials.isEmpty else { return 0 }
         // Self-throttling on its own cadence, so calling it every tick is cheap
         // when it is not due (#230).
-        await refreshLoomCodexLiveReadings(for: credentials)
+        await refreshLoomCodexLiveReadings(for: credentials, environment: environment)
 
         let now = Date()
         var polled = 0
 
         for credential in credentials {
             guard let credId = credential.id else { continue }
-            let lastPoll = lastPollTimes[credId]
-            if lastPoll == nil || now.timeIntervalSince(lastPoll!) >= pollInterval {
-                await pollWithRetry(credential)
-                lastPollTimes[credId] = Date()
-                polled += 1
-            }
+            if let last = lastPolls[credId], last.snapshotOnly == credential.isCodexSnapshotOnly,
+               now.timeIntervalSince(last.time) < pollInterval { continue }
+            await pollWithRetry(credential)
+            lastPolls[credId] = (Date(), credential.isCodexSnapshotOnly)
+            polled += 1
         }
 
         return polled
@@ -2905,11 +3025,23 @@ class OAuthPoller: ObservableObject {
     nonisolated static func codexHomeConflicts(
         storedAccountId: String, storedEmail: String?, reportedAccountId: String?, reportedEmail: String?
     ) -> Bool {
-        guard !storedAccountId.isEmpty else { return false }
-        if accountIdsComparable(stored: storedAccountId, reported: reportedAccountId) {
-            return identitiesConflict(reportedAccountId, storedAccountId)
+        if case .conflict = compareCodexHomeIdentity(storedAccountId: storedAccountId, storedEmail: storedEmail,
+                                                     reportedAccountId: reportedAccountId, reportedEmail: reportedEmail) {
+            return true
         }
-        return identitiesConflict(reportedEmail, storedEmail)
+        return false
+    }
+
+    /// Live polling checks for a contradiction. Converting a stored owner to
+    /// snapshot mode requires a match, since rollout readings carry no identity.
+    nonisolated private static func compareCodexHomeIdentity(
+        storedAccountId: String, storedEmail: String?, reportedAccountId: String?, reportedEmail: String?
+    ) -> CodexIdentityComparison {
+        guard !storedAccountId.isEmpty else { return .indeterminate }
+        if accountIdsComparable(stored: storedAccountId, reported: reportedAccountId) {
+            return compareIdentities(reported: reportedAccountId, stored: storedAccountId)
+        }
+        return compareIdentities(reported: reportedEmail, stored: storedEmail)
     }
 
     /// Whether a stored account id and one a home reports are the **same kind
@@ -2925,8 +3057,11 @@ class OAuthPoller: ObservableObject {
     nonisolated static func accountIdsComparable(stored: String, reported: String?) -> Bool {
         guard let reported = reported?.trimmingCharacters(in: .whitespacesAndNewlines), !reported.isEmpty,
               !isLocallyMintedAccountId(stored) else { return false }
-        func isLegacyUserId(_ id: String) -> Bool { id.lowercased().hasPrefix("user-") }
         return isLegacyUserId(stored) == isLegacyUserId(reported)
+    }
+
+    nonisolated private static func isLegacyUserId(_ id: String) -> Bool {
+        id.lowercased().hasPrefix("user-")
     }
 
     /// Two identity strings that are both known and disagree. Pure function of

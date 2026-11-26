@@ -311,7 +311,8 @@ final class Statement: Sequence, IteratorProtocol {
         }
     }
 
-    fileprivate func stepRow() throws -> [Any?]? {
+    /// Read one row, propagating a step error to callers making a write decision.
+    func stepRow() throws -> [Any?]? {
         switch sqlite3_step(handle) {
         case SQLITE_ROW: return currentRow()
         case SQLITE_DONE: return nil

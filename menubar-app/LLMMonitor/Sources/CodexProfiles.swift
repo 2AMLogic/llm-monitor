@@ -59,22 +59,68 @@ enum CodexProfiles {
             .appendingPathComponent(".loom/codex-profiles").path
     }
 
-    struct Profile: Equatable {
+    /// Identity and type as reported by a single directory listing.
+    struct RootEntry: Hashable {
+        enum Kind: Hashable { case directory, other, needsLookup }
         let name: String
         let home: String
+        let inode: ino_t
+        let kind: Kind
     }
 
-    /// Every profile directory under `root`, sorted by name. Hidden entries
-    /// (Loom's own bookkeeping) are skipped.
-    static func scan(root: String?) -> [Profile] {
-        guard let root = root,
-              let names = try? FileManager.default.contentsOfDirectory(atPath: root) else { return [] }
-        return names.sorted().compactMap { name in
-            guard !name.hasPrefix(".") else { return nil }
-            let home = (root as NSString).appendingPathComponent(name)
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: home, isDirectory: &isDir), isDir.boolValue else { return nil }
-            return Profile(name: name, home: home)
+    struct RootListing {
+        let entries: [RootEntry]
+        let modificationTime: timespec?
+    }
+
+    /// The visible entries of `root` in name order, or nil when the root cannot
+    /// be listed (disabled, missing, unreadable). The type comes from the
+    /// listing (`d_type`), so a regular file costs no metadata lookup; only a
+    /// symlink or a filesystem that reports no type needs one.
+    static func listRoot(_ root: String?) -> RootListing? {
+        guard let root = root, let stream = opendir(root) else { return nil }
+        defer { closedir(stream) }
+        // Sample the open root before reading entries. A concurrent replacement
+        // during enumeration remains visible as a change on the next tick.
+        var metadata = stat()
+        let hasMetadata = fstat(dirfd(stream), &metadata) == 0
+        #if os(macOS)
+        let modificationTime = hasMetadata ? metadata.st_mtimespec : nil
+        #else
+        let modificationTime = hasMetadata ? metadata.st_mtim : nil
+        #endif
+        var entries: [RootEntry] = []
+        while let entry = readdir(stream) {
+            let name = withUnsafePointer(to: &entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: entry.pointee.d_name)) {
+                    String(cString: $0)
+                }
+            }
+            guard !name.hasPrefix(".") else { continue }  // also drops "." and ".."
+            let kind: RootEntry.Kind
+            switch Int32(entry.pointee.d_type) {
+            case Int32(DT_DIR): kind = .directory
+            case Int32(DT_UNKNOWN), Int32(DT_LNK): kind = .needsLookup
+            default: kind = .other
+            }
+            entries.append(RootEntry(name: name, home: (root as NSString).appendingPathComponent(name),
+                                     inode: entry.pointee.d_ino, kind: kind))
+        }
+        return RootListing(entries: entries.sorted { $0.name < $1.name }, modificationTime: modificationTime)
+    }
+
+    /// Resolve an untyped entry without caching a symlink's mutable target
+    /// or a transient lookup failure as a regular file.
+    static func lookupKind(_ path: String) -> RootEntry.Kind {
+        var metadata = stat()
+        guard lstat(path, &metadata) == 0 else { return .needsLookup }
+        switch metadata.st_mode & mode_t(S_IFMT) {
+        case mode_t(S_IFDIR): return .directory
+        case mode_t(S_IFLNK):
+            guard stat(path, &metadata) == 0, metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
+            else { return .needsLookup }
+            return .directory
+        default: return .other
         }
     }
 

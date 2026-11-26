@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 /// `llm-monitor selftest` — assertions over the portable core, runnable on
@@ -55,6 +56,7 @@ enum SelfTest {
         ("DataDirectoryMigration", { testDataDirectoryMigration() }),
         ("CodexRolloutSnapshotParsing", { testCodexRolloutSnapshotParsing() }),
         ("CodexProfileSyncSnapshotMode", { testCodexProfileSyncSnapshotMode() }),
+        ("CodexProfileTickDiscovery", { testCodexProfileTickDiscovery() }),
         ("LoomLiveCheckDecoding", { testLoomLiveCheckDecoding() }),
         ("LoomDaemonBinaryAndWorkspaceResolution", { testLoomDaemonBinaryAndWorkspaceResolution() }),
         ("LoomLiveCheckSpawnAgainstStub", { testLoomLiveCheckSpawnAgainstStub() }),
@@ -1893,6 +1895,477 @@ enum SelfTest {
             expect(!OAuthPoller.isLoomCodexProfile(root + "-other/agent-1", root: root), "a sibling path is not")
             expectEqual(CodexProfiles.root(environment: ["LOOM_CODEX_PROFILE_ROOT": " "]), nil,
                         "an explicitly empty LOOM_CODEX_PROFILE_ROOT disables profiles, as in loom-daemon")
+        }
+    }
+
+    /// Per-tick Loom Codex profile discovery (#368): a profile directory that
+    /// appears under the root while the monitor runs joins the poll set on the
+    /// tick that finds it, an unchanged root costs nothing beyond the
+    /// directory listing, a native account id that already owns a different
+    /// home is never taken over, and a failed registration stays eligible for
+    /// retry. Real due ticks run against fixture directories and a disabled
+    /// shared registry, so every reading comes from the local rollouts.
+    private static func testCodexProfileTickDiscovery() {
+        withSelfTestTempDir("codex-profile-tick") { dir in
+            let fm = FileManager.default
+            let root = dir.appendingPathComponent("codex-profiles").path
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            UsageStore(dbPath: dbPath).ensureDatabase()
+
+            func makeProfile(_ name: String, accountId: String?, email: String?, tokens fixtureTokens: [String: String] = [:]) {
+                let home = (root as NSString).appendingPathComponent(name)
+                try? fm.createDirectory(atPath: home + "/sessions/2026/09/23", withIntermediateDirectories: true)
+                if let accountId = accountId {
+                    var tokens = fixtureTokens
+                    tokens["account_id"] = accountId
+                    if let email = email {
+                        let claims = try! JSONSerialization.data(withJSONObject: ["email": email])
+                        let b64 = claims.base64EncodedString().replacingOccurrences(of: "=", with: "")
+                            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+                        tokens["id_token"] = "e30.\(b64).sig"
+                    }
+                    let auth = try! JSONSerialization.data(withJSONObject: ["tokens": tokens])
+                    fm.createFile(atPath: home + "/auth.json", contents: auth)
+                }
+            }
+            func writeSnapshot(_ name: String, weeklyPercent: Int) {
+                let observed = Date().addingTimeInterval(-7200)
+                let timestamp = ISO8601DateFormatter().string(from: observed)
+                let reset = Int(Date().timeIntervalSince1970) + 3 * 86400
+                let line = #"{"timestamp":"\#(timestamp)","payload":{"rate_limits":{"primary":{"used_percent":\#(weeklyPercent),"window_minutes":10080,"resets_at":\#(reset)},"secondary":null,"plan_type":"pro"}}}"#
+                let path = root + "/\(name)/sessions/2026/09/23/rollout-2026-09-23T16-55-50-x.jsonl"
+                try! Data((line + "\n").utf8).write(to: URL(fileURLWithPath: path))
+            }
+            // Assertion helpers open a fresh connection per call, so they
+            // always read what the poller's own short-lived connections wrote.
+            func text(_ sql: String, _ arg: String, at path: String = dbPath) -> String? {
+                guard let conn = try? openDatabase(path),
+                      let value = try? conn.scalar(sql, arg) else { return nil }
+                return value as? String
+            }
+            func count(_ sql: String, _ arg: String, at path: String = dbPath) -> Int {
+                guard let conn = try? openDatabase(path),
+                      let value = try? conn.scalar(sql, arg), let n = value as? Int64 else { return 0 }
+                return Int(n)
+            }
+
+            // "Launch": one profile on disk, plus a home-less OpenAI row whose
+            // identity the next profile will match — the pre-profile history
+            // the linking rule keeps attached.
+            makeProfile("alpha", accountId: "acct-alpha", email: nil,
+                        tokens: ["access_token": "fixture-access", "refresh_token": "fixture-refresh"])
+            let db = try! openDatabase(dbPath)
+            try! db.run("INSERT INTO accounts (id, account_name, email, provider) VALUES (?, ?, ?, 'openai')",
+                        "user-beta", "beta@example.com", "beta@example.com")
+
+            try! db.run("""
+                INSERT INTO oauth_credentials (account_id, label, provider, access_token, refresh_token, created_at, updated_at)
+                VALUES ('user-beta', 'beta', 'openai', 'old-access', 'old-refresh', 'now', 'now')
+                """)
+            let betaCredentialID = try! db.scalar("SELECT id FROM oauth_credentials WHERE account_id = 'user-beta'") as! Int64
+            let poller = OAuthPoller(dbPath: dbPath)
+            expectEqual(poller.syncCodexProfiles(root: root), 1,
+                        "the launch sync registers the profile that existed at launch")
+
+            expectEqual(count("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ? "
+                              + "AND access_token IS NULL AND refresh_token IS NULL", "acct-alpha"), 1,
+                        "a new snapshot credential stores neither token from auth.json")
+
+            // The directory appears a tick before login. Its name cannot identify
+            // the existing account. Only the eventual email claim links the two.
+            let slot = root + "/slot-7"
+            try! fm.createDirectory(atPath: slot, withIntermediateDirectories: false)
+            var directoryProbes: [String] = []
+            func probeKind(_ path: String) -> CodexProfiles.RootEntry.Kind {
+                directoryProbes.append(path)
+                return CodexProfiles.lookupKind(path)
+            }
+            try! db.run("INSERT INTO usage_history (account_id, timestamp, weekly_all_percent) VALUES (?, ?, 17)",
+                        "user-beta", ISO8601DateFormatter().string(from: Date().addingTimeInterval(-10800)))
+            let environment = [
+                "LOOM_CODEX_PROFILE_ROOT": root,
+                "LLM_MONITOR_CLAUDE_TOKEN_DIRS": dir.appendingPathComponent("empty-tokens").path,
+                "LOOM_SHARED_ACCOUNTS_ROOT": ""
+            ]
+            // The synchronous selftest owns the main thread. Pump its run loop
+            // while the real main-actor poll completes, without waiting a poll interval.
+            @MainActor func tick() -> Int {
+                let loop = CFRunLoopGetCurrent()
+                var polled: Int?
+                Task {
+                    polled = await poller.pollDue(environment: environment)
+                    CFRunLoopStop(loop)
+                }
+                let deadline = Date(timeIntervalSinceNow: 10)
+                while polled == nil && Date() < deadline {
+                    _ = RunLoop.current.run(mode: .default, before: deadline)
+                }
+                return polled ?? -1
+            }
+            expectEqual(tick(), 2,
+                        "the first tick polls alpha and the still home-less beta credential")
+            expectEqual(text("SELECT last_error FROM oauth_credentials WHERE account_id = ?", "user-beta"),
+                        OAuthPoller.exhaustedTiersMessage(home: .ambiguous),
+                        "the first poll records why the home-less credential cannot supply a reading")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 0,
+                        "the first tick leaves the home available for identity matching")
+
+            makeProfile("slot-7", accountId: "acct-beta", email: "beta@example.com")
+            writeSnapshot("slot-7", weeklyPercent: 43)
+
+            expectEqual(tick(), 1,
+                        "only the newly converted beta credential is due on the discovering tick")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "user-beta"), slot,
+                        "the home-less row keeps its id and gains the new home")
+            expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND weekly_all_percent = 17",
+                              "user-beta"), 1, "the linked account keeps its earlier history")
+            expectEqual(text("SELECT codex_home_mode FROM accounts WHERE id = ?", "user-beta"),
+                        CodexProfiles.snapshotMode, "the linked row is in snapshot mode")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 1,
+                        "exactly one row owns the new home")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = ?", "acct-beta"), 0,
+                        "no second row is keyed on the native id when an existing row links")
+            expectEqual(count("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ? AND is_active = 1 "
+                              + "AND access_token IS NULL AND refresh_token IS NULL AND source = 'loom-codex-profile'", "user-beta"), 1,
+                        "the linked row has exactly one active, token-free profile credential")
+            expectEqual(try! db.scalar("SELECT id FROM oauth_credentials WHERE account_id = 'user-beta'") as? Int64,
+                        betaCredentialID, "conversion reuses the recently polled credential id")
+            expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND is_synthetic = 0 "
+                              + "AND weekly_all_percent = 43", "user-beta"), 1,
+                        "the discovering tick archives the profile snapshot under the existing id")
+            expect(text("SELECT last_error FROM oauth_credentials WHERE account_id = ?", "user-beta") == nil,
+                   "the same tick clears the old credential error")
+            expectEqual(tick(), 0, "the next tick respects the poll interval")
+
+            @MainActor func checkDiscoveryTick(_ profiles: [(id: String, name: String, email: String?, percent: Int)]) {
+                for profile in profiles {
+                    makeProfile(profile.name, accountId: profile.id, email: profile.email)
+                    writeSnapshot(profile.name, weeklyPercent: profile.percent)
+                }
+                expectEqual(tick(), profiles.count, "every new login is polled on the discovery tick")
+                for profile in profiles {
+                    expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", profile.id), root + "/" + profile.name,
+                                "the exact account \(profile.id) owns its login's directory")
+                    expectEqual(try! db.scalar("SELECT weekly_all_percent FROM usage_history WHERE account_id = ?",
+                                               profile.id) as? Double, Double(profile.percent),
+                                "the discovery tick records the login's own reading for \(profile.id)")
+                }
+            }
+
+            // B's directory sorts first, but A sorts first among rows with the
+            // shared email. The third login has only its native ID and a
+            // directory name matching an unrelated row's email local part.
+            try! db.execute("""
+                INSERT INTO accounts (id, email, provider, sort_order) VALUES
+                    ('native-a', 'team@example.com', 'openai', 1),
+                    ('native-b', 'team@example.com', 'openai', 2),
+                    ('legacy-name', 'name.match@example.com', 'openai', 3),
+                    ('native-no-email', NULL, 'openai', 4)
+                """)
+            checkDiscoveryTick([
+                ("native-b", "01-b", "team@example.com", 72),
+                ("native-a", "02-a", "team@example.com", 34),
+                ("native-no-email", "namematch", nil, 51)
+            ])
+            expect(text("SELECT codex_home FROM accounts WHERE id = ?", "legacy-name") == nil,
+                   "the directory-name match leaves the unrelated legacy row home-less")
+
+            // Only the later login in each pair has a row. The earlier login
+            // matches that row by email or directory name and needs its own row.
+            try! db.execute("""
+                INSERT INTO accounts (id, email, provider) VALUES
+                    ('existing-email', 'pool@example.com', 'openai'),
+                    ('existing-name', 'pool.name@example.com', 'openai')
+                """)
+            checkDiscoveryTick([
+                ("new-email", "03-new", "pool@example.com", 67),
+                ("existing-email", "04-existing", "pool@example.com", 27),
+                ("new-name", "poolname", nil, 71),
+                ("existing-name", "z-existing", "pool.name@example.com", 33)
+            ])
+
+            // The rightful owners can also arrive a tick later, outside the
+            // current batch. These fixture workspace IDs identify the two
+            // pre-existing rows across both ticks.
+            let shiftWorkspaceID = "aaaaaaaa-0000-4000-8000-000000000001"
+            let nextShiftWorkspaceID = "cccccccc-0000-4000-8000-000000000003"
+            try! db.run("INSERT INTO accounts (id, email, provider) VALUES (?, ?, 'openai'), (?, ?, 'openai')",
+                        shiftWorkspaceID, "shift@example.com", nextShiftWorkspaceID, "next.shift@example.com")
+            checkDiscoveryTick([
+                ("bbbbbbbb-0000-4000-8000-000000000002", "early-email", "shift@example.com", 64),
+                ("dddddddd-0000-4000-8000-000000000004", "nextshift", nil, 71)
+            ])
+            for id in [shiftWorkspaceID, nextShiftWorkspaceID] {
+                expect(text("SELECT codex_home FROM accounts WHERE id = ?", id) == nil,
+                       "the absent workspace keeps its home unassigned")
+                expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", id), 0,
+                            "the earlier login writes no usage under the absent workspace")
+            }
+            checkDiscoveryTick([
+                (shiftWorkspaceID, "later-email", "shift@example.com", 21),
+                (nextShiftWorkspaceID, "later-name", "next.shift@example.com", 33)
+            ])
+
+            // A UUID with a different spelling still identifies the existing owner.
+            makeProfile("duplicate-uppercase", accountId: shiftWorkspaceID.uppercased(), email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "UUID casing cannot create a second owner")
+            try! fm.removeItem(atPath: root + "/duplicate-uppercase")
+
+            // A legacy user key and a current workspace UUID describe different
+            // kinds of identity. A login with no email can still use the name.
+            try! db.run("INSERT INTO accounts (id, email, provider) VALUES (?, ?, 'openai')",
+                        "user-oldshift", "old.shift@example.com")
+            checkDiscoveryTick([("user-othershift", "other-user", "old.shift@example.com", 19)])
+            makeProfile("oldshift", accountId: "eeeeeeee-0000-4000-8000-000000000005", email: nil)
+            writeSnapshot("oldshift", weeklyPercent: 18)
+            expectEqual(tick(), 1, "the legacy name match is polled on discovery")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "user-oldshift"), root + "/oldshift",
+                        "the legacy user row gains the workspace home")
+            expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND weekly_all_percent = 18",
+                              "user-oldshift"), 1, "the reading belongs to the legacy account")
+
+            // Occupied paths can reappear before login completes. Exercise the
+            // regular codex-home credentials without launching a host Codex CLI.
+            let previousBinary = ProcessInfo.processInfo.environment[CodexBinary.overrideEnvKey]
+            setenv(CodexBinary.overrideEnvKey, dir.appendingPathComponent("no-codex").path, 1)
+            defer {
+                if let previousBinary { setenv(CodexBinary.overrideEnvKey, previousBinary, 1) }
+                else { unsetenv(CodexBinary.overrideEnvKey) }
+            }
+            let formerOwnerID = "f0f0f0f0-0000-4000-8000-000000000006"
+            let reusedLoginID = "a1a1a1a1-0000-4000-8000-000000000007"
+            for (id, name) in [(formerOwnerID, "reused-slot"), ("user-former", "legacy-slot"),
+                               ("user-returning", "returning-slot")] {
+                try! db.run("INSERT INTO accounts (id, email, provider, codex_home) VALUES (?, ?, 'openai', ?)",
+                            id, name + "@example.com", root + "/" + name)
+                try! db.run("""
+                    INSERT INTO oauth_credentials (account_id, label, provider, source, is_active, created_at, updated_at)
+                    VALUES (?, ?, 'openai', 'codex-home', 1, 'now', 'now')
+                    """, id, name)
+            }
+            // Older databases may have two stored owners for the same path.
+            for id in ["user-shared-first", "user-shared-second"] {
+                try! db.run("INSERT INTO accounts (id, email, provider, codex_home) VALUES (?, 'shared-slot@example.com', 'openai', ?)",
+                            id, root + "/shared-slot")
+            }
+            makeProfile("shared-slot", accountId: "dddddddd-0000-4000-8000-000000000010", email: "shared-slot@example.com")
+            try! fm.createDirectory(atPath: root + "/reused-slot", withIntermediateDirectories: false)
+            let returningWorkspace = "cccccccc-0000-4000-8000-000000000009"
+            makeProfile("returning-slot", accountId: returningWorkspace, email: nil)
+            makeProfile("legacy-slot", accountId: "bbbbbbbb-0000-4000-8000-000000000008", email: "other@example.com")
+            writeSnapshot("legacy-slot", weeklyPercent: 61)
+            expectEqual(tick(), 3, "the three occupied paths' credentials are polled")
+            func retainsOriginalMode(_ id: String) -> Bool {
+                count("SELECT COUNT(*) FROM accounts WHERE id = ? AND codex_home_mode IS NULL", id) == 1
+            }
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ? AND codex_home_mode IS NULL", root + "/shared-slot"),
+                        2, "a shared path and email cannot identify a single owner")
+            expect(retainsOriginalMode(formerOwnerID), "an empty directory cannot convert its stored workspace owner")
+            expect(retainsOriginalMode("user-former"), "a conflicting login email cannot convert its legacy owner")
+            expect(retainsOriginalMode("user-returning"), "a workspace ID alone cannot confirm a legacy user ID")
+
+            makeProfile("reused-slot", accountId: reusedLoginID, email: nil)
+            writeSnapshot("reused-slot", weeklyPercent: 73)
+            makeProfile("returning-slot", accountId: returningWorkspace, email: "RETURNING-slot@example.com")
+            writeSnapshot("returning-slot", weeklyPercent: 26)
+            // Make the next tick due now, including for a mistakenly converted owner.
+            let previousInterval = poller.pollInterval
+            poller.pollInterval = 0
+            expect(tick() > 0, "the tick after login completes polls the due credentials")
+            poller.pollInterval = previousInterval
+            expect(retainsOriginalMode(formerOwnerID), "the new workspace cannot convert the former owner")
+            expect(retainsOriginalMode("user-former"), "the legacy owner's mode stays unchanged on later ticks")
+            let recordedAccountIDs = try! db.prepare("SELECT DISTINCT account_id FROM usage_history")
+                .map { $0[0] as! String }
+            expect(!recordedAccountIDs.contains(formerOwnerID), "the former workspace receives no usage")
+            expect(!recordedAccountIDs.contains(reusedLoginID), "the skipped login has no usage history")
+            expect(!recordedAccountIDs.contains("user-former"), "the legacy owner receives no usage")
+            expectEqual(text("SELECT codex_home_mode FROM accounts WHERE id = ?", "user-returning"),
+                        CodexProfiles.snapshotMode, "a matching email converts its legacy owner after login")
+            expectEqual(try! db.scalar("SELECT weekly_all_percent FROM usage_history WHERE account_id = 'user-returning'") as? Double,
+                        26, "the returning owner receives its own snapshot on that tick")
+            for name in ["reused-slot", "legacy-slot", "shared-slot"] { try! fm.removeItem(atPath: root + "/" + name) }
+
+            // An unchanged root: the listing is the whole cost. Deleting the
+            // row makes any per-home registration work visible — the
+            // unconditional full sync would resurrect it — and none may
+            // happen, so the settled set must be consulted before any
+            // per-home identity read or registration SQL.
+            try! db.run("DELETE FROM oauth_credentials WHERE account_id = ?", "user-beta")
+            try! db.run("DELETE FROM accounts WHERE id = ?", "user-beta")
+            // Exercise both legal listing formats regardless of the host filesystem.
+            let readme = root + "/pool-readme.txt"
+            try! Data("notes".utf8).write(to: URL(fileURLWithPath: readme))
+            typealias Entry = CodexProfiles.RootEntry
+            let listing = CodexProfiles.listRoot(root)!
+            let rest = listing.entries.filter { $0.home != readme }
+            @MainActor func discover(_ listing: CodexProfiles.RootListing) -> Int {
+                poller.syncCodexProfiles(listing, incremental: true, lookupKind: probeKind)
+            }
+            func fileListing(_ kind: Entry.Kind, modified: Int) -> CodexProfiles.RootListing {
+                // Keep the inode fixed even after replacement to exercise inode reuse.
+                let file = Entry(name: "pool-readme.txt", home: readme, inode: 2, kind: kind)
+                return CodexProfiles.RootListing(entries: rest + [file], modificationTime: timespec(tv_sec: modified, tv_nsec: 0))
+            }
+            expectEqual(discover(fileListing(.other, modified: 1)), 0, "a known regular file registers nothing")
+            expectEqual(directoryProbes, [], "known files and settled directories cost no probes")
+            let unchanged = fileListing(.needsLookup, modified: 1)
+            expectEqual(discover(unchanged), 0, "the new regular file registers nothing")
+            expectEqual(directoryProbes, [readme], "the new untyped file is probed once")
+            directoryProbes.removeAll()
+            for _ in 0..<2 {
+                expectEqual(discover(unchanged), 0, "an unchanged root registers nothing")
+                expectEqual(directoryProbes, [], "an unchanged untyped file costs no further lookups")
+            }
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", slot), 0,
+                        "a settled home is skipped before any per-home identity read or registration SQL")
+
+            try! fm.removeItem(atPath: readme)
+            makeProfile("pool-readme.txt", accountId: "acct-was-file", email: nil)
+            expectEqual(discover(fileListing(.needsLookup, modified: 2)), 1,
+                        "a directory replacing a cached file registers immediately")
+            expectEqual(directoryProbes, [readme], "the changed root triggers one fresh lookup")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-was-file"), readme,
+                        "the replacement owns the former file path")
+
+            // A symlink target can become a directory without changing the root.
+            let link = root + "/linked-home"
+            let target = dir.appendingPathComponent("link-target").path
+            try! fm.createSymbolicLink(atPath: link, withDestinationPath: target)
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "a dangling link registers nothing")
+            try! Data().write(to: URL(fileURLWithPath: target))
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "a link to a regular file registers nothing")
+            try! fm.removeItem(atPath: target)
+            try! fm.createDirectory(atPath: target, withIntermediateDirectories: false)
+            makeProfile("linked-home", accountId: "acct-symlink", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "a link whose target becomes a profile stays eligible")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-symlink"), link,
+                        "the newly available directory is registered through its link")
+
+            // A second directory whose native id already owns a different
+            // home: neither the original row nor its credential may change.
+            makeProfile("owned", accountId: "acct-owned", email: "owned@example.com")
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "the owned profile registers normally")
+            makeProfile("zz-incoming", accountId: "acct-owned", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 0,
+                        "a conflicting native id registers nothing")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-owned"), root + "/owned",
+                        "the row that already owns a home keeps it")
+            expectEqual(text("SELECT codex_home_mode FROM accounts WHERE id = ?", "acct-owned"),
+                        CodexProfiles.snapshotMode, "and keeps its snapshot mode")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", root + "/zz-incoming"), 0,
+                        "no row is created for the conflicting profile")
+            expectEqual(count("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ? AND is_active = 1",
+                              "acct-owned"), 1,
+                        "the original account's credential is preserved, not duplicated")
+            expectEqual(poller.discoverCodexProfiles(root: root), 0,
+                        "the conflict is settled, so later ticks do not retry it")
+
+            // Replacing a conflicting directory between listings must register
+            // the new login immediately, even on filesystems that recycle inodes.
+            let swap = root + "/swap"
+            makeProfile("swap", accountId: "acct-owned", email: nil)
+            // Model separate poll ticks even on a filesystem with a coarse clock.
+            try! fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: root)
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "the first login at swap conflicts")
+            try! fm.removeItem(atPath: swap)
+            makeProfile("swap", accountId: "acct-swap", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "a replacement between ticks registers immediately")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-swap"), swap,
+                        "the replacement login owns its new home")
+
+            // Show the poller a regular file, then return the very same directory
+            // with a new login. The file tick alone must have cleared the conflict.
+            let viaFile = root + "/via-file"
+            let parked = dir.appendingPathComponent("parked").path
+            makeProfile("via-file", accountId: "acct-owned", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "the first login at via-file conflicts")
+            try! fm.moveItem(atPath: viaFile, toPath: parked)
+            try! Data().write(to: URL(fileURLWithPath: viaFile))
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "the intervening regular file registers nothing")
+            try! fm.removeItem(atPath: viaFile)
+            try! fm.moveItem(atPath: parked, toPath: viaFile)
+            makeProfile("via-file", accountId: "acct-via-file", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "a directory returning after a file registers immediately")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-via-file"), viaFile,
+                        "the login after the file owns the reused path")
+
+            // A conflicting name that disappears for a tick is forgotten. A
+            // different login that later reuses the name registers, and the
+            // existing rows are left alone while the path is absent.
+            try! fm.removeItem(atPath: root + "/zz-incoming")
+            expectEqual(poller.discoverCodexProfiles(root: root), 0, "the removed conflicting directory registers nothing")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = ?", "acct-owned"), 1,
+                        "removing a directory never deletes an existing row")
+            makeProfile("zz-incoming", accountId: "acct-reused", email: nil)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1,
+                        "a new login reusing a previously conflicting name registers")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-reused"), root + "/zz-incoming",
+                        "the reused name is owned by the new account")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-owned"), root + "/owned",
+                        "the original owner keeps its own home")
+
+            // Native identity and row ID can differ in either direction. One
+            // native login is already linked under a legacy ID. The other owns
+            // its native row, but a home-less legacy row also matches its email.
+            try! db.run("INSERT INTO accounts (id, email, provider) VALUES ('legacy-linked', 'shared@example.com', 'openai')")
+            makeProfile("linked", accountId: "native-linked", email: "shared@example.com")
+            writeSnapshot("linked", weeklyPercent: 21)
+            writeSnapshot("owned", weeklyPercent: 22)
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "the first home links to the legacy row")
+            try! db.run("INSERT INTO accounts (id, email, provider) VALUES ('legacy-free', 'owned@example.com', 'openai')")
+            makeProfile("duplicate-linked", accountId: "native-linked", email: "shared@example.com")
+            makeProfile("duplicate-owned", accountId: "acct-owned", email: "owned@example.com")
+            makeProfile("distinct", accountId: "native-distinct", email: "shared@example.com")
+            writeSnapshot("duplicate-linked", weeklyPercent: 61)
+            writeSnapshot("duplicate-owned", weeklyPercent: 62)
+            writeSnapshot("distinct", weeklyPercent: 63)
+
+            expectEqual(poller.discoverCodexProfiles(root: root), 1, "only the distinct native login registers")
+            for credential in poller.loadActiveCredentials() where credential.isCodexSnapshotOnly {
+                poller.pollCodexSnapshot(credential)
+            }
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = ?", "native-linked"), 0,
+                        "the linked login gains no native-keyed sibling")
+            expect(text("SELECT codex_home FROM accounts WHERE id = ?", "legacy-free") == nil,
+                   "the duplicate leaves the email-matching legacy row home-less")
+            for id in ["native-linked", "legacy-free"] {
+                expectEqual(count("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ?", id), 0,
+                            "no credential is written for the duplicate under \(id)")
+                expectEqual(count("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", id), 0,
+                            "no duplicate usage is recorded under \(id)")
+            }
+            expectEqual(try! db.scalar("SELECT COUNT(*) FROM usage_history WHERE weekly_all_percent IN (61, 62)") as? Int64, 0,
+                        "neither duplicate home's snapshot is attributed to any account")
+            for (id, percent) in [("legacy-linked", 21), ("acct-owned", 22), ("native-distinct", 63)] {
+                expectEqual(try! db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND weekly_all_percent = ?",
+                                           id, percent) as? Int64, 1, "the owning home supplies the reading for \(id)")
+            }
+
+            // Fail the credential insert after the account upsert. A partial
+            // account would make the next tick skip credential registration.
+            let retryRoot = dir.appendingPathComponent("codex-profiles-retry").path
+            let retryDb = dir.appendingPathComponent("retry.db").path
+            UsageStore(dbPath: retryDb).ensureDatabase()
+            let retryConnection = try! openDatabase(retryDb)
+            try! retryConnection.execute("""
+                CREATE TRIGGER fail_profile_credential BEFORE INSERT ON oauth_credentials
+                BEGIN SELECT RAISE(ABORT, 'private-fixture-diagnostic'); END
+                """)
+            let retryHome = (retryRoot as NSString).appendingPathComponent("gamma")
+            try? fm.createDirectory(atPath: retryHome + "/sessions/2026/09/23", withIntermediateDirectories: true)
+            let retryAuth = try! JSONSerialization.data(withJSONObject: ["tokens": ["account_id": "acct-gamma"]])
+            fm.createFile(atPath: retryHome + "/auth.json", contents: retryAuth)
+            let retryPoller = OAuthPoller(dbPath: retryDb)
+            expectEqual(retryPoller.discoverCodexProfiles(root: retryRoot), 0,
+                        "a registration that cannot write registers nothing")
+            expectEqual(count("SELECT COUNT(*) FROM accounts WHERE id = ?", "acct-gamma", at: retryDb), 0,
+                        "the credential failure rolls back the account upsert")
+            try! retryConnection.execute("DROP TRIGGER fail_profile_credential")
+            expectEqual(retryPoller.discoverCodexProfiles(root: retryRoot), 1,
+                        "the failed home is retried on the next tick and registers")
+            expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", "acct-gamma", at: retryDb),
+                        retryRoot + "/gamma", "the retried registration landed")
         }
     }
 
