@@ -1995,7 +1995,10 @@ enum SelfTest {
                     polled = await poller.pollDue(environment: environment)
                     CFRunLoopStop(loop)
                 }
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 10, false)
+                let deadline = Date(timeIntervalSinceNow: 10)
+                while polled == nil && Date() < deadline {
+                    _ = RunLoop.current.run(mode: .default, before: deadline)
+                }
                 return polled ?? -1
             }
             expectEqual(tick(), 2,
