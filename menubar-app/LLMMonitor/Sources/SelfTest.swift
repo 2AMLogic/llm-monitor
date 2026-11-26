@@ -38,6 +38,7 @@ enum SelfTest {
         ("PoolSummaryTally", { testPoolSummaryTally() }),
         ("PoolSummaryTabFallback", { testPoolSummaryTabFallback() }),
         ("PoolInputAssembly", { testPoolInputAssembly() }),
+        ("PoolTallyHonorsStoredRejection", { testPoolTallyHonorsStoredRejection() }),
         ("ResetAdvisor", { testResetAdvisor() }),
         ("WindowKindDerivation", { testWindowKindDerivation() }),
         ("SnapshotFromPositionalWindows", { testSnapshotFromPositionalWindows() }),
@@ -1359,6 +1360,105 @@ enum SelfTest {
             "a reading with no reset-credit archive says unknown, never 0")
     }
 
+    /// Classify the same fresh SQLite row through the popover, export and accounts CLI.
+    private static func testPoolTallyHonorsStoredRejection() {
+        do {
+            try withSelfTestTempDir("pool-stored-rejection") { dir in
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+                let accountId = "acct-fixture"
+                let poller = OAuthPoller(dbPath: dbPath)
+                poller.saveCodexHomeAccount(
+                    accountId: accountId, email: "fixture@example.com", plan: nil, codexHome: dir.path
+                )
+
+                @MainActor
+                func checkPopover(_ status: String?, usable: Int, exhausted: Int, blocked: Bool = false) {
+                    store.loadFromDatabase()
+                    let inputs = ProviderPoolSummary.poolInputs(
+                        accounts: store.accounts, latestUsage: store.latestUsage,
+                        blockedIds: blocked ? [accountId] : []
+                    )
+                    let tally = ProviderPoolSummary.tally(inputs)
+                    let label = status ?? "unknown"
+                    expectEqual(tally.total, 1, "one configured fixture seat")
+                    expectEqual(inputs.first?.status, status, "popover status for \(label)")
+                    expectEqual(tally.usable, usable, "usable seats for \(label)")
+                    expectEqual(tally.exhausted, exhausted, "exhausted seats for \(label)")
+                }
+
+                @MainActor
+                func checkOtherSurfaces(_ status: String, summary: String) throws {
+                    expectEqual(RankingExporter.statusReading(db: db, accountId: accountId).status,
+                                status, "export status reading")
+                    let output = dir.appendingPathComponent("ranking.json")
+                    RankingExporter.exportNow(dbPath: dbPath, outputPath: output.path)
+                    let data = try Data(contentsOf: output)
+                    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    let accounts = json?["accounts"] as? [[String: Any]]
+                    expectEqual(accounts?.first?["status"] as? String, status, "ranking.json account status")
+
+                    if let cli = resolveCLIBinary() {
+                        let result = try AccountSyncRemote.runProcess(
+                            executable: cli, arguments: ["accounts", "list", "--provider", "openai", "--db", dbPath],
+                            timeout: 60
+                        )
+                        expectEqual(result.status, 0, "accounts list exit status")
+                        let listing = String(decoding: result.stdout, as: UTF8.self)
+                        expect(listing.contains("OpenAI — \(summary) (1 configured)"),
+                               "accounts list should report \(summary), got \(listing)")
+                    }
+                }
+
+                // A provisioned seat that has never reported has no pool status.
+                checkPopover(nil, usable: 0, exhausted: 0)
+
+                let rejected = try OpenAIAPIClient.snapshot(from: Data(rejectedOpenAIUsageFixture.utf8), httpStatus: 200)
+                expectEqual(rejected.rateLimit.weekly?.usedPercent, 14, "fixture rejects below the weekly cap")
+                poller.writeUsageToDB(
+                    accountId: accountId, sessionPercent: rejected.rateLimit.session?.usedPercent,
+                    weeklyPercent: rejected.rateLimit.weekly?.usedPercent, sessionReset: nil, weeklyReset: nil,
+                    rawFields: rejected.rawFields, probeModel: "openai-usage", httpStatus: rejected.httpStatus,
+                    observedAt: Date().addingTimeInterval(-2)
+                )
+                checkPopover("exhausted", usable: 0, exhausted: 1)
+                try checkOtherSurfaces("exhausted", summary: "0 usable · 1 exhausted")
+                checkPopover("blocked", usable: 0, exhausted: 0, blocked: true)
+
+                // The scratch database contains exactly one reading. Vary its archive in place.
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM usage_history") as? Int64, 1,
+                            "one stored fixture reading")
+                func setArchive(_ raw: String?) throws {
+                    try db.run("UPDATE usage_history SET raw_data = ?", raw)
+                }
+                try setArchive(#"{"overall_status":"rejected","weekly_status":"allowed"}"#)
+                checkPopover("rate_limited", usable: 0, exhausted: 0)
+                try checkOtherSurfaces("rate_limited", summary: "0 usable")
+                try setArchive(#"{"anthropic-ratelimit-unified-status":"rejected"}"#)
+                checkPopover("rate_limited", usable: 0, exhausted: 0)
+                try setArchive(#"{"session_status":"rejected"}"#)
+                checkPopover("rate_limited", usable: 0, exhausted: 0)
+                try setArchive(#"{"weekly_status":"rejected","rate_limit_reset_credits.available_count":"1"}"#)
+                checkPopover("exhausted", usable: 0, exhausted: 1)
+                expectEqual(store.latestUsage[accountId]?.resetCredits?.availableCount, 1, "credits on the same row")
+
+                for raw in [nil, "not JSON", #"{"weekly_status":true}"#, #"{"weekly_status":"allowed_warning"}"#] {
+                    try setArchive(raw)
+                    checkPopover("available", usable: 1, exhausted: 0)
+                }
+                try db.run("UPDATE usage_history SET weekly_all_percent = 100")
+                for raw in [nil, "not JSON", #"{"weekly_status":"allowed","session_status":"rejected"}"#] {
+                    try setArchive(raw)
+                    checkPopover("exhausted", usable: 0, exhausted: 1)
+                }
+            }
+        } catch {
+            expect(false, "stored rejection fixture failed: \(error)")
+        }
+    }
+
     // MARK: - Window model
 
     /// Window kind must come from the window's *duration*, never its position
@@ -1491,6 +1591,10 @@ enum SelfTest {
       ]
     }
     """
+
+    private static let rejectedOpenAIUsageFixture = openAIUsageFixture
+        .replacingOccurrences(of: "\"limit_reached\": false", with: "\"limit_reached\": true")
+        .replacingOccurrences(of: "\"allowed\": true", with: "\"allowed\": false")
 
     /// The wire contract, mapped onto the shared model: windows filed by
     /// duration, a null secondary window left nil, identity picked up from the
@@ -2361,10 +2465,7 @@ enum SelfTest {
                         "additional_rate_limits land in the named sub-limit map")
 
             // `limit_reached` is the direct "you are cut off" signal.
-            let capped = openAIUsageFixture
-                .replacingOccurrences(of: "\"limit_reached\": false", with: "\"limit_reached\": true")
-                .replacingOccurrences(of: "\"allowed\": true", with: "\"allowed\": false")
-            let cappedSnapshot = try OpenAIAPIClient.snapshot(from: Data(capped.utf8), httpStatus: 200)
+            let cappedSnapshot = try OpenAIAPIClient.snapshot(from: Data(rejectedOpenAIUsageFixture.utf8), httpStatus: 200)
             expectEqual(cappedSnapshot.rateLimit.overallStatus, "rejected",
                         "limit_reached maps to the shared 'rejected' status")
             expect(cappedSnapshot.rateLimit.weekly?.isExhausted == true,

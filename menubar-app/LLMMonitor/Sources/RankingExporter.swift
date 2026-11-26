@@ -468,7 +468,7 @@ enum RankingExporter {
         }
 
         // Parse the per-poll status blob written by OAuthPoller.writePingToDB().
-        let statuses = parseStatuses(rawData)
+        let statuses = parseStoredStatuses(rawData)
         let credential = credentialState(db: db, accountId: accountId)
         let status = mapStatus(
             overallStatus: statuses.overall,
@@ -517,22 +517,29 @@ enum RankingExporter {
         return (true, false)
     }
 
-    private struct Statuses { let overall: String?; let session: String?; let weekly: String? }
+    struct StoredStatuses {
+        let overall: String?
+        let session: String?
+        let weekly: String?
 
-    /// Parse the status blob stored in `usage_history.raw_data`. Two shapes exist
-    /// in the wild and both are tolerated:
-    ///   1. The compact form written by this repo's `OAuthPoller.writePingToDB()`:
-    ///      `{"ping_status":200,"session_status":"allowed","weekly_status":"allowed","overall_status":"allowed"}`
-    ///   2. The full response-header form written by the external poller that
-    ///      populates the live DB, keyed by the raw `anthropic-ratelimit-unified-*`
-    ///      header names.
+        static let unreported = Self(overall: nil, session: nil, weekly: nil)
+    }
+
+    /// Parse the status blob stored in `usage_history.raw_data`. Two key
+    /// spellings exist in stored rows and both are read:
+    ///   1. The compact form the live usage pollers archive beside their
+    ///      flattened fields (OpenAI `wham/usage`, `codex app-server`, z.ai):
+    ///      `{"session_status":"allowed","weekly_status":"allowed","overall_status":"allowed"}`
+    ///   2. The full response-header form keyed by the raw
+    ///      `anthropic-ratelimit-unified-*` header names — the Anthropic ping
+    ///      archive, and the external poller that populates the live DB.
     /// Only status *strings* (`allowed` / `allowed_warning` / `rejected`) are read —
     /// never token or identity fields.
-    private static func parseStatuses(_ raw: String?) -> Statuses {
+    static func parseStoredStatuses(_ raw: String?) -> StoredStatuses {
         guard let raw = raw,
               let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return Statuses(overall: nil, session: nil, weekly: nil)
+            return .unreported
         }
         func str(_ keys: String...) -> String? {
             for key in keys {
@@ -540,7 +547,7 @@ enum RankingExporter {
             }
             return nil
         }
-        return Statuses(
+        return StoredStatuses(
             overall: str("overall_status", "anthropic-ratelimit-unified-status"),
             session: str("session_status", "anthropic-ratelimit-unified-5h-status"),
             weekly: str("weekly_status", "anthropic-ratelimit-unified-7d-status")
