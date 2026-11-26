@@ -10,9 +10,8 @@
 # user unit with a rewritten ExecStart=, seeds accounts.env, and verifies the
 # result with --version / selftest / systemctl status.
 #
-# Idempotent and safe to re-run: an unchanged version is reported as a no-op
-# rather than reinstalled/restarted; a newer version upgrades in place and
-# restarts the unit.
+# An identical executable skips reinstallation. A different build replaces
+# the installed executable and restarts the unit, even at the same version.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -262,7 +261,7 @@ maybe_sudo() {
     if [[ -w "$INSTALL_DIR" ]] || { [[ ! -e "$INSTALL_DIR" ]] && [[ -w "$(dirname "$INSTALL_DIR")" ]]; }; then
         "$@"
     else
-        log "'$PREFIX' is not writable by $(whoami) — using sudo for this step."
+        log "'$PREFIX' is not writable by $(whoami) — using sudo for this step." >&2
         sudo "$@"
     fi
 }
@@ -273,12 +272,18 @@ if [[ -x "$INSTALL_BIN" ]]; then
 fi
 
 BINARY_CHANGED=false
-if [[ -n "$OLD_VERSION" && "$OLD_VERSION" == "$NEW_VERSION" ]]; then
+if [[ -x "$INSTALL_BIN" && "$OLD_VERSION" == "$NEW_VERSION" ]] && cmp -s "$STAGE_BIN" "$INSTALL_BIN"; then
     log "llm-monitor is already up to date ($NEW_VERSION at $INSTALL_BIN) — no-op, skipping reinstall."
 else
     maybe_sudo mkdir -p "$INSTALL_DIR"
-    maybe_sudo cp "$STAGE_BIN" "$INSTALL_BIN"
-    maybe_sudo chmod 755 "$INSTALL_BIN"
+    # Publish by rename so a running daemon can keep its old executable open.
+    (
+        replacement=$(maybe_sudo mktemp "$INSTALL_DIR/.llm-monitor.XXXXXXXX")
+        trap 'maybe_sudo rm -f "$replacement"' EXIT
+        maybe_sudo install -m 755 "$STAGE_BIN" "$replacement"
+        maybe_sudo mv -fT "$replacement" "$INSTALL_BIN"
+        trap - EXIT
+    )
     BINARY_CHANGED=true
     if [[ -n "$OLD_VERSION" ]]; then
         log "Upgraded $INSTALL_BIN: $OLD_VERSION -> $NEW_VERSION"
@@ -290,7 +295,12 @@ fi
 # Retire the pre-rename alias an earlier 2.x install left behind (it linked
 # claude-monitor -> llm-monitor); nothing new is created (#210). A real
 # binary at that name is not this script's to delete.
-if [[ "$(readlink "$INSTALL_DIR/claude-monitor" 2>/dev/null)" == "llm-monitor" ]]; then
+link_points_to() {
+    # Compare the stored target literally, including any trailing newlines.
+    readlink -- "$1" | cmp -s - <(printf '%s\n' "$2")
+}
+
+if [[ -L "$INSTALL_DIR/claude-monitor" ]] && link_points_to "$INSTALL_DIR/claude-monitor" llm-monitor; then
     maybe_sudo rm -f "$INSTALL_DIR/claude-monitor"
     log "Removed the leftover claude-monitor compatibility alias."
 fi
@@ -334,9 +344,14 @@ systemctl --user daemon-reload
 DATA_DIR="$HOME/.llm-monitor"
 LEGACY_DATA_DIR="$HOME/.claude-monitor"
 if [[ -L "$LEGACY_DATA_DIR" ]]; then
-    mkdir -p "$DATA_DIR"
-    rm -f "$LEGACY_DATA_DIR"
-    log "Removed the leftover $LEGACY_DATA_DIR compatibility symlink."
+    if link_points_to "$LEGACY_DATA_DIR" .llm-monitor; then
+        mkdir -p "$DATA_DIR"
+        rm -- "$LEGACY_DATA_DIR" || fail "Could not unlink $LEGACY_DATA_DIR."
+        log "Removed the leftover $LEGACY_DATA_DIR compatibility symlink."
+    else
+        warn "Data directory conflict at $LEGACY_DATA_DIR. Preserving the custom symlink."
+        [[ -d "$DATA_DIR" ]] || fail "Provide a working data directory at $DATA_DIR before continuing."
+    fi
 elif [[ -d "$LEGACY_DATA_DIR" ]]; then
     if [[ -e "$DATA_DIR" ]]; then
         fail "Both $LEGACY_DATA_DIR and $DATA_DIR exist as real directories. Merge or remove one, then re-run."

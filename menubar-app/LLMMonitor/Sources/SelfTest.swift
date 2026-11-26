@@ -2203,6 +2203,23 @@ enum SelfTest {
         expectEqual(try? String(contentsOfFile: join(h4, ".claude-monitor/usage.db"), encoding: .utf8), "old",
                     "a conflict leaves the legacy data untouched")
         expect(linkTarget(join(h4, ".claude-monitor")) == nil, "a conflict never replaces a real dir with a link")
+
+        // 5. Both names lead to user-managed storage through the legacy link.
+        let h5 = scratchHome("custom-links")
+        defer { try? fm.removeItem(atPath: h5) }
+        try? fm.createDirectory(atPath: join(h5, "storage"), withIntermediateDirectories: true)
+        try? "db".write(toFile: join(h5, "storage/usage.db"), atomically: true, encoding: .utf8)
+        try? fm.createSymbolicLink(atPath: join(h5, ".claude-monitor"), withDestinationPath: "storage")
+        try? fm.createSymbolicLink(atPath: join(h5, ".llm-monitor"), withDestinationPath: ".claude-monitor")
+        if case .conflict(let message) = AppPaths.migrateLegacyDataDirectory(home: h5) {
+            expect(message.contains(".claude-monitor") && message.contains("storage"),
+                   "the diagnostic identifies the custom link and its target")
+        } else {
+            expect(false, "a custom legacy link must be reported as a conflict")
+        }
+        expectEqual(linkTarget(join(h5, ".claude-monitor")), "storage", "custom legacy link survives")
+        expectEqual(try? String(contentsOfFile: join(h5, ".llm-monitor/usage.db"), encoding: .utf8), "db",
+                    "existing data stays reachable through the canonical name")
     }
 
     // MARK: z.ai

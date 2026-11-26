@@ -774,11 +774,24 @@ systemd user unit, seed accounts — in one idempotent, re-runnable command:
 ```
 
 Re-running the script upgrades an already-installed daemon in place and
-restarts the unit when a newer binary is available, and reports a no-op when
-the version is unchanged. It refuses to install a dynamically-linked binary
-(printing the `ldd` evidence) before touching the filesystem — the failure
-mode that leaves a host with a unit that can't start. Run
+restarts the unit when the binary changes, even if it has the same version.
+An identical binary skips reinstallation. The installer checks for unresolved
+dynamic dependencies with `ldd` before replacing the executable. Run
 `./scripts/install-linux.sh --help` for the full flag list.
+
+**Account sync during a rolling upgrade.** Before upgrading a remote host,
+update any scripts on older 2.x peers that initiate sync. Those clients call
+`claude-monitor` over SSH by default, and the upgrade removes that alias.
+Pass `--remote-bin llm-monitor` on the initiating host for both directions.
+
+```bash
+llm-monitor accounts push worker-1 --remote-bin llm-monitor --dry-run
+llm-monitor accounts pull worker-1 --remote-bin llm-monitor --dry-run
+```
+
+Remove `--dry-run` to sync after the check succeeds. If the SSH session
+cannot find `llm-monitor` on its PATH, pass the absolute path on the remote
+host. Once the initiating client is upgraded, it defaults to `llm-monitor`.
 
 The rest of this section explains what the script automates, for manual
 installs, upgrades, or troubleshooting.

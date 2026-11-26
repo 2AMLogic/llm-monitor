@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
 /// Where LLM Monitor keeps its data, and the one-time move from the pre-2.0
 /// `~/.claude-monitor` name.
@@ -15,8 +20,8 @@ import Foundation
 /// kept for one more major version, so a straggler 1.x host still upgrades
 /// cleanly. The 2.x compatibility **symlink** at the old name is gone (#210):
 /// loom-daemon reads the new path natively since v0.19.991 and every sync
-/// peer answers to `llm-monitor`, so a leftover symlink is removed rather
-/// than recreated.
+/// peer answers to `llm-monitor`. Only the relative link installed by 2.x
+/// is removed. A custom link may still be part of the active data path.
 ///
 /// Portable core: no AppKit / SwiftUI / Combine / os.Logger — builds on Linux.
 enum AppPaths {
@@ -88,22 +93,28 @@ enum AppPaths {
         let newPath = (home as NSString).appendingPathComponent(directoryName)
         let legacyPath = (home as NSString).appendingPathComponent(legacyDirectoryName)
 
-        let legacyIsLink = (try? fm.destinationOfSymbolicLink(atPath: legacyPath)) != nil
-        var legacyIsDir: ObjCBool = false
-        let legacyExists = !legacyIsLink && fm.fileExists(atPath: legacyPath, isDirectory: &legacyIsDir)
         var newIsDir: ObjCBool = false
         let newExists = fm.fileExists(atPath: newPath, isDirectory: &newIsDir)
 
-        if legacyIsLink {
-            // A leftover 2.x compatibility symlink: the data already lives at
-            // the new path (a dangling link pointed at nothing worth keeping),
-            // so ensure the directory exists and drop the link.
-            if !newExists { try? fm.createDirectory(atPath: newPath, withIntermediateDirectories: true) }
-            try? fm.removeItem(atPath: legacyPath)
+        if let target = try? fm.destinationOfSymbolicLink(atPath: legacyPath) {
+            guard target == directoryName else {
+                return .conflict("preserving custom symlink \(legacyPath) -> \(target)")
+            }
+            if !newIsDir.boolValue {
+                do {
+                    try fm.createDirectory(atPath: newPath, withIntermediateDirectories: true)
+                } catch {
+                    return .conflict("could not create \(newPath): \(error.localizedDescription)")
+                }
+            }
+            guard unlink(legacyPath) == 0 else {
+                return .conflict("could not unlink \(legacyPath): \(String(cString: strerror(errno)))")
+            }
             return .unlinked
         }
 
-        if legacyExists {
+        var legacyIsDir: ObjCBool = false
+        if fm.fileExists(atPath: legacyPath, isDirectory: &legacyIsDir) {
             guard legacyIsDir.boolValue else {
                 return .conflict("\(legacyPath) is not a directory; left untouched")
             }
