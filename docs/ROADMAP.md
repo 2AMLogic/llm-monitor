@@ -79,13 +79,6 @@ The three items below can start today and have no issue yet; drafts exist.
   z.ai seats in `zai list` and `ranking.json`, and a lightly used seat no
   longer reads `0%`. Unblocked once the scope question under "Blocked and
   waiting" is answered and PR #250 is rebased (it conflicts with `main`).
-- **Remove the Claude Monitor compatibility shims** (#210): the
-  `~/.claude-monitor` symlink, the `claude-monitor` binary alias and duplicate
-  release asset, the `CLAUDE_MONITOR_*` environment fallback. Done when the
-  checklist in #210 is ticked and CI's smoke run no longer asserts the symlink.
-  Unblocked once every host that syncs with `accounts push` / `pull` runs
-  2.0 or newer and a Loom release that reads `~/.llm-monitor` natively
-  (rjwalters/loom#8849, closed) is deployed there.
 
 ## Later
 

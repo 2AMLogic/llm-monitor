@@ -20,9 +20,6 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 REPO="rjwalters/llm-monitor"
 ASSET_NAME="llm-monitor-linux-x64"
 UNIT_NAME="llm-monitor.service"
-# Pre-2.0 names, retired on upgrade (the binary name survives as an alias).
-LEGACY_UNIT_NAME="claude-monitor.service"
-LEGACY_BIN_NAME="claude-monitor"
 UNIT_SRC="$SCRIPT_DIR/$UNIT_NAME"
 # swift:6.1 + SQLite dev headers (scripts/Dockerfile.swift-linux), built once
 # and cached by docker; see acquire_from_source.
@@ -131,7 +128,6 @@ done
 PREFIX="${PREFIX/#\~/$HOME}"
 INSTALL_DIR="$PREFIX/bin"
 INSTALL_BIN="$INSTALL_DIR/llm-monitor"
-LEGACY_BIN="$INSTALL_DIR/$LEGACY_BIN_NAME"
 
 STAGE_DIR="$(mktemp -d)"
 trap 'rm -rf "$STAGE_DIR"' EXIT
@@ -274,8 +270,6 @@ maybe_sudo() {
 OLD_VERSION=""
 if [[ -x "$INSTALL_BIN" ]]; then
     OLD_VERSION="$("$INSTALL_BIN" --version 2>/dev/null || true)"
-elif [[ -x "$LEGACY_BIN" && ! -L "$LEGACY_BIN" ]]; then
-    OLD_VERSION="$("$LEGACY_BIN" --version 2>/dev/null || true)"
 fi
 
 BINARY_CHANGED=false
@@ -293,12 +287,12 @@ else
     fi
 fi
 
-# The pre-2.0 command name stays as an alias: `accounts push` from a peer
-# (and any script or muscle memory) still calls `claude-monitor`. This also
-# replaces a 1.x binary left at that path.
-if [[ "$(readlink "$LEGACY_BIN" 2>/dev/null)" != "llm-monitor" ]]; then
-    maybe_sudo ln -sfn "llm-monitor" "$LEGACY_BIN"
-    log "Linked $LEGACY_BIN -> llm-monitor (compatibility alias)."
+# Retire the pre-rename alias an earlier 2.x install left behind (it linked
+# claude-monitor -> llm-monitor); nothing new is created (#210). A real
+# binary at that name is not this script's to delete.
+if [[ "$(readlink "$INSTALL_DIR/claude-monitor" 2>/dev/null)" == "llm-monitor" ]]; then
+    maybe_sudo rm -f "$INSTALL_DIR/claude-monitor"
+    log "Removed the leftover claude-monitor compatibility alias."
 fi
 
 # --- Step 4: install/refresh the systemd user unit -------------------------
@@ -326,14 +320,6 @@ command -v systemctl >/dev/null 2>&1 || fail "systemctl not found — cannot man
 systemctl --user show-environment >/dev/null 2>&1 \
     || fail "systemctl --user is not reachable in this session (no user D-Bus session). Use a full login shell (not 'ssh host cmd'), or have an admin run 'loginctl enable-linger $(whoami)' first, then re-run this script."
 
-# Retire the pre-2.0 unit so two pollers never run side by side.
-LEGACY_UNIT_DEST="$UNIT_DEST_DIR/$LEGACY_UNIT_NAME"
-if [[ -f "$LEGACY_UNIT_DEST" ]]; then
-    systemctl --user disable --now "$LEGACY_UNIT_NAME" 2>/dev/null || true
-    rm -f "$LEGACY_UNIT_DEST"
-    log "Stopped and removed the pre-2.0 unit $LEGACY_UNIT_NAME."
-fi
-
 systemctl --user daemon-reload
 
 # --- Step 4b: move the data directory to its 2.0 name ----------------------
@@ -341,22 +327,24 @@ systemctl --user daemon-reload
 # Mirrors AppPaths.migrateLegacyDataDirectory, but runs *before* the unit
 # starts: seeding accounts.env below must not create ~/.llm-monitor beside a
 # not-yet-moved ~/.claude-monitor (the daemon would then see two real
-# directories and refuse to merge them). ~/.claude-monitor stays as a symlink
-# because loom-daemon reads it.
+# directories and refuse to merge them). The move itself is kept for one
+# more major version so a straggler 1.x host still upgrades cleanly; the
+# 2.x compatibility symlink is no longer created, and a leftover one is
+# removed — loom-daemon reads ~/.llm-monitor natively (#210).
 DATA_DIR="$HOME/.llm-monitor"
 LEGACY_DATA_DIR="$HOME/.claude-monitor"
 if [[ -L "$LEGACY_DATA_DIR" ]]; then
     mkdir -p "$DATA_DIR"
+    rm -f "$LEGACY_DATA_DIR"
+    log "Removed the leftover $LEGACY_DATA_DIR compatibility symlink."
 elif [[ -d "$LEGACY_DATA_DIR" ]]; then
     if [[ -e "$DATA_DIR" ]]; then
         fail "Both $LEGACY_DATA_DIR and $DATA_DIR exist as real directories. Merge or remove one, then re-run."
     fi
     mv "$LEGACY_DATA_DIR" "$DATA_DIR"
-    ln -s ".llm-monitor" "$LEGACY_DATA_DIR"
-    log "Moved $LEGACY_DATA_DIR to $DATA_DIR (old path kept as a symlink)."
+    log "Moved $LEGACY_DATA_DIR to $DATA_DIR."
 else
     mkdir -p "$DATA_DIR"
-    [[ -e "$LEGACY_DATA_DIR" ]] || ln -s ".llm-monitor" "$LEGACY_DATA_DIR"
 fi
 
 # --- Step 5: seed accounts.env (start-then-seed-then-restart ordering) ----

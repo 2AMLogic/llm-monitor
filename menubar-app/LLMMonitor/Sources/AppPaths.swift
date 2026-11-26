@@ -11,11 +11,12 @@ import Foundation
 /// `~/.llm-monitor` beside the real data. It is also why migration must not log
 /// through `FileLogger`: the logger's own path comes from here.
 ///
-/// **`~/.claude-monitor` stays as a symlink to `~/.llm-monitor`.** It is an
-/// external contract: loom-daemon reads `usage.db`, `ranking.json`, and
-/// `accounts.env` from it (or `LOOM_CLAUDE_MONITOR_DIR`), and `accounts
-/// push`/`pull` peers may still run a pre-rename build. The symlink is removed
-/// only once every consumer reads the new path.
+/// The *move* of a real pre-2.0 `~/.claude-monitor` to `~/.llm-monitor` is
+/// kept for one more major version, so a straggler 1.x host still upgrades
+/// cleanly. The 2.x compatibility **symlink** at the old name is gone (#210):
+/// loom-daemon reads the new path natively since v0.19.991 and every sync
+/// peer answers to `llm-monitor`, so a leftover symlink is removed rather
+/// than recreated.
 ///
 /// Portable core: no AppKit / SwiftUI / Combine / os.Logger — builds on Linux.
 enum AppPaths {
@@ -39,15 +40,13 @@ enum AppPaths {
 
     static var databasePath: String { path("usage.db") }
 
-    /// An environment override, preferring `LLM_MONITOR_<name>` and falling
-    /// back to the pre-rename `CLAUDE_MONITOR_<name>`, so existing unit files
-    /// and shell profiles keep working. Empty values count as unset.
+    /// An environment override: `LLM_MONITOR_<name>`. Empty values count as
+    /// unset. (The pre-rename `CLAUDE_MONITOR_<name>` fallback was removed
+    /// with the other 2.0 compatibility shims, #210.)
     static func environment(
         _ name: String, in env: [String: String] = ProcessInfo.processInfo.environment
     ) -> String? {
-        for key in ["LLM_MONITOR_\(name)", "CLAUDE_MONITOR_\(name)"] {
-            if let value = env[key], !value.isEmpty { return value }
-        }
+        if let value = env["LLM_MONITOR_\(name)"], !value.isEmpty { return value }
         return nil
     }
 
@@ -63,24 +62,26 @@ enum AppPaths {
 
     enum MigrationOutcome: Equatable {
         /// `~/.claude-monitor` was a real directory; it was moved to
-        /// `~/.llm-monitor` and replaced by a symlink.
+        /// `~/.llm-monitor`.
         case moved
-        /// Nothing to move; `~/.llm-monitor` exists (created if needed) and
-        /// the compatibility symlink was created.
-        case linked
-        /// Already migrated: the symlink is in place.
-        case alreadyMigrated
+        /// `~/.claude-monitor` was a leftover compatibility symlink from a
+        /// 2.x build; it was removed.
+        case unlinked
+        /// Nothing to move; `~/.llm-monitor` exists (created if needed).
+        case clean
         /// Both names are real directories, or the legacy name is something
         /// this code did not create. Nothing was touched; `~/.llm-monitor` is
         /// used as-is.
         case conflict(String)
     }
 
-    /// Move `<home>/.claude-monitor` to `<home>/.llm-monitor` and leave a
-    /// symlink at the old name. Idempotent, and never deletes or merges: any
-    /// state it does not recognize is reported as `.conflict` and left alone.
-    /// `home` is a parameter so the self-test can drive every case in a
-    /// scratch directory.
+    /// Move `<home>/.claude-monitor` to `<home>/.llm-monitor`. Idempotent, and
+    /// never deletes or merges: any state it does not recognize is reported as
+    /// `.conflict` and left alone. The move is kept for one more major
+    /// version so a straggler 1.x host still upgrades cleanly; the 2.x
+    /// compatibility symlink at the old name is no longer created, and a
+    /// leftover one is removed (#210). `home` is a parameter so the self-test
+    /// can drive every case in a scratch directory.
     @discardableResult
     static func migrateLegacyDataDirectory(home: String) -> MigrationOutcome {
         let fm = FileManager.default
@@ -94,8 +95,12 @@ enum AppPaths {
         let newExists = fm.fileExists(atPath: newPath, isDirectory: &newIsDir)
 
         if legacyIsLink {
+            // A leftover 2.x compatibility symlink: the data already lives at
+            // the new path (a dangling link pointed at nothing worth keeping),
+            // so ensure the directory exists and drop the link.
             if !newExists { try? fm.createDirectory(atPath: newPath, withIntermediateDirectories: true) }
-            return .alreadyMigrated
+            try? fm.removeItem(atPath: legacyPath)
+            return .unlinked
         }
 
         if legacyExists {
@@ -109,22 +114,18 @@ enum AppPaths {
             }
             do {
                 // A rename within one filesystem: processes that already hold
-                // files open (e.g. a still-running older build, or loom-daemon
-                // reading usage.db) keep valid descriptors.
+                // files open (e.g. a still-running older build) keep valid
+                // descriptors.
                 try fm.moveItem(atPath: legacyPath, toPath: newPath)
             } catch {
                 return .conflict("could not move \(legacyPath) to \(newPath): \(error.localizedDescription)")
             }
-            try? fm.createSymbolicLink(atPath: legacyPath, withDestinationPath: directoryName)
             return .moved
         }
 
         if !newExists {
             try? fm.createDirectory(atPath: newPath, withIntermediateDirectories: true)
         }
-        // Relative target, so the link survives a home directory that is
-        // itself reached through a symlink or a different mount path.
-        try? fm.createSymbolicLink(atPath: legacyPath, withDestinationPath: directoryName)
-        return .linked
+        return .clean
     }
 }

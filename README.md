@@ -3,8 +3,7 @@
 Monitor your LLM subscription usage (**Claude**, **OpenAI Codex**, and **z.ai
 GLM Coding Plan** accounts, one or many) from a macOS menu-bar widget, or
 headless on Linux. It surfaces quota, reset times, and usage trends without
-leaving your menu bar. Formerly **Claude Monitor**; see
-[Upgrading to 2.0](#upgrading-to-20-claude-monitor--llm-monitor).
+leaving your menu bar. Formerly **Claude Monitor**.
 
 ![Menu bar popover with the summary table](docs/window.png)
 ![Per-account usage history chart](docs/plot_window.png)
@@ -1173,7 +1172,7 @@ stripped, and hidden or malformed files are skipped. The pool's `index.json`
 
 | Variable | Effect |
 |---|---|
-| `LLM_MONITOR_CLAUDE_TOKEN_DIRS` | Colon-separated list that **replaces the whole default list**. `CLAUDE_MONITOR_CLAUDE_TOKEN_DIRS` is accepted as a fallback. |
+| `LLM_MONITOR_CLAUDE_TOKEN_DIRS` | Colon-separated list that **replaces the whole default list**. |
 | `LOOM_SHARED_TOKENS_DIR` | Replaces **only the pool entry** (`~/.claude-oauth` stays). Set it to an empty value to disable the pool entry. Ignored when `LLM_MONITOR_CLAUDE_TOKEN_DIRS` is set. |
 
 ```bash
@@ -1524,41 +1523,6 @@ rm ~/Library/LaunchAgents/com.llm-monitor.plist 2>/dev/null
 rm -rf ~/.llm-monitor
 rm -rf /Applications/LLMMonitor.app
 ```
-
-### Upgrading to 2.0 (Claude Monitor → LLM Monitor)
-
-2.0 renames the tool. Most of the rename is automatic, and nothing that reads
-the old names breaks:
-
-| | 1.x | 2.0 | Compatibility |
-|---|---|---|---|
-| Data directory | `~/.claude-monitor/` | `~/.llm-monitor/` | Moved on first launch; `~/.claude-monitor` becomes a symlink to it (loom-daemon and `LOOM_CLAUDE_MONITOR_DIR` keep working) |
-| CLI | `claude-monitor` | `llm-monitor` | `install-linux.sh` keeps `claude-monitor` as a symlink alias; `accounts push` still calls `claude-monitor` on peers |
-| Env overrides | `CLAUDE_MONITOR_*` | `LLM_MONITOR_*` | Old names still honored (new ones win) |
-| systemd unit | `claude-monitor.service` | `llm-monitor.service` | `install-linux.sh` stops and removes the old unit |
-| macOS app | `ClaudeMonitor.app`, `com.claude-monitor.app` | `LLMMonitor.app`, `com.llm-monitor.app` | Manual (below) |
-| Linux release asset | `claude-monitor-linux-x64` | `llm-monitor-linux-x64` | Both are attached to each release |
-
-**Linux:** re-run `install-linux.sh --from-release` (or `--binary`). It handles
-the binary, the alias, the unit, and the data directory.
-
-**macOS:** the app bundle has a new name, so the old one is not replaced:
-
-```bash
-osascript -e 'quit app "Claude Monitor"'; sleep 2
-rm -rf /Applications/ClaudeMonitor.app
-cp -R build/LLMMonitor.app /Applications/LLMMonitor.app
-open /Applications/LLMMonitor.app     # moves ~/.claude-monitor on first launch
-```
-
-If you use the login LaunchAgent, unload `~/Library/LaunchAgents/com.claude-monitor.plist`,
-delete it, and recreate it under the new name ([Auto-Start on Login](#auto-start-on-login-optional)).
-If a CLI symlink points into the old bundle, re-point it at
-`/Applications/LLMMonitor.app/Contents/MacOS/LLMMonitor`.
-
-If the app finds both `~/.claude-monitor` and `~/.llm-monitor` as real
-directories, it moves and merges nothing. It uses `~/.llm-monitor` and logs the
-conflict to stderr, so merge or remove the old directory yourself.
 
 ### Upgrading from pre-1.8
 
