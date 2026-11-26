@@ -2,6 +2,20 @@
 
 Sections moved byte-for-byte from [WORK_LOG.md](../WORK_LOG.md) by `loom-daemon work-docs archive`.
 
+### 2026-09-26
+
+- **PR #218**: feat: read rolled Claude tokens from ~/.claude-oauth and the Loom pool
+- **PR #216**: fix: persist Codex snapshot diagnostics; export ranking.json on launch
+- **PR #217**: fix(security): ignore sibling copies of the Loom token pool
+
+### 2026-09-25
+
+- **PR #207**: chore(deps): bump the github-actions group across 1 directory with 2 updates
+- **PR #214**: feat: read-only visibility into Loom's Codex profiles
+- **PR #211**: refactor!: rename Claude Monitor to LLM Monitor (2.0)
+- **PR #209**: feat: z.ai (GLM Coding Plan) accounts as a third provider
+- **Issue #212** (closed): Flaky selftest: CodexAppServer argfail-stub race under host load
+- **PR #213**: fix: surface codex's stderr when it exits before the handshake (#212)
 ### 2026-09-18
 
 - **Issue #196** (closed): quota_calibration is never populated: compute tokens-per-weekly-point per account and alert on step changes
