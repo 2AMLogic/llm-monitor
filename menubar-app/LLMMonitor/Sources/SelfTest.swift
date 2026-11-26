@@ -2036,6 +2036,21 @@ enum SelfTest {
                    "the same tick clears the old credential error")
             expectEqual(tick(), 0, "the next tick respects the poll interval")
 
+            @MainActor func checkDiscoveryTick(_ profiles: [(id: String, name: String, email: String?, percent: Int)]) {
+                for profile in profiles {
+                    makeProfile(profile.name, accountId: profile.id, email: profile.email)
+                    writeSnapshot(profile.name, weeklyPercent: profile.percent)
+                }
+                expectEqual(tick(), profiles.count, "every new login is polled on the discovery tick")
+                for profile in profiles {
+                    expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", profile.id), root + "/" + profile.name,
+                                "the exact account \(profile.id) owns its login's directory")
+                    expectEqual(try! db.scalar("SELECT weekly_all_percent FROM usage_history WHERE account_id = ?",
+                                               profile.id) as? Double, Double(profile.percent),
+                                "the discovery tick records the login's own reading for \(profile.id)")
+                }
+            }
+
             // B's directory sorts first, but A sorts first among rows with the
             // shared email. The third login has only its native ID and a
             // directory name matching an unrelated row's email local part.
@@ -2046,25 +2061,27 @@ enum SelfTest {
                     ('legacy-name', 'name.match@example.com', 'openai', 3),
                     ('native-no-email', NULL, 'openai', 4)
                 """)
-            let profiles: [(id: String, name: String, email: String?, percent: Int)] = [
+            checkDiscoveryTick([
                 ("native-b", "01-b", "team@example.com", 72),
                 ("native-a", "02-a", "team@example.com", 34),
                 ("native-no-email", "namematch", nil, 51)
-            ]
-            for profile in profiles {
-                makeProfile(profile.name, accountId: profile.id, email: profile.email)
-                writeSnapshot(profile.name, weeklyPercent: profile.percent)
-            }
-            expectEqual(tick(), profiles.count, "all three new logins are polled on the discovery tick")
-            for profile in profiles {
-                expectEqual(text("SELECT codex_home FROM accounts WHERE id = ?", profile.id), root + "/" + profile.name,
-                            "the exact account \(profile.id) owns its login's directory")
-                expectEqual(try! db.scalar("SELECT weekly_all_percent FROM usage_history WHERE account_id = ?",
-                                           profile.id) as? Double, Double(profile.percent),
-                            "the discovery tick records the login's own reading for \(profile.id)")
-            }
+            ])
             expect(text("SELECT codex_home FROM accounts WHERE id = ?", "legacy-name") == nil,
                    "the directory-name match leaves the unrelated legacy row home-less")
+
+            // Only the later login in each pair has a row. The earlier login
+            // matches that row by email or directory name and needs its own row.
+            try! db.execute("""
+                INSERT INTO accounts (id, email, provider) VALUES
+                    ('existing-email', 'pool@example.com', 'openai'),
+                    ('existing-name', 'pool.name@example.com', 'openai')
+                """)
+            checkDiscoveryTick([
+                ("new-email", "03-new", "pool@example.com", 67),
+                ("existing-email", "04-existing", "pool@example.com", 27),
+                ("new-name", "poolname", nil, 71),
+                ("existing-name", "z-existing", "pool.name@example.com", 33)
+            ])
 
             // An unchanged root: the listing is the whole cost. Deleting the
             // row makes any per-home registration work visible — the

@@ -1139,8 +1139,16 @@ class OAuthPoller: ObservableObject {
         guard !profiles.isEmpty, FileManager.default.fileExists(atPath: dbPath),
               let db = try? openDatabase(dbPath) else { return 0 }
         func normalized(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
+        // Reserve native IDs across the batch before a legacy match can claim
+        // the row belonging to a profile later in directory order. Only the
+        // opaque account ID and email claim are used for registration.
+        let logins = profiles.map { profile in
+            (profile: profile, nativeId: CodexAuth.accountId(inHome: profile.home),
+             email: CodexAuth.email(inHome: profile.home))
+        }
+        let pendingNativeIDs = Set(logins.compactMap(\.nativeId))
         var registered = 0
-        for profile in profiles {
+        for (profile, nativeId, email) in logins {
             do {
                 try db.execute("BEGIN IMMEDIATE")
                 // Holding the write lock keeps the home lookup, account and token-free
@@ -1152,11 +1160,6 @@ class OAuthPoller: ObservableObject {
                     settledCodexProfiles.insert(profile)
                     continue
                 }
-                // Registration uses the opaque accounts.id and the email claim for
-                // local account matching and display. The JWT and bearer tokens
-                // stay in the profile's auth.json.
-                let nativeId = CodexAuth.accountId(inHome: profile.home)
-                let email = CodexAuth.email(inHome: profile.home)
                 if requireLoginIdentity && nativeId == nil && email == nil {
                     // Login can create the directory a tick before publishing
                     // auth.json. Leave the home unclaimed and retry next tick.
@@ -1185,7 +1188,7 @@ class OAuthPoller: ObservableObject {
                     }
                     // Remember the first legacy match, but keep looking for
                     // the native ID in the remaining home-less rows.
-                    guard target == nil else { continue }
+                    guard target == nil, !pendingNativeIDs.contains(id) else { continue }
                     let rowEmail = (row[1] as? String)?.lowercased()
                     if let email, rowEmail == email.lowercased() {
                         target = id
