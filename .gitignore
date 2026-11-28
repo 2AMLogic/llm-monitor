@@ -76,6 +76,7 @@ dist/
 .loom/api-keys-*/
 .loom/account-health.json
 .loom/account-health.lock
+.loom/account-ranking.codex
 .loom/CANARY
 .loom/*.log
 .loom/*.sock
@@ -91,6 +92,8 @@ dist/
 .loom/gh-config-by-owner.*/
 .loom/gh-config-by-owner-*/
 /.loom-local/
+/node_modules/
+/pnpm-lock.yaml
 # <<< loom-managed <<<
 
 # Sibling copies of Loom's token pool (e.g. `.loom/tokens.shadow-disabled-<ts>/`,
