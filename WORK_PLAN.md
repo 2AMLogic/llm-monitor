@@ -10,6 +10,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#325**: feat: add in-app update check and one-click self-install for macOS
 - **#366**: refactor!: remove the Claude Monitor compatibility shims
 - **#371**: feat: register Loom Codex profiles discovered mid-run on the poll tick
+- **#384**: chore: resync installed Loom surfaces
 
 ## Very Important
 
@@ -38,12 +39,13 @@ Issues currently being built (`loom:building`).
 - **#320**: Codex accounts show "usage unknown" on a host that no longer runs Codex, though other hosts hold fresh readings
 - **#323**: Offer an in-app "Update now" when a newer release is available
 - **#368**: Register new Loom Codex profiles on a poll tick, not only at launch or by codex list
+- **#385**: Prune two retired Loom surfaces the resync cannot reach: clean-labels.sh and loom-reference.md
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#386**: chore: drop orphaned Loom surfaces clean-labels.sh and loom-reference.md
 
 ## Approved (Awaiting Merge)
 
@@ -52,6 +54,7 @@ PRs that passed review (`loom:pr`). Unheld PRs are queued for Champion auto-merg
 - **#325**: feat: add in-app update check and one-click self-install for macOS *(held)*
 - **#366**: refactor!: remove the Claude Monitor compatibility shims *(held)*
 - **#371**: feat: register Loom Codex profiles discovered mid-run on the poll tick *(held)*
+- **#384**: chore: resync installed Loom surfaces *(held)*
 
 ## Proposed
 
@@ -63,6 +66,7 @@ Issues carrying `loom:curated`.
 - **#323**: Offer an in-app "Update now" when a newer release is available *(curated)*
 - **#338**: Per-account scope (personal | work): push/export skip personal accounts; popover marks them *(curated)*
 - **#368**: Register new Loom Codex profiles on a poll tick, not only at launch or by codex list *(curated)*
+- **#385**: Prune two retired Loom surfaces the resync cannot reach: clean-labels.sh and loom-reference.md *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -76,14 +80,14 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 3 |
+| Operator merge-risk holds | 4 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 5 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 3 |
-| Curated | 6 |
+| In Progress (`loom:building`) | 6 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 4 |
+| Curated | 7 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
