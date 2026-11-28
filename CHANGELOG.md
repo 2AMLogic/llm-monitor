@@ -34,6 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Popover sorting is 10-45× faster and deterministic for equal reset times**
   (#330, #331, #333).
 
+### Removed
+
+- **The Claude Monitor → LLM Monitor compatibility shims** (#210). The 2.0
+  rename's transitional links are retired. On launch, `AppPaths` removes the
+  old relative link `~/.claude-monitor -> .llm-monitor`, preserves custom
+  symlinks, and ignores `CLAUDE_MONITOR_*` environment fallbacks.
+  `accounts push` and `accounts pull` call `llm-monitor` on peers. The
+  installer retires its legacy binary and data-directory links, and releases
+  attach only the `llm-monitor-linux-x64` asset. The one-time *move* of a real pre-2.0
+  `~/.claude-monitor` directory to `~/.llm-monitor` is kept, so a straggler
+  1.x host still upgrades cleanly. Older 2.x clients initiating account sync
+  with an upgraded peer need `--remote-bin llm-monitor`.
+
 ### Fixed
 
 - **Linux container builds no longer leave a root-owned `.build/`** (#343).

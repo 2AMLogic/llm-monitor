@@ -30,12 +30,9 @@ enum AccountSyncRemote {
     /// non-interactive `ssh HOST <command>` shell does **not** source the
     /// profile that usually puts `~/.local/bin` on `PATH`.
     ///
-    /// Deliberately still the **pre-rename** name: every 2.x install keeps a
-    /// `claude-monitor` alias, and a peer still on 1.x has only that name, so
-    /// it is the one spelling that resolves on both. Switch to `llm-monitor`
-    /// once the fleet is past 1.x (tracked with the `~/.claude-monitor`
-    /// symlink removal).
-    static let defaultRemoteBinary = "claude-monitor"
+    /// The binary's own name, now that the fleet is past the 2.0 rename (the
+    /// `claude-monitor` alias this once had to call is gone, #210).
+    static let defaultRemoteBinary = "llm-monitor"
 
     /// The follow-on step `--then-loom` runs on whichever host received the
     /// bundle. Always the next thing an operator types on a Loom host, so it is

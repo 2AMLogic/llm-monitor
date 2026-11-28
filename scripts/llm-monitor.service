@@ -2,7 +2,6 @@
 #
 # Install:
 #   sudo cp LLMMonitor /usr/local/bin/llm-monitor
-#   sudo ln -sfn llm-monitor /usr/local/bin/claude-monitor   # pre-2.0 alias
 #   cp scripts/llm-monitor.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now llm-monitor

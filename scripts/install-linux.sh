@@ -10,9 +10,8 @@
 # user unit with a rewritten ExecStart=, seeds accounts.env, and verifies the
 # result with --version / selftest / systemctl status.
 #
-# Idempotent and safe to re-run: an unchanged version is reported as a no-op
-# rather than reinstalled/restarted; a newer version upgrades in place and
-# restarts the unit.
+# An identical executable skips reinstallation. A different build replaces
+# the installed executable and restarts the unit, even at the same version.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,9 +19,6 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 REPO="rjwalters/llm-monitor"
 ASSET_NAME="llm-monitor-linux-x64"
 UNIT_NAME="llm-monitor.service"
-# Pre-2.0 names, retired on upgrade (the binary name survives as an alias).
-LEGACY_UNIT_NAME="claude-monitor.service"
-LEGACY_BIN_NAME="claude-monitor"
 UNIT_SRC="$SCRIPT_DIR/$UNIT_NAME"
 # swift:6.1 + SQLite dev headers (scripts/Dockerfile.swift-linux), built once
 # and cached by docker; see acquire_from_source.
@@ -131,7 +127,9 @@ done
 PREFIX="${PREFIX/#\~/$HOME}"
 INSTALL_DIR="$PREFIX/bin"
 INSTALL_BIN="$INSTALL_DIR/llm-monitor"
-LEGACY_BIN="$INSTALL_DIR/$LEGACY_BIN_NAME"
+UNIT_DEST_DIR="$HOME/.config/systemd/user"
+UNIT_DEST="$UNIT_DEST_DIR/$UNIT_NAME"
+RESTART_STAMP="$UNIT_DEST_DIR/.${UNIT_NAME}.restart-pending"
 
 STAGE_DIR="$(mktemp -d)"
 trap 'rm -rf "$STAGE_DIR"' EXIT
@@ -266,7 +264,7 @@ maybe_sudo() {
     if [[ -w "$INSTALL_DIR" ]] || { [[ ! -e "$INSTALL_DIR" ]] && [[ -w "$(dirname "$INSTALL_DIR")" ]]; }; then
         "$@"
     else
-        log "'$PREFIX' is not writable by $(whoami) — using sudo for this step."
+        log "'$PREFIX' is not writable by $(whoami) — using sudo for this step." >&2
         sudo "$@"
     fi
 }
@@ -274,17 +272,27 @@ maybe_sudo() {
 OLD_VERSION=""
 if [[ -x "$INSTALL_BIN" ]]; then
     OLD_VERSION="$("$INSTALL_BIN" --version 2>/dev/null || true)"
-elif [[ -x "$LEGACY_BIN" && ! -L "$LEGACY_BIN" ]]; then
-    OLD_VERSION="$("$LEGACY_BIN" --version 2>/dev/null || true)"
 fi
 
+mark_restart_pending() {
+    mkdir -p "$UNIT_DEST_DIR"
+    : > "$RESTART_STAMP"
+}
+
 BINARY_CHANGED=false
-if [[ -n "$OLD_VERSION" && "$OLD_VERSION" == "$NEW_VERSION" ]]; then
+if [[ -x "$INSTALL_BIN" && "$OLD_VERSION" == "$NEW_VERSION" ]] && cmp -s "$STAGE_BIN" "$INSTALL_BIN"; then
     log "llm-monitor is already up to date ($NEW_VERSION at $INSTALL_BIN) — no-op, skipping reinstall."
 else
     maybe_sudo mkdir -p "$INSTALL_DIR"
-    maybe_sudo cp "$STAGE_BIN" "$INSTALL_BIN"
-    maybe_sudo chmod 755 "$INSTALL_BIN"
+    # Publish by rename so a running daemon can keep its old executable open.
+    (
+        replacement=$(maybe_sudo mktemp "$INSTALL_DIR/.llm-monitor.XXXXXXXX")
+        trap 'maybe_sudo rm -f "$replacement"' EXIT
+        maybe_sudo install -m 755 "$STAGE_BIN" "$replacement"
+        mark_restart_pending
+        maybe_sudo mv -fT "$replacement" "$INSTALL_BIN"
+        trap - EXIT
+    )
     BINARY_CHANGED=true
     if [[ -n "$OLD_VERSION" ]]; then
         log "Upgraded $INSTALL_BIN: $OLD_VERSION -> $NEW_VERSION"
@@ -293,20 +301,23 @@ else
     fi
 fi
 
-# The pre-2.0 command name stays as an alias: `accounts push` from a peer
-# (and any script or muscle memory) still calls `claude-monitor`. This also
-# replaces a 1.x binary left at that path.
-if [[ "$(readlink "$LEGACY_BIN" 2>/dev/null)" != "llm-monitor" ]]; then
-    maybe_sudo ln -sfn "llm-monitor" "$LEGACY_BIN"
-    log "Linked $LEGACY_BIN -> llm-monitor (compatibility alias)."
+# Retire the pre-rename alias an earlier 2.x install left behind (it linked
+# claude-monitor -> llm-monitor); nothing new is created (#210). A real
+# binary at that name is not this script's to delete.
+link_points_to() {
+    # Compare the stored target literally, including any trailing newlines.
+    readlink -- "$1" | cmp -s - <(printf '%s\n' "$2")
+}
+
+if [[ -L "$INSTALL_DIR/claude-monitor" ]] && link_points_to "$INSTALL_DIR/claude-monitor" llm-monitor; then
+    maybe_sudo rm -f "$INSTALL_DIR/claude-monitor"
+    log "Removed the leftover claude-monitor compatibility alias."
 fi
 
 # --- Step 4: install/refresh the systemd user unit -------------------------
 
 [[ -f "$UNIT_SRC" ]] || fail "Reference unit file not found at $UNIT_SRC."
 
-UNIT_DEST_DIR="$HOME/.config/systemd/user"
-UNIT_DEST="$UNIT_DEST_DIR/$UNIT_NAME"
 mkdir -p "$UNIT_DEST_DIR"
 
 RENDERED_UNIT="$STAGE_DIR/$UNIT_NAME"
@@ -314,6 +325,7 @@ sed "s|^ExecStart=.*|ExecStart=$INSTALL_BIN|" "$UNIT_SRC" > "$RENDERED_UNIT"
 
 UNIT_CHANGED=false
 if [[ ! -f "$UNIT_DEST" ]] || ! cmp -s "$RENDERED_UNIT" "$UNIT_DEST"; then
+    mark_restart_pending
     cp "$RENDERED_UNIT" "$UNIT_DEST"
     UNIT_CHANGED=true
     log "Installed/updated systemd user unit at $UNIT_DEST (ExecStart=$INSTALL_BIN)"
@@ -326,14 +338,6 @@ command -v systemctl >/dev/null 2>&1 || fail "systemctl not found — cannot man
 systemctl --user show-environment >/dev/null 2>&1 \
     || fail "systemctl --user is not reachable in this session (no user D-Bus session). Use a full login shell (not 'ssh host cmd'), or have an admin run 'loginctl enable-linger $(whoami)' first, then re-run this script."
 
-# Retire the pre-2.0 unit so two pollers never run side by side.
-LEGACY_UNIT_DEST="$UNIT_DEST_DIR/$LEGACY_UNIT_NAME"
-if [[ -f "$LEGACY_UNIT_DEST" ]]; then
-    systemctl --user disable --now "$LEGACY_UNIT_NAME" 2>/dev/null || true
-    rm -f "$LEGACY_UNIT_DEST"
-    log "Stopped and removed the pre-2.0 unit $LEGACY_UNIT_NAME."
-fi
-
 systemctl --user daemon-reload
 
 # --- Step 4b: move the data directory to its 2.0 name ----------------------
@@ -341,22 +345,30 @@ systemctl --user daemon-reload
 # Mirrors AppPaths.migrateLegacyDataDirectory, but runs *before* the unit
 # starts: seeding accounts.env below must not create ~/.llm-monitor beside a
 # not-yet-moved ~/.claude-monitor (the daemon would then see two real
-# directories and refuse to merge them). ~/.claude-monitor stays as a symlink
-# because loom-daemon reads it.
+# directories and refuse to merge them). The move itself is kept for one
+# more major version so a straggler 1.x host still upgrades cleanly; the
+# 2.x compatibility symlink is no longer created, and a leftover one is
+# removed — loom-daemon reads ~/.llm-monitor natively (#210).
 DATA_DIR="$HOME/.llm-monitor"
 LEGACY_DATA_DIR="$HOME/.claude-monitor"
 if [[ -L "$LEGACY_DATA_DIR" ]]; then
-    mkdir -p "$DATA_DIR"
+    if link_points_to "$LEGACY_DATA_DIR" .llm-monitor; then
+        mkdir -p "$DATA_DIR"
+        rm -- "$LEGACY_DATA_DIR" || fail "Could not unlink $LEGACY_DATA_DIR."
+        log "Removed the leftover $LEGACY_DATA_DIR compatibility symlink."
+    else
+        warn "Data directory conflict at $LEGACY_DATA_DIR. Preserving the custom symlink."
+        [[ -d "$DATA_DIR" ]] || fail "Provide a working data directory at $DATA_DIR before continuing."
+    fi
 elif [[ -d "$LEGACY_DATA_DIR" ]]; then
     if [[ -e "$DATA_DIR" ]]; then
         fail "Both $LEGACY_DATA_DIR and $DATA_DIR exist as real directories. Merge or remove one, then re-run."
     fi
+    mark_restart_pending
     mv "$LEGACY_DATA_DIR" "$DATA_DIR"
-    ln -s ".llm-monitor" "$LEGACY_DATA_DIR"
-    log "Moved $LEGACY_DATA_DIR to $DATA_DIR (old path kept as a symlink)."
+    log "Moved $LEGACY_DATA_DIR to $DATA_DIR."
 else
     mkdir -p "$DATA_DIR"
-    [[ -e "$LEGACY_DATA_DIR" ]] || ln -s ".llm-monitor" "$LEGACY_DATA_DIR"
 fi
 
 # --- Step 5: seed accounts.env (start-then-seed-then-restart ordering) ----
@@ -384,6 +396,7 @@ ACCOUNTS_ENV_DEST="$DATA_DIR/accounts.env"
 ACCOUNTS_SEEDED=false
 if [[ -n "$ACCOUNTS_ENV_PATH" ]]; then
     [[ -f "$ACCOUNTS_ENV_PATH" ]] || fail "--accounts-env path does not exist: $ACCOUNTS_ENV_PATH"
+    mark_restart_pending
     cp "$ACCOUNTS_ENV_PATH" "$ACCOUNTS_ENV_DEST"
     chmod 600 "$ACCOUNTS_ENV_DEST"
     ACCOUNTS_SEEDED=true
@@ -400,11 +413,45 @@ else
     log "$ACCOUNTS_ENV_DEST already exists — leaving it untouched."
 fi
 
-# --- Step 6: restart if anything changed since the unit was (re)started ---
+# --- Step 6: restart if anything changed or the running unit is stale ------
 
-if [[ "$BINARY_CHANGED" == true || "$UNIT_CHANGED" == true || "$ACCOUNTS_SEEDED" == true ]]; then
+service_runs_stale_binary() {
+    local main_pid installed_id running_id fd target
+    main_pid="$(systemctl --user show -p MainPID --value "$UNIT_NAME" 2>/dev/null || true)"
+    [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    installed_id="$(stat -Lc '%d:%i' "$INSTALL_BIN" 2>/dev/null || true)"
+    [[ -n "$installed_id" ]] || return 1
+
+    # A `#!` stub in tests executes its interpreter (/bin/sh), so
+    # /proc/<pid>/exe names the shell rather than $INSTALL_BIN. Compare any
+    # open script descriptor for $INSTALL_BIN instead; for real ELF
+    # binaries, compare /proc/<pid>/exe directly.
+    if [[ "$(LC_ALL=C head -c 2 "$INSTALL_BIN" 2>/dev/null || true)" == '#!' ]]; then
+        for fd in "/proc/$main_pid/fd"/*; do
+            [[ -L "$fd" ]] || continue
+            target="$(readlink -- "$fd" 2>/dev/null || true)"
+            if [[ "$target" == "$INSTALL_BIN" || "$target" == "$INSTALL_BIN (deleted)" ]]; then
+                running_id="$(stat -Lc '%d:%i' "$fd" 2>/dev/null || true)"
+                [[ -n "$running_id" && "$running_id" != "$installed_id" ]] && return 0
+                return 1
+            fi
+        done
+        return 1
+    fi
+
+    running_id="$(stat -Lc '%d:%i' "/proc/$main_pid/exe" 2>/dev/null || true)"
+    [[ -n "$running_id" && "$running_id" != "$installed_id" ]]
+}
+
+RESTART_NEEDED=false
+if [[ "$BINARY_CHANGED" == true || "$UNIT_CHANGED" == true || "$ACCOUNTS_SEEDED" == true || -e "$RESTART_STAMP" ]] || service_runs_stale_binary; then
+    RESTART_NEEDED=true
+fi
+
+if [[ "$RESTART_NEEDED" == true ]]; then
     log "Restarting '$UNIT_NAME' to pick up the change..."
     systemctl --user restart "$UNIT_NAME"
+    rm -f "$RESTART_STAMP"
 else
     log "Nothing changed this run — leaving the running unit as-is."
 fi

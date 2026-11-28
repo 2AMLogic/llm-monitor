@@ -97,6 +97,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Test Linux installer upgrades
+        run: bash scripts/test-install-linux.sh
+
       - name: Install SQLite dev headers
         run: apt-get update && apt-get install -y libsqlite3-dev
 
@@ -119,8 +122,9 @@ jobs:
           passwd_home=$(getent passwd "$(id -u)" | cut -d: -f6)
           for h in "$passwd_home" "$HOME"; do
             if test -f "$h/.llm-monitor/usage.db"; then
-              # The pre-2.0 name must stay a symlink to the new directory (loom-daemon reads it).
-              test "$(readlink "$h/.claude-monitor")" = ".llm-monitor" && found=1 && break
+              # No compatibility symlink at the pre-2.0 name: loom-daemon
+              # reads ~/.llm-monitor natively (#210).
+              test ! -e "$h/.claude-monitor" && test ! -L "$h/.claude-monitor" && found=1 && break
             fi
           done
           test -n "${found:-}"
@@ -159,8 +163,9 @@ jobs:
           passwd_home=$(getent passwd "$(id -u)" | cut -d: -f6)
           for h in "$passwd_home" "$HOME"; do
             if test -f "$h/.llm-monitor/usage.db"; then
-              # The pre-2.0 name must stay a symlink to the new directory (loom-daemon reads it).
-              test "$(readlink "$h/.claude-monitor")" = ".llm-monitor" && found=1 && break
+              # No compatibility symlink at the pre-2.0 name: loom-daemon
+              # reads ~/.llm-monitor natively (#210).
+              test ! -e "$h/.claude-monitor" && test ! -L "$h/.claude-monitor" && found=1 && break
             fi
           done
           test -n "${found:-}"
@@ -169,18 +174,13 @@ jobs:
         run: |
           mkdir -p dist
           cp menubar-app/LLMMonitor/.build/release/LLMMonitor dist/llm-monitor-linux-x64
-          # Pre-2.0 asset name, still attached so a 1.x install-linux.sh
-          # --from-release keeps working. Remove with the ~/.claude-monitor symlink.
-          cp dist/llm-monitor-linux-x64 dist/claude-monitor-linux-x64
-          chmod 755 dist/llm-monitor-linux-x64 dist/claude-monitor-linux-x64
+          chmod 755 dist/llm-monitor-linux-x64
 
       - name: Upload static release binary as workflow artifact
         uses: actions/upload-artifact@v7
         with:
           name: llm-monitor-linux-x64
-          path: |
-            dist/llm-monitor-linux-x64
-            dist/claude-monitor-linux-x64
+          path: dist/llm-monitor-linux-x64
           if-no-files-found: error
 
   # Attaches the static Linux binary built by build-linux to the GitHub
@@ -205,8 +205,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          chmod 755 dist/llm-monitor-linux-x64 dist/claude-monitor-linux-x64
+          chmod 755 dist/llm-monitor-linux-x64
           gh release upload "${{ github.event.release.tag_name }}" \
-            dist/llm-monitor-linux-x64 dist/claude-monitor-linux-x64 \
+            dist/llm-monitor-linux-x64 \
             --repo "${{ github.repository }}" \
             --clobber

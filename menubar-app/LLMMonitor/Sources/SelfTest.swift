@@ -2259,7 +2259,8 @@ enum SelfTest {
         func join(_ home: String, _ name: String) -> String { (home as NSString).appendingPathComponent(name) }
         func linkTarget(_ path: String) -> String? { try? fm.destinationOfSymbolicLink(atPath: path) }
 
-        // 1. A 1.x host: real ~/.claude-monitor with data → moved, symlinked.
+        // 1. A 1.x host: real ~/.claude-monitor with data → moved, with no
+        //    compatibility symlink left behind (#210).
         let h1 = scratchHome("legacy")
         defer { try? fm.removeItem(atPath: h1) }
         try? fm.createDirectory(atPath: join(h1, ".claude-monitor"), withIntermediateDirectories: true)
@@ -2267,33 +2268,63 @@ enum SelfTest {
         expectEqual(AppPaths.migrateLegacyDataDirectory(home: h1), .moved, "legacy dir is moved")
         expectEqual(try? String(contentsOfFile: join(h1, ".llm-monitor/usage.db"), encoding: .utf8), "db",
                     "data lands in ~/.llm-monitor")
-        expectEqual(linkTarget(join(h1, ".claude-monitor")), ".llm-monitor",
-                    "~/.claude-monitor becomes a relative symlink")
-        expectEqual(try? String(contentsOfFile: join(h1, ".claude-monitor/usage.db"), encoding: .utf8), "db",
-                    "the old path still reads the same file (loom-daemon's contract)")
-        expectEqual(AppPaths.migrateLegacyDataDirectory(home: h1), .alreadyMigrated, "second run is a no-op")
+        expect(!fm.fileExists(atPath: join(h1, ".claude-monitor")),
+               "the old name is gone after the move (no symlink is left behind)")
+        expectEqual(AppPaths.migrateLegacyDataDirectory(home: h1), .clean, "second run is a no-op")
 
-        // 2. A fresh host: nothing → new dir plus the compatibility link.
-        let h2 = scratchHome("fresh")
+        // 2. A 2.x host still carrying the old compatibility symlink →
+        //    removed, with the data behind it untouched.
+        let h2 = scratchHome("symlinked")
         defer { try? fm.removeItem(atPath: h2) }
-        expectEqual(AppPaths.migrateLegacyDataDirectory(home: h2), .linked, "fresh host is linked")
-        var isDir: ObjCBool = false
-        expect(fm.fileExists(atPath: join(h2, ".llm-monitor"), isDirectory: &isDir) && isDir.boolValue,
-               "fresh host gets ~/.llm-monitor")
-        expectEqual(linkTarget(join(h2, ".claude-monitor")), ".llm-monitor", "fresh host gets the link too")
+        try? fm.createDirectory(atPath: join(h2, ".llm-monitor"), withIntermediateDirectories: true)
+        try? "db".write(toFile: join(h2, ".llm-monitor/usage.db"), atomically: true, encoding: .utf8)
+        try? fm.createSymbolicLink(atPath: join(h2, ".claude-monitor"), withDestinationPath: ".llm-monitor")
+        expectEqual(AppPaths.migrateLegacyDataDirectory(home: h2), .unlinked,
+                    "a leftover compatibility symlink is removed")
+        expectEqual(try? String(contentsOfFile: join(h2, ".llm-monitor/usage.db"), encoding: .utf8), "db",
+                    "the data behind a removed symlink is untouched")
+        expect(linkTarget(join(h2, ".claude-monitor")) == nil && !fm.fileExists(atPath: join(h2, ".claude-monitor")),
+               "the old name is gone after the unlink")
 
-        // 3. Both real directories: nothing is moved, merged, or deleted.
-        let h3 = scratchHome("both")
+        // 3. A fresh host: nothing → the new directory, and no symlink.
+        let h3 = scratchHome("fresh")
         defer { try? fm.removeItem(atPath: h3) }
-        try? fm.createDirectory(atPath: join(h3, ".claude-monitor"), withIntermediateDirectories: true)
-        try? fm.createDirectory(atPath: join(h3, ".llm-monitor"), withIntermediateDirectories: true)
-        try? "old".write(toFile: join(h3, ".claude-monitor/usage.db"), atomically: true, encoding: .utf8)
-        if case .conflict = AppPaths.migrateLegacyDataDirectory(home: h3) {} else {
+        expectEqual(AppPaths.migrateLegacyDataDirectory(home: h3), .clean, "a fresh host needs no migration")
+        var isDir: ObjCBool = false
+        expect(fm.fileExists(atPath: join(h3, ".llm-monitor"), isDirectory: &isDir) && isDir.boolValue,
+               "fresh host gets ~/.llm-monitor")
+        expect(!fm.fileExists(atPath: join(h3, ".claude-monitor")),
+               "no compatibility symlink is created on a fresh host")
+
+        // 4. Both real directories: nothing is moved, merged, or deleted.
+        let h4 = scratchHome("both")
+        defer { try? fm.removeItem(atPath: h4) }
+        try? fm.createDirectory(atPath: join(h4, ".claude-monitor"), withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: join(h4, ".llm-monitor"), withIntermediateDirectories: true)
+        try? "old".write(toFile: join(h4, ".claude-monitor/usage.db"), atomically: true, encoding: .utf8)
+        if case .conflict = AppPaths.migrateLegacyDataDirectory(home: h4) {} else {
             expect(false, "two real data directories must be reported as a conflict")
         }
-        expectEqual(try? String(contentsOfFile: join(h3, ".claude-monitor/usage.db"), encoding: .utf8), "old",
+        expectEqual(try? String(contentsOfFile: join(h4, ".claude-monitor/usage.db"), encoding: .utf8), "old",
                     "a conflict leaves the legacy data untouched")
-        expect(linkTarget(join(h3, ".claude-monitor")) == nil, "a conflict never replaces a real dir with a link")
+        expect(linkTarget(join(h4, ".claude-monitor")) == nil, "a conflict never replaces a real dir with a link")
+
+        // 5. Both names lead to user-managed storage through the legacy link.
+        let h5 = scratchHome("custom-links")
+        defer { try? fm.removeItem(atPath: h5) }
+        try? fm.createDirectory(atPath: join(h5, "storage"), withIntermediateDirectories: true)
+        try? "db".write(toFile: join(h5, "storage/usage.db"), atomically: true, encoding: .utf8)
+        try? fm.createSymbolicLink(atPath: join(h5, ".claude-monitor"), withDestinationPath: "storage")
+        try? fm.createSymbolicLink(atPath: join(h5, ".llm-monitor"), withDestinationPath: ".claude-monitor")
+        if case .conflict(let message) = AppPaths.migrateLegacyDataDirectory(home: h5) {
+            expect(message.contains(".claude-monitor") && message.contains("storage"),
+                   "the diagnostic identifies the custom link and its target")
+        } else {
+            expect(false, "a custom legacy link must be reported as a conflict")
+        }
+        expectEqual(linkTarget(join(h5, ".claude-monitor")), "storage", "custom legacy link survives")
+        expectEqual(try? String(contentsOfFile: join(h5, ".llm-monitor/usage.db"), encoding: .utf8), "db",
+                    "existing data stays reachable through the canonical name")
     }
 
     // MARK: z.ai
@@ -3223,9 +3254,9 @@ enum SelfTest {
                     CodexBinary.resolve(environment: [CodexBinary.overrideEnvKey: stub, "PATH": "/nowhere"]),
                     stub, "LLM_MONITOR_CODEX_BIN wins over PATH"
                 )
-                expectEqual(
-                    CodexBinary.resolve(environment: ["CLAUDE_MONITOR_CODEX_BIN": stub, "PATH": "/nowhere"]),
-                    stub, "the pre-rename CLAUDE_MONITOR_CODEX_BIN still works"
+                expect(
+                    CodexBinary.resolve(environment: ["CLAUDE_MONITOR_CODEX_BIN": stub, "PATH": "/nowhere"]) != stub,
+                    "the pre-rename CLAUDE_MONITOR_CODEX_BIN override no longer resolves (#210)"
                 )
                 expect(
                     CodexBinary.resolve(environment: [
@@ -5540,12 +5571,13 @@ enum SelfTest {
             "CLAUDE_CONFIG_DIR moves the root the way Claude Code moves it")
         expectEqual(TranscriptImporter.defaultTranscriptRoot(environment: [
             "CLAUDE_CONFIG_DIR": "/tmp/cfg",
-            "CLAUDE_MONITOR_TRANSCRIPT_ROOT": "/tmp/fixture"
-        ]), "/tmp/fixture", "the explicit (pre-rename) override wins")
+            "LLM_MONITOR_TRANSCRIPT_ROOT": "/tmp/fixture"
+        ]), "/tmp/fixture", "the explicit override wins")
         expectEqual(TranscriptImporter.defaultTranscriptRoot(environment: [
             "CLAUDE_MONITOR_TRANSCRIPT_ROOT": "/tmp/legacy",
-            "LLM_MONITOR_TRANSCRIPT_ROOT": "/tmp/new"
-        ]), "/tmp/new", "LLM_MONITOR_* takes precedence over CLAUDE_MONITOR_*")
+            "CLAUDE_CONFIG_DIR": "/tmp/cfg"
+        ]), "/tmp/cfg/projects",
+        "the pre-rename CLAUDE_MONITOR_* override is no longer honored (#210)")
     }
 
     // MARK: - Quota calibration (#198)
@@ -7318,7 +7350,7 @@ enum SelfTest {
                 store.loadFromDatabase()
                 let storeAbsent = Dictionary(uniqueKeysWithValues:
                     store.accounts.map { ($0.id, $0.isAbsent) })
-                // Surface 2: `claude-monitor codex list`.
+                // Surface 2: `llm-monitor codex list`.
                 let listAbsent = Dictionary(uniqueKeysWithValues:
                     poller.codexAccounts().map { ($0.accountId, $0.isAbsent) })
                 // Surface 3: ranking.json.
@@ -7834,7 +7866,7 @@ enum SelfTest {
     }
 
     /// The intended set must be expressible with no GUI: a headless Linux host
-    /// has no popover to paste into, so `~/.claude-monitor/accounts.env` is
+    /// has no popover to paste into, so `~/.llm-monitor/accounts.env` is
     /// its only env-transfer surface. Drives `parseAccountPairs` →
     /// `declareCodexIdentity` — the exact pair `syncFromAccountFiles` runs for
     /// a keyless entry — against a scratch store, twice, to pin that the
@@ -8072,7 +8104,7 @@ enum SelfTest {
         withSelfTestTempDir { dir in
             do {
                 // Deliberately two levels down: neither the directory nor the
-                // file exists, exactly like a never-launched `~/.claude-monitor`.
+                // file exists, exactly like a never-launched `~/.llm-monitor`.
                 let dbPath = dir.appendingPathComponent("fresh-host/.claude-monitor/usage.db").path
                 expect(!FileManager.default.fileExists(atPath: dbPath),
                        "fixture precondition: the database does not exist yet")
@@ -8305,7 +8337,7 @@ enum SelfTest {
                 let argv = (try? String(contentsOfFile: argvFile, encoding: .utf8)) ?? ""
                 expect(argv.contains("BatchMode=yes"), "ssh runs in batch mode; argv was: \(argv)")
                 expect(argv.contains("worker1"), "the host is passed to ssh; argv was: \(argv)")
-                expect(argv.contains("'claude-monitor' accounts import -"),
+                expect(argv.contains("'llm-monitor' accounts import -"),
                        "the remote command reads the bundle from stdin; argv was: \(argv)")
 
                 // The destination store was created by the import itself.
@@ -8532,8 +8564,8 @@ enum SelfTest {
     }
 
     /// `--dry-run` must not put a credential on the wire for a mere preview: it
-    /// probes reachability (and that `claude-monitor` resolves on the far
-    /// side's non-interactive PATH) and sends nothing.
+    /// probes reachability (and that `llm-monitor` resolves on the far side's
+    /// non-interactive PATH) and sends nothing.
     private static func testAccountSyncPushDryRunSendsNoBundle() {
         withSelfTestTempDir("push-dry") { dir in
             do {
@@ -8568,7 +8600,7 @@ enum SelfTest {
 
                 expectEqual(status, 0, "a reachable dry run exits 0 (stderr: \(errors.joined(separator: " | ")))")
                 let argv = (try? String(contentsOfFile: argvFile, encoding: .utf8)) ?? ""
-                expect(argv.contains("'claude-monitor' --version"),
+                expect(argv.contains("'llm-monitor' --version"),
                        "a dry run asks the far side to identify itself, nothing more; argv was: \(argv)")
                 let bytes = ((try? String(contentsOfFile: stdinBytes, encoding: .utf8)) ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
